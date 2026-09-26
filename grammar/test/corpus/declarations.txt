@@ -511,6 +511,127 @@ int GlobalA = 1, GlobalB;
       (identifier))))
 
 ================================================================================
+stray semicolons at top level and in namespaces
+================================================================================
+
+;
+class UExample
+{
+};
+;
+
+namespace Outer
+{
+    ;
+    void Fn();
+    ;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (empty_declaration)
+  (class_declaration
+    (identifier)
+    (class_body))
+  (empty_declaration)
+  (namespace_declaration
+    (scoped_name
+      (identifier))
+    (namespace_body
+      (empty_declaration)
+      (function_declaration
+        (type
+          (primitive_type))
+        (identifier)
+        (parameter_list))
+      (empty_declaration))))
+
+================================================================================
+forward declarations
+================================================================================
+
+class UForwardClass;
+struct FForwardStruct;
+enum EForwardEnum;
+
+class UForwardClass
+{
+};
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    (identifier))
+  (struct_declaration
+    (identifier))
+  (enum_declaration
+    (identifier))
+  (class_declaration
+    (identifier)
+    (class_body)))
+
+================================================================================
+import declaration (live token, unused by UE scripts)
+================================================================================
+
+import void ExternalFunction(int Value) from "OtherModule";
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (import_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list
+      (parameter
+        (type
+          (primitive_type))
+        (identifier)))
+    (string_literal)))
+
+================================================================================
+complete method attribute set
+================================================================================
+
+class UExample
+{
+    void Everything() const final override property mixin
+        accept_temporary_this external_implicit_this
+        no_discard allow_discard __generated
+        deprecated defaults unsafe_during_construction
+    {
+    }
+};
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    (identifier)
+    (class_body
+      (function_declaration
+        (type
+          (primitive_type))
+        (identifier)
+        (parameter_list)
+        (function_attribute)
+        (function_attribute)
+        (function_attribute)
+        (function_attribute)
+        (function_attribute)
+        (function_attribute)
+        (function_attribute)
+        (function_attribute)
+        (function_attribute)
+        (function_attribute)
+        (function_attribute)
+        (function_attribute)
+        (block)))))
+
+================================================================================
 virtual property
 ================================================================================
 
@@ -518,8 +639,14 @@ class UExample
 {
     int Value
     {
-        get const { return 1; }
-        set;
+        get const { return Backing; }
+        set { Backing = value; }
+    }
+
+    private FVector Location
+    {
+        get const final { return Cached; }
+        set override { Cached = value; }
     }
 };
 
@@ -536,5 +663,58 @@ class UExample
         (virtual_property_accessor
           (block
             (return_statement
-              (number))))
+              (identifier))))
+        (virtual_property_accessor
+          (block
+            (expression_statement
+              (assignment_expression
+                (identifier)
+                (identifier))))))
+      (virtual_property_declaration
+        (type
+          (identifier))
+        (identifier)
+        (virtual_property_accessor
+          (function_attribute)
+          (block
+            (return_statement
+              (identifier))))
+        (virtual_property_accessor
+          (function_attribute)
+          (block
+            (expression_statement
+              (assignment_expression
+                (identifier)
+                (identifier)))))))))
+
+================================================================================
+virtual property without implementation (parses, but semantically invalid)
+================================================================================
+
+// Accepted by asCParser, then rejected by asCBuilder with
+// "Property accessor must be implemented" -> a semantic diagnostic,
+// NOT a parse error.
+class UExample
+{
+    int Value
+    {
+        get;
+        set;
+    }
+};
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (comment)
+  (comment)
+  (comment)
+  (class_declaration
+    (identifier)
+    (class_body
+      (virtual_property_declaration
+        (type
+          (primitive_type))
+        (identifier)
+        (virtual_property_accessor)
         (virtual_property_accessor)))))

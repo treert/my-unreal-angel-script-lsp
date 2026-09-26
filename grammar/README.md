@@ -8,7 +8,7 @@
 | [`angelscript.bnf`](angelscript.bnf) | **形式化语法规范**（Layer A = 用户实际书写的 `.as` 源码）。改文法前先改 BNF。 |
 | `grammar.js` | Tree-sitter DSL 文法，按 BNF 实现（优先级表 §5.5、节点命名 §5.6、冲突清单 §5.4）。 |
 | `src/scanner.c` | 外部扫描器：格式化字符串 `f"..."` 的文本块与格式说明符（**手写，入库**）。 |
-| `test/corpus/` | 回归测试（声明 / 语句 / 表达式 / 字面量 / 错误恢复），31 条，全部通过。 |
+| `test/corpus/` | 回归测试（声明 / 类型 / 语句 / 表达式 / 字面量 / 错误恢复），42 条，全部通过。 |
 | `.gitignore` | 生成物不入库：`src/parser.c`、`src/grammar.json`、`src/node-types.json`、`src/tree_sitter/`。 |
 
 > **生成物不进版本库**：克隆仓库后必须先 `npm install && npx tree-sitter generate`，
@@ -32,9 +32,43 @@ npx tree-sitter parse -q -s '<glob>'         # 批量语料验证（统计错误
 |---|---|---|
 | `Demo_AS/Script/**/*.as`（含 unreal-angelscript 官方 demo） | 27 | 100% 无 ERROR |
 | `Demo_AS/Saved/AS-Cache/*.d.as`（UE 导出的类型声明） | 414 | 100% 无 ERROR |
-| `test/corpus` | 31 条 | 全部通过 |
+| `UnrealEngine/Script-Examples/**/*.as` | 26 | 100% 无 ERROR |
+| `test/corpus` | 42 条 | 全部通过 |
+
+corpus 覆盖率：**具名节点 97/97、终结符 132/132，均 100%**。
+新增文法节点/终结符时应同步补用例以保持该数字，复算脚本（PowerShell）：
+
+```powershell
+# 具名节点覆盖（排除 supertype "_*"）
+$named = (Get-Content src\node-types.json -Raw | ConvertFrom-Json) |
+    Where-Object { $_.named -and $_.type -notlike '_*' } |
+    ForEach-Object { $_.type } | Sort-Object -Unique
+$used = [regex]::Matches((Get-ChildItem test\corpus\*.txt | Get-Content -Raw),
+    '\(([a-z_][a-z0-9_]*)\b') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+$named | Where-Object { $used -notcontains $_ }   # 输出为空即 100%
+```
+
+终结符覆盖同理：从 `src/grammar.json` 抽取所有 `"type":"STRING"` 的 `value`，
+再在 corpus 的**源码段**（`===` 标题与 `---` 分隔符之间那一段）里查找。
 
 `.as` 与 `.d.as` 使用**同一 parser**（后者是前者的子集：函数体退化为 `;`）。
+
+### corpus 格式陷阱（踩过）
+
+每个用例**必须**是完整三段：`===` 标题 `===` / 源码 / `---` 分隔符 / 期望树。
+若新增用例漏写 `---` 与期望树，tree-sitter 会把它当成**后一个用例源码的一部分**，
+而 `tree-sitter test -u` 重写文件时会**静默丢弃**这些内容。新增用例后务必
+复核用例数：
+
+```powershell
+Get-ChildItem test\corpus\*.txt | ForEach-Object {
+    "{0,-22} {1}" -f $_.Name,
+        (([regex]::Matches((Get-Content $_.FullName -Raw), '(?m)^={10,}\r?\n')).Count / 2)
+}
+```
+
+另外：corpus 的源码段是**逐字解析**的，没有元注释语法 —— 想写说明只能用
+`//`（会作为 `comment` 节点进入期望树），用 `#` 会被解析成 `preproc_line`。
 
 ## 文法设计要点
 
@@ -99,6 +133,26 @@ npx tree-sitter parse -q -s '<glob>'         # 批量语料验证（统计错误
    `__any_implicit_integer`）—— 前者 token 已从引擎移除，后者只出现在 C++ 注册串里。
    `?`（通配类型，`.d.as` 的 `void opCast(? Address)`）和 `unresolved_object` 已实现。
 9. **f-string 嵌套格式说明符**（`f"{a:{fmt}}"`）暂不支持，会落入错误恢复。
+
+## 「语法接受 ≠ 语义合法」的已知点
+
+文法刻意比引擎**宽松**，把这类错误留给 LSP 报语义诊断（而不是解析错误），
+以免中途编辑时整棵树崩掉。目前已确认并有 corpus 快照的：
+
+| 形态 | 引擎行为 |
+|---|---|
+| 无实现的虚属性访问器 `get;` / `set;` | `asCParser` 接受（`ParseVirtualPropertyDecl` 非 interface 分支允许 `;`），但 `asCBuilder::RegisterVirtualProperty` 报 **"Property accessor must be implemented"**。该形态本是给 `interface` 用的，而 `interface` 在 UE fork 是死 token，故**实际必错**。 |
+| 非块内的变量声明，如 `if (x) int y = 5;` | `STATBLOCK ::= '{' {VAR \| STATEMENT} '}'` —— 声明只能直接出现在块内（或 for 初始化）。`ParseStatement` 显式报 `TXT_UNEXPECTED_VAR_DECL`。case 子句内同理。 |
+| `fallthrough;` 出现在 case 子句末尾以外 | `ParseStatement` 没有 `ttFallthrough` 分支，只有 `ParseCase` 在末尾位置识别它（与 `break` 同位）。 |
+| `struct` 内的 `default` 语句 | `ParseClass` 用 `!isStruct` 守卫，`default` 仅限 `class`。 |
+| 全局变量 / 类成员上的 `&` | `ParseDeclaration` 用 `!isClassProp && !isGlobalVar` 守卫引用后缀，只有**局部**变量能是引用。 |
+| 直接把赋值当实参 `f(a = b)` | 实参是 `ParseCondition()` 而非 ASSIGN；且 `a = b` 会被优先当成命名实参。 |
+
+虚属性访问器的属性集与普通方法相同（`ParseVirtualPropertyDecl` 直接调
+`ParseMethodAttributes`），`function_attribute` 已覆盖其全部 12 个 token：
+`final` `override` `property` `mixin` `accept_temporary_this`
+`external_implicit_this` `no_discard` `allow_discard` `__generated`
+`deprecated` `defaults` `unsafe_during_construction`。
 
 ## 与 `../lsp` 的边界
 

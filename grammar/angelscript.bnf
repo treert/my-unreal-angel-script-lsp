@@ -216,8 +216,11 @@ top_declaration   ::= namespace_decl                      (* 2.2 *)
                     | local_function                      (* 2.6 *)
                     | global_function                     (* 2.7 *)
                     | global_var                          (* 2.7 *)
+                    | virtual_property                    (* 2.3.7 — yes, at
+                          top level too: ParseScript calls
+                          ParseVirtualPropertyDecl(false,false) *)
                     | asset_decl                          (* 2.8  [pproc] *)
-                    | import_decl                         (* 2.9  [dead] *)
+                    | import_decl                         (* 2.9 — NOT dead *)
                     | typedef_decl                        (* 2.9  [dead] *)
                     | interface_decl                      (* 2.9  [dead] *)
                     | funcdef_decl                        (* 2.9  [dead] *)
@@ -237,18 +240,27 @@ namespace_decl    ::= 'namespace' IDENTIFIER { '::' IDENTIFIER } '{' SCRIPT '}'
 
 class_decl        ::= [ UCLASS '(' macro_list ')' ]        (* [pproc] *)
                       'class' IDENTIFIER
-                      [ ':' scoped_name { ',' scoped_name } ]
-                      '{' { class_member } '}'
+                      ( ';'                                 (* fwd decl *)
+                      | [ ':' scoped_name { ',' scoped_name } ]
+                        '{' { class_member } '}' )
 
 struct_decl       ::= [ USTRUCT '(' macro_list ')' ]       (* [pproc] *)
                       'struct' IDENTIFIER
-                      [ ':' scoped_name { ',' scoped_name } ]
-                      '{' { class_member } '}'
+                      ( ';'                                 (* fwd decl *)
+                      | [ ':' scoped_name { ',' scoped_name } ]
+                        '{' { struct_member } '}' )
+(* The bodyless ';' form is accepted by ParseClass (it returns right after
+   the identifier when the next token is ';').  A trailing ';' AFTER the
+   body is NOT part of this production — it is swallowed by SCRIPT's
+   empty-declaration branch, so `class X { };` is class_decl + ';'. *)
 
-class_member      ::= ';'                                   #(* empty *)
+class_member      ::= struct_member
+                    | class_default_statement               (* 2.3.3 — class
+                          ONLY; ParseClass guards it with `!isStruct` *)
+
+struct_member     ::= ';'                                   #(* empty *)
                     | access_specifier                      (* 2.3.1 *)
                     | access_decl                           (* 2.3.2 *)
-                    | class_default_statement               (* 2.3.3 *)
                     | constructor_decl                      (* 2.3.4 *)
                     | destructor_decl                       (* 2.3.4 *)
                     | class_property                        (* 2.3.5 *)
@@ -277,24 +289,40 @@ access_mod_list   ::= ( 'readonly' | 'editdefaults' | 'inherited' )
 
 # 2.3.3 — Class default-value statement  (ParseClassDefaultStatement)
 #   e.g.  default RootComponent = CreateDefaultSubobject(...);
-#   or inside a  default { ... }  block  [LSP treats both as statements]
+#         default Tags.Add(n"ExampleTag");
+#         default { bHidden = false; }
 
-class_default_statement ::= 'default' ( assignment | '{' { assignment ';' } '}' )
+class_default_statement ::= 'default' statement
+(* ParseClassDefaultStatement consumes 'default' then calls
+   SuperficiallyParseStatement() — it is ANY statement, not just an
+   assignment, which is why the block form falls out for free (a block is a
+   statement).  Restricting this to assignments would be wrong. *)
 
 # 2.3.4 — Constructor / Destructor  (ParseFunction isMethod path)
 
-constructor_decl  ::= IDENTIFIER '(' parameter_list ')' [method_attributes]
+constructor_decl  ::= IDENTIFIER parameter_list { method_attribute }
                       ( ';' | statement_block )
-destructor_decl   ::= '~' IDENTIFIER '(' ')' [method_attributes]
+destructor_decl   ::= '~' IDENTIFIER parameter_list { method_attribute }
                       ( ';' | statement_block )
-(* constructor name must equal the class name; no return type *)
+(* constructor name must equal the class name; no return type.
+   NOTE: parameter_list already carries its own '( )' — see 3.2. *)
 
 # 2.3.5 — Class property  [core VAR + UPROPERTY macro]
 
 class_property    ::= [ access_specifier ]
                       [ UPROPERTY '(' macro_list ')' ]      (* [pproc] *)
                       [ access_specifier ]
-                      var_decl
+                      member_var_decl
+
+# Class properties and global variables do NOT accept the '&' reference
+# suffix nor '__auto_constref_type' — ParseDeclaration guards both with
+# `if (!isClassProp && !isGlobalVar)`.  Only LOCAL variables may be
+# references (see 3.5).
+member_var_decl   ::= TYPE IDENTIFIER
+                      [ ( '=' ( init_list | expression ) ) | arg_list ]
+                      { ',' IDENTIFIER
+                        [ ( '=' ( init_list | expression ) ) | arg_list ] }
+                      ';'
 
 # 2.3.6 — Class method  [core FUNC + UFUNCTION macro]
 
@@ -314,17 +342,36 @@ class_method      ::= [ access_specifier ]
 
 virtual_property ::= [ 'private' | 'protected' ] TYPE [ '&' ] IDENTIFIER
                       '{' { ( 'get' | 'set' ) [ 'const' ]
-                             [ 'override' | 'final' ]
+                             { method_attribute }
                              ( statement_block | ';' ) } '}'
+(* CORRECTION (verified in source): accessors take the FULL method attribute
+   set — ParseVirtualPropertyDecl calls ParseMethodAttributes, not just
+   'override'/'final'.
+   The ';' form parses but is SEMANTICALLY INVALID here: asCBuilder::
+   RegisterVirtualProperty emits "Property accessor must be implemented"
+   unless the owner is an interface — and 'interface' is a dead token in the
+   UE fork.  Tree-sitter accepts it; the LSP must report it as a semantic
+   diagnostic. *)
 
 # ----------------------------------------------------------------------------
 # 2.4  Enumeration  [core]  (BNF:1 ENUM) + UMETA  [pproc]
 # ----------------------------------------------------------------------------
 
 enum_decl         ::= [ UENUM '(' macro_list ')' ]          (* [pproc] *)
-                      'enum' IDENTIFIER '{' [ enum_list ] '}' ';'
-enum_list         ::= enum_value { ',' [enum_value] } [ ',' ]
+                      'enum' IDENTIFIER
+                      ( ';'                                 (* fwd decl *)
+                      | '{' [ enum_list ] '}' )
+enum_list         ::= enum_value { ',' enum_value } [ ',' ]
 enum_value        ::= IDENTIFIER [ '=' expression ] [ UMETA '(' macro_list ')' ]
+(* Corrections vs earlier revisions of this file:
+   - the bodyless ';' form exists (ParseEnumeration returns early on ';');
+   - the trailing ';' after '}' is NOT part of ENUM — ParseEnumeration stops
+     at '}', and SCRIPT eats the ';' as an empty declaration.  It is
+     therefore OPTIONAL, not mandatory (`.d.as` exports omit it);
+   - empty slots are NOT allowed between commas (unlike init_list): every
+     element must be an IDENTIFIER, only a single trailing comma is tolerated;
+   - the '=' initializer is SuperficiallyParseVarInit'd at declaration time,
+     i.e. only brace/paren-balanced text is scanned, then re-parsed later. *)
 
 # ----------------------------------------------------------------------------
 # 2.5  Delegate / Event  [pproc]
@@ -339,10 +386,11 @@ event_decl        ::= 'event'    function_signature ';'
 # 2.6  Mixin / Local functions  [core]  (BNF:1 MIXIN, LOCAL)
 # ----------------------------------------------------------------------------
 
-mixin_function    ::= 'mixin' function_decl_body
-local_function    ::= 'local' function_decl_body
-(* 'mixin' also appears as a post-'(' method attribute, and as a qualifier
-   in func_qualifiers — same word, three positions. *)
+mixin_function    ::= 'mixin' function_decl
+local_function    ::= 'local' function_decl
+(* 'mixin' also appears as a trailing method attribute (2.7) — same word,
+   two positions.  ParseMixin/ParseLocal simply prepend the keyword node to
+   the result of ParseFunction. *)
 
 # ----------------------------------------------------------------------------
 # 2.7  Global functions & variables  [core]  (BNF:0/1 FUNC, VAR)
@@ -351,11 +399,10 @@ local_function    ::= 'local' function_decl_body
 global_function   ::= [ UFUNCTION '(' macro_list ')' ]      (* [pproc] *)
                       function_decl
 
-global_var        ::= TYPE [ '&' ] IDENTIFIER
-                      [ ( '=' ( init_list | expression ) ) | arg_list ]
-                      { ',' IDENTIFIER
-                        [ ( '=' ( init_list | expression ) ) | arg_list ] }
-                      ';'
+global_var        ::= member_var_decl                       (* see 2.3.5 *)
+(* NO '&' here: ParseDeclaration only parses the reference suffix when
+   `!isClassProp && !isGlobalVar`.  Global and member variables are values;
+   only locals can be references (3.5). *)
 
 function_decl     ::= TYPE [ '&' ] IDENTIFIER parameter_list
                       [ 'const' ] { method_attribute }
@@ -369,10 +416,14 @@ function_signature ::= TYPE [ '&' ] IDENTIFIER parameter_list
 # Method/post-qualifier attributes — contextually-keyworded identifiers
 # (ParseMethodAttributes / IsFuncDecl):
 method_attribute  ::= 'final' | 'override' | 'property' | 'mixin'
-                    | 'no_discard' | 'allow_discard' | 'deprecated'
-                    | 'defaults' | 'unsafe_during_construction'
-                    | '__generated'
+                    | 'accept_temporary_this' | 'external_implicit_this'
+                    | 'no_discard' | 'allow_discard' | '__generated'
+                    | 'deprecated' | 'defaults'
+                    | 'unsafe_during_construction'
                     | IDENTIFIER      (* forward-compat catch-all [LSP] *)
+(* The 12 alternatives above are the complete set, in ParseMethodAttributes
+   order (as_parser.cpp).  Earlier revisions of this file omitted
+   'accept_temporary_this' / 'external_implicit_this'. *)
 
 # ----------------------------------------------------------------------------
 # 2.8  Literal asset declaration  [pproc]
@@ -383,12 +434,17 @@ method_attribute  ::= 'final' | 'override' | 'property' | 'mixin'
 asset_decl        ::= 'asset' IDENTIFIER 'of' IDENTIFIER
 
 # ----------------------------------------------------------------------------
-# 2.9  Removed/legacy top-level declarations  [dead]  (documented for
-#       completeness — tokens commented out in as_tokendef.h tokenWords[])
+# 2.9  Legacy top-level declarations
 # ----------------------------------------------------------------------------
+# CORRECTION: only typedef / interface / funcdef are [dead] (their tokens are
+# commented out in as_tokendef.h tokenWords[], so the parser branches that
+# test for them are unreachable).  'import' is NOT among them.
 
+# [live] — asTokenDef("import", ttImport) is active and ParseScript
+# dispatches ttImport to ParseImport().  Unused by UE scripts in practice,
+# but syntactically valid; a tolerant parser should accept it.
 import_decl      ::= 'import' TYPE ['&'] IDENTIFIER parameter_list 'from'
-                     StringLiteral ';'                  (* token removed *)
+                     StringLiteral ';'
 typedef_decl     ::= 'typedef' PRIMTYPE IDENTIFIER ';'  (* token removed *)
 interface_decl   ::= 'interface' IDENTIFIER [':' IDENTIFIER {',' IDENTIFIER}]
                      '{' { virtual_property | interface_method } '}'  (* removed *)
@@ -467,13 +523,23 @@ statement         ::= if_statement
                     | return_statement
                     | break_statement
                     | continue_statement
-                    | fallthrough_statement
                     | statement_block
-                    | var_decl                        (* 3.5 *)
                     | expression_statement
                     (* statement-level 'else'/'case'/'default' bodies appear
                        as separate statements in [LSP] because it slices
                        text per-statement — see Part 5.3 *)
+
+(* CORRECTIONS (verified against ParseStatement / ParseStatementBlock):
+   - 'var_decl' is NOT a statement.  STATBLOCK is '{' {VAR | STATEMENT} '}':
+     a declaration is only legal DIRECTLY inside a block (or as a for-init).
+     ParseStatement explicitly rejects it with TXT_UNEXPECTED_VAR_DECL, so
+         if (x) int y = 5;          // invalid
+         for (...) FVector V;       // invalid
+     Same rule inside a case clause: ParseCase parses a declaration only to
+     emit a better error message.
+   - 'fallthrough' is NOT a statement either.  ParseStatement has no branch
+     for ttFallthrough; the token is recognised ONLY by ParseCase, in the
+     same terminal position as 'break' (see case_clause below). *)
 
 statement_block   ::= '{' { var_decl | statement } '}'   (* BNF:2 STATBLOCK *)
 
@@ -500,17 +566,20 @@ range_for         ::= 'for' '(' TYPE TYPEMOD IDENTIFIER ':' condition ')'
    [PPROC] rewrites for old iterator mode (angelscript.UseNewIterators=0);
    with new iterators (default) it parses natively as snForRange. *)
 
-switch_statement ::= 'switch' '(' condition ')' '{' { case_clause } '}'
+switch_statement ::= 'switch' '(' assignment ')' '{' { case_clause } '}'
 case_clause       ::= ( 'case' expression | 'default' ) ':'
                       { statement }
-                      [ ( 'break' ';' ) | ( 'fallthrough' ';' ) ]
-(* BNF:8/9; case labels in [ENGINE] only accept expressions (literals or
-   scoped names); [LSP] also allows parenthesized labels. *)
+                      [ break_statement | fallthrough_statement ]
+(* BNF:8/9.  The case label is ParseExpression() — the EXPR level, so NO
+   ternary and NO assignment (literals, scoped names, arithmetic only).
+   'break'/'fallthrough' are consumed by ParseCase itself and therefore can
+   only appear LAST in a clause; 'break' is additionally a normal statement
+   (usable in loops), 'fallthrough' is not. *)
 
-return_statement ::= 'return' [ condition ] ';'           (* BNF:8 *)
+return_statement ::= 'return' [ assignment ] ';'          (* BNF:8 *)
 break_statement   ::= 'break' ';'
 continue_statement ::= 'continue' ';'
-fallthrough_statement ::= 'fallthrough' ';'
+fallthrough_statement ::= 'fallthrough' ';'     (* case clauses only *)
 
 expression_statement ::= [ assignment ] ';'                (* BNF:8 EXPRSTAT *)
 
@@ -605,9 +674,18 @@ unary             ::= ( '-' | '+' | '!' | '++' | '--' | '~' ) unary  (* 15 *)
                     | postfix_expression
 postfix_expression ::= expr_term { postfix_op }                      (* 16 *)
 postfix_op        ::= '++' | '--'
-                    | '.' ( IDENTIFIER | function_call_name )        (* member *)
-                    | '[' arg_list ']'                               (* index *)
-                    | '(' arg_list ')'     (* call on function handle *)
+                    | '.' ( IDENTIFIER | function_call )             (* member *)
+                    | '[' argument { ',' argument } ']'              (* index *)
+                    | arg_list             (* call on function handle *)
+(* CORRECTIONS:
+   - earlier revisions wrote `'[' arg_list ']'` / `'(' arg_list ')'`, which
+     double up the delimiters — arg_list ALREADY carries its own '( )'
+     (see 4.4).  ParseExprPostOp calls ParseArgList(false) for '[' (no
+     parentheses, terminated by ']') and ParseArgList() for '(';
+   - because the index reuses ARGLIST, NAMED ARGUMENTS ARE LEGAL INSIDE
+     BRACKETS:  Arr[Index: 3]  /  Grid[X, Y]  both parse;
+   - the member form reuses FUNCCALL (not a separate "function_call_name"),
+     chosen by a 2-token lookahead for '('. *)
 
 # 4.2 — Expression terms  [core]  (BNF:10-11)
 
@@ -625,14 +703,18 @@ expr_term         ::= 'void'                        (* skip-out-arg marker *)
 # 4.3 — Cast  (BNF:12 CAST; UE fork capitalizes it as keyword 'Cast')
 #   'cast' (vanilla lower-case) is NOT a keyword here; only 'Cast'.
 
-cast_expression   ::= 'Cast' '<' TYPE '>' '(' assignment ')'
+cast_expression   ::= 'Cast' '<' TYPE '>' '(' condition ')'
+(* 'Cast' is CAPITALISED — asTokenDef("Cast", ttCast).  Vanilla's lower-case
+   'cast' is not a token here.  The operand is ParseCondition(), so a bare
+   assignment must be parenthesised. *)
 
 # 4.4 — Calls and access  (BNF:11-12)
 
-function_call     ::= SCOPE IDENTIFIER '(' arg_list ')'
-(* member/method call goes through postfix '.', the head is this rule *)
+function_call     ::= SCOPE IDENTIFIER arg_list
+(* member/method call goes through postfix '.', the head is this rule.
+   arg_list supplies the parentheses — do not write them again. *)
 
-construct_call    ::= TYPE '(' arg_list ')'
+construct_call    ::= TYPE arg_list
 (* recognized when the identifier is a known type, or template
    'TArray<int>(...)', or array type 'type[](...)' — a semantic decision
    the parser approximates by lookahead; Tree-sitter should parse as a
@@ -643,10 +725,15 @@ variable_access   ::= SCOPE IDENTIFIER
    Super::Foo / this.Foo both fall out of scoped_name + postfix '.' *)
 
 arg_list          ::= '(' [ argument { ',' argument } [ ',' ] ] ')'   (* BNF:13 *)
-argument          ::= [ IDENTIFIER ':' ] assignment
-(* named argument uses ':' (NOT '='); legacy '=' form exists behind
-   ep.alterSyntaxNamedArgs — omit from Tree-sitter.  Index brackets reuse
-   arg_list:  Arr[Index] and multi-arg index Arr[A, B] are both valid. *)
+argument          ::= [ IDENTIFIER ( ':' | '=' ) ] condition
+(* CORRECTIONS:
+   - the argument is ParseCondition(), NOT ASSIGN: an assignment expression
+     cannot be passed directly (`f((a = b))` needs the parentheses);
+   - BOTH ':' and '=' introduce a named argument here.  The '=' form is
+     gated on ep.alterSyntaxNamedArgs, and AngelscriptManager.cpp sets
+     asEP_ALTER_SYNTAX_NAMED_ARGS = 1 — so it is LIVE in UE and heavily used
+     (`Print("...", Duration=30)`).  Earlier revisions of this file wrongly
+     told implementers to omit it. *)
 
 # 4.5 — Literals  (BNF:12 LITERAL)
 

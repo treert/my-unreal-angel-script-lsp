@@ -44,6 +44,180 @@ void Test()
                                 (identifier)))))))))))))))))
 
 ================================================================================
+all binary operators
+================================================================================
+
+void Test()
+{
+    A = B == C;
+    A = B != C;
+    A = B < C;
+    A = B <= C;
+    A = B > C;
+    A = B >= C;
+    A = B << C;
+    A = B >> C;
+    A = B >>> C;
+    A = B + C;
+    A = B - C;
+    A = B * C;
+    A = B / C;
+    A = B % C;
+    A = B ** C;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list)
+    (block
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (binary_expression
+            (identifier)
+            (identifier))))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (binary_expression
+            (identifier)
+            (identifier))))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (binary_expression
+            (identifier)
+            (identifier))))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (binary_expression
+            (identifier)
+            (identifier))))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (binary_expression
+            (identifier)
+            (identifier))))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (binary_expression
+            (identifier)
+            (identifier))))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (binary_expression
+            (identifier)
+            (identifier))))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (binary_expression
+            (identifier)
+            (identifier))))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (binary_expression
+            (identifier)
+            (identifier))))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (binary_expression
+            (identifier)
+            (identifier))))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (binary_expression
+            (identifier)
+            (identifier))))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (binary_expression
+            (identifier)
+            (identifier))))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (binary_expression
+            (identifier)
+            (identifier))))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (binary_expression
+            (identifier)
+            (identifier))))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (binary_expression
+            (identifier)
+            (identifier)))))))
+
+================================================================================
+parenthesized expressions override precedence
+================================================================================
+
+void Test()
+{
+    A = (B + C) * D;
+    A = ((B));
+    if ((A > 0) && (B < 10))
+        Use();
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list)
+    (block
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (binary_expression
+            (parenthesized_expression
+              (binary_expression
+                (identifier)
+                (identifier)))
+            (identifier))))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (parenthesized_expression
+            (parenthesized_expression
+              (identifier)))))
+      (if_statement
+        (binary_expression
+          (parenthesized_expression
+            (binary_expression
+              (identifier)
+              (number)))
+          (parenthesized_expression
+            (binary_expression
+              (identifier)
+              (number))))
+        (expression_statement
+          (call_expression
+            (identifier)
+            (argument_list)))))))
+
+================================================================================
 unary, update and ternary expressions
 ================================================================================
 
@@ -150,14 +324,17 @@ void Test()
         (assignment_expression
           (subscript_expression
             (identifier)
-            (string_literal))
+            (argument
+              (string_literal)))
           (number)))
       (expression_statement
         (assignment_expression
           (subscript_expression
             (identifier)
-            (identifier)
-            (identifier))
+            (argument
+              (identifier))
+            (argument
+              (identifier)))
           (number)))
       (expression_statement
         (call_expression
@@ -165,7 +342,8 @@ void Test()
             (member_expression
               (subscript_expression
                 (identifier)
-                (number))
+                (argument
+                  (number)))
               (identifier))
             (identifier))
           (argument_list)))
@@ -208,6 +386,7 @@ void Test()
     Math::Clamp(X: 2.0, Min: 0.0, Max: 0.5);
     TraceLine(Start, End, OutHit = void);
     SkipOutParameter(void);
+    Arr[Index: 3] = 1;
 }
 
 --------------------------------------------------------------------------------
@@ -264,7 +443,16 @@ void Test()
           (identifier)
           (argument_list
             (argument
-              (void_argument))))))))
+              (void_argument)))))
+      (expression_statement
+        (assignment_expression
+          (subscript_expression
+            (identifier)
+            (argument
+              (named_argument
+                (identifier)
+                (number))))
+          (number))))))
 
 ================================================================================
 cast expression
@@ -315,8 +503,17 @@ void Test()
 {
     A = 1;
     A += 1;
-    A >>>= 2;
+    A -= 1;
+    A *= 2;
+    A /= 2;
+    A %= 2;
     A **= 2;
+    A |= 1;
+    A &= 1;
+    A ^= 1;
+    A <<= 2;
+    A >>= 2;
+    A >>>= 2;
     A = B = C;
     Map.FindOrAdd("Key") = 21;
 }
@@ -330,6 +527,42 @@ void Test()
     (identifier)
     (parameter_list)
     (block
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number)))
       (expression_statement
         (assignment_expression
           (identifier)

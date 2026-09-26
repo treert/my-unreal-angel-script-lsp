@@ -1,0 +1,278 @@
+================================================================================
+all primitive types
+================================================================================
+
+void VoidFn();
+bool BoolFn();
+int8 Int8Fn();
+int16 Int16Fn();
+int Int32Fn();
+int32 Int32AliasFn();
+int64 Int64Fn();
+uint8 Uint8Fn();
+uint16 Uint16Fn();
+uint UintFn();
+uint32 Uint32AliasFn();
+uint64 Uint64Fn();
+float FloatFn();
+float32 Float32Fn();
+float64 Float64Fn();
+double DoubleFn();
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list)))
+
+================================================================================
+reference modifiers
+================================================================================
+
+void Plain(FVector& Ref);
+void In(const FVector&in Value);
+void Out(FVector&out Result);
+void InOut(FVector&inout Both);
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list
+      (parameter
+        (type
+          (identifier)
+          (reference_modifier))
+        (identifier))))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list
+      (parameter
+        (type
+          (identifier)
+          (reference_modifier))
+        (identifier))))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list
+      (parameter
+        (type
+          (identifier)
+          (reference_modifier))
+        (identifier))))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list
+      (parameter
+        (type
+          (identifier)
+          (reference_modifier))
+        (identifier)))))
+
+================================================================================
+type suffixes: arrays, const, unresolved_object, scoped and template names
+================================================================================
+
+void Test()
+{
+    int[] Flat;
+    int[][] Nested;
+    const FVector ConstValue = Other;
+    TArray<int>::Iterator It;
+    Outer::Inner::Deep Qualified;
+    TMap<FString, TArray<AActor>> Lookup;
+    UObject unresolved_object Marker;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list)
+    (block
+      (variable_declaration
+        (type
+          (primitive_type)
+          (array_suffix))
+        (variable_declarator
+          (identifier)))
+      (variable_declaration
+        (type
+          (primitive_type)
+          (array_suffix)
+          (array_suffix))
+        (variable_declarator
+          (identifier)))
+      (variable_declaration
+        (type
+          (identifier))
+        (variable_declarator
+          (identifier)
+          (identifier)))
+      (variable_declaration
+        (type
+          (qualified_identifier
+            (template_type
+              (identifier)
+              (template_arguments
+                (type
+                  (primitive_type))))
+            (identifier)))
+        (variable_declarator
+          (identifier)))
+      (variable_declaration
+        (type
+          (qualified_identifier
+            (identifier)
+            (qualified_identifier
+              (identifier)
+              (identifier))))
+        (variable_declarator
+          (identifier)))
+      (variable_declaration
+        (type
+          (template_type
+            (identifier)
+            (template_arguments
+              (type
+                (identifier))
+              (type
+                (template_type
+                  (identifier)
+                  (template_arguments
+                    (type
+                      (identifier))))))))
+        (variable_declarator
+          (identifier)))
+      (variable_declaration
+        (type
+          (identifier))
+        (variable_declarator
+          (identifier))))))
+
+================================================================================
+USTRUCT specifiers
+================================================================================
+
+USTRUCT(BlueprintType, meta = (HasNativeMake = "/Script/Module.Lib"))
+struct FExampleStruct
+{
+    UPROPERTY()
+    float Value = 1.0;
+};
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (struct_declaration
+    (ustruct_specifiers
+      (macro_argument_list
+        (macro_argument
+          (identifier))
+        (macro_argument
+          (identifier)
+          (macro_argument_list
+            (macro_argument
+              (identifier)
+              (macro_value
+                (string_literal)))))))
+    (identifier)
+    (class_body
+      (variable_declaration
+        (uproperty_specifiers
+          (macro_argument_list))
+        (type
+          (primitive_type))
+        (variable_declarator
+          (identifier)
+          (number))))))

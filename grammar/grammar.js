@@ -115,8 +115,23 @@ module.exports = grammar({
       $.delegate_declaration,
       $.event_declaration,
       $.asset_declaration,
+      $.import_declaration,
       $.function_declaration,
       $.variable_declaration,
+      // ParseScript dispatches virtual properties at top level too
+      $.virtual_property_declaration,
+    ),
+
+    // `import` is still a live token (as_tokendef.h) and ParseScript
+    // dispatches it, even though UE scripts never use it.
+    import_declaration: $ => seq(
+      'import',
+      field('type', $.type),
+      field('name', $.identifier),
+      field('parameters', $.parameter_list),
+      'from',
+      field('source', $.string_literal),
+      ';',
     ),
 
     // ========================================================================
@@ -145,9 +160,14 @@ module.exports = grammar({
       'class',
       field('name', $.identifier),
       optional(field('type_parameters', $.type_parameters)),
-      optional(seq(':', commaSep1(field('base', $._type_identifier)))),
-      field('body', $.class_body),
-      optional(';'),
+      choice(
+        ';',                                  // forward declaration
+        seq(
+          optional(seq(':', commaSep1(field('base', $._type_identifier)))),
+          field('body', $.class_body),
+          optional(';'),
+        ),
+      ),
     )),
 
     struct_declaration: $ => prec.right(seq(
@@ -155,9 +175,14 @@ module.exports = grammar({
       'struct',
       field('name', $.identifier),
       optional(field('type_parameters', $.type_parameters)),
-      optional(seq(':', commaSep1(field('base', $._type_identifier)))),
-      field('body', $.class_body),
-      optional(';'),
+      choice(
+        ';',                                  // forward declaration
+        seq(
+          optional(seq(':', commaSep1(field('base', $._type_identifier)))),
+          field('body', $.class_body),
+          optional(';'),
+        ),
+      ),
     )),
 
     // `.d.as` template declarations: `struct TMap<K, V>`
@@ -239,7 +264,10 @@ module.exports = grammar({
       choice(field('body', $.block), ';'),
     ),
 
-    // 2.3.7 — virtual property (engine-supported, unused in practice)
+    // 2.3.7 — virtual property.  The engine parser supports it
+    // (ParseVirtualPropertyDecl) but it is a paper feature in the UE fork:
+    // zero usage across engine/plugin scripts.  Parsed anyway so it never
+    // produces a hard error.
     virtual_property_declaration: $ => seq(
       repeat($._member_modifier),
       field('type', $.type),
@@ -249,10 +277,18 @@ module.exports = grammar({
       '}',
     ),
 
+    // Accessors take the full method attribute set (as_parser.cpp
+    // ParseVirtualPropertyDecl -> ParseMethodAttributes).
+    //
+    // NOTE: the bodyless form (`get;` / `set;`) parses, but the builder
+    // rejects it with "Property accessor must be implemented" unless the
+    // owner is an interface (as_builder.cpp RegisterVirtualProperty) — and
+    // `interface` is a dead token in the UE fork.  Kept accepted here so the
+    // LSP can report a *semantic* error instead of a parse error.
     virtual_property_accessor: $ => seq(
       choice('get', 'set'),
       optional('const'),
-      optional(choice('override', 'final')),
+      repeat(field('attribute', $.function_attribute)),
       choice(field('body', $.block), ';'),
     ),
 
@@ -264,8 +300,10 @@ module.exports = grammar({
       optional(field('specifiers', $.uenum_specifiers)),
       'enum',
       field('name', $.identifier),
-      field('body', $.enum_body),
-      optional(';'),
+      choice(
+        ';',                                  // forward declaration
+        seq(field('body', $.enum_body), optional(';')),
+      ),
     )),
 
     enum_body: $ => seq(
@@ -331,17 +369,20 @@ module.exports = grammar({
       choice(field('body', $.block), ';'),
     )),
 
+    // as_parser.cpp ParseMethodAttributes — the complete set (12 tokens).
     function_attribute: _ => choice(
       'final',
       'override',
       'property',
       'mixin',
+      'accept_temporary_this',
+      'external_implicit_this',
       'no_discard',
       'allow_discard',
+      '__generated',
       'deprecated',
       'defaults',
       'unsafe_during_construction',
-      '__generated',
     ),
 
     // NOTE: the explicit empty-list form `(void)` is not a separate
@@ -680,10 +721,12 @@ module.exports = grammar({
       field('property', $.identifier),
     )),
 
+    // Index brackets reuse ARGLIST (ParseExprPostOp -> ParseArgList(false)),
+    // so named arguments are legal here: `Arr[Index: 3]`, `Grid[X, Y]`.
     subscript_expression: $ => prec.left(PREC.POSTFIX, seq(
       field('object', $._expression),
       '[',
-      commaSep1(field('index', $._expression)),
+      commaSep1(field('index', $.argument)),
       ']',
     )),
 

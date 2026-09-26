@@ -147,6 +147,12 @@ void Test()
     for (int I = 0, J = 1; ; )
         Use(I);
 
+    for (;;)
+        Use(0);
+
+    for (I = 0; I < 10; I += 1, J -= 1)
+        Use(I);
+
     for (auto Element : Map)
     {
         Use(Element.Key);
@@ -208,6 +214,33 @@ void Test()
           (variable_declarator
             (identifier)
             (number)))
+        (expression_statement
+          (call_expression
+            (identifier)
+            (argument_list
+              (argument
+                (identifier))))))
+      (for_statement
+        (expression_statement
+          (call_expression
+            (identifier)
+            (argument_list
+              (argument
+                (number))))))
+      (for_statement
+        (expression_statement
+          (assignment_expression
+            (identifier)
+            (number)))
+        (binary_expression
+          (identifier)
+          (number))
+        (assignment_expression
+          (identifier)
+          (number))
+        (assignment_expression
+          (identifier)
+          (number))
         (expression_statement
           (call_expression
             (identifier)
