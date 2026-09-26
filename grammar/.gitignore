@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Tree-sitter generated files (run `npx tree-sitter generate` to rebuild)
+src/parser.c
+src/grammar.json
+src/node-types.json
+src/tree_sitter/
+
+# Build artifacts
+*.obj
+*.lib
+*.exp
+*.pdb
+*.dll
+*.so
+*.dylib
+
+# OS
+.DS_Store
+Thumbs.db

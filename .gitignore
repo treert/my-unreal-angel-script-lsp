@@ -1,0 +1,28 @@
+# Dependencies & caches
+node_modules/
+.cache*/
+
+# Build / artifacts
+dist/
+out/
+target/
+build/
+*.vsix
+
+# IDE / OS
+.idea/
+.DS_Store
+Thumbs.db
+
+.codebuddy/plan/
+
+# Logs & temp
+*.log
+*.orig
+.tmp/
+tmp/
+
+# Native (common)
+*.dll
+*.so
+*.dylib

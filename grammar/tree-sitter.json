@@ -1,0 +1,18 @@
+{
+  "grammars": [
+    {
+      "name": "angelscript",
+      "camelcase": "Angelscript",
+      "scope": "source.angelscript",
+      "path": ".",
+      "file-types": [
+        "as"
+      ],
+      "injection-regex": "angelscript"
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT"
+  }
+}

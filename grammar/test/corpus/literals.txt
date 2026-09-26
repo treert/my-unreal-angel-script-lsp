@@ -1,0 +1,336 @@
+================================================================================
+numeric literals
+================================================================================
+
+void Test()
+{
+    A = 0;
+    A = 1337;
+    A = 0xFF;
+    A = 0b1010;
+    A = 0o777;
+    A = 0d42;
+    A = 1.5;
+    A = 1.5f;
+    A = 1.f;
+    A = .5;
+    A = 1e10;
+    A = 1.5e-3f;
+    A = 100f;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list)
+    (block
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (number))))))
+
+================================================================================
+string, name and heredoc literals
+================================================================================
+
+void Test()
+{
+    A = "plain";
+    A = "escaped \" and \n and \x41";
+    A = n"FNameLiteral";
+    A = """
+        heredoc "quoted" text
+        """;
+    A = "";
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list)
+    (block
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (string_literal)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (string_literal)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (name_literal)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (heredoc_string)))
+      (expression_statement
+        (assignment_expression
+          (identifier)
+          (string_literal))))))
+
+================================================================================
+format strings
+================================================================================
+
+void Test()
+{
+    Print(f"Called from {GetName()} at {ActorLocation}");
+    Print(f"{DeltaSeconds =}");
+    Print(f"{DeltaSeconds =:.0f}");
+    Print(f"Hex: {20 :#x}");
+    Print(f"Aligned: {GetName() :_<40}");
+    Print(f"{ESlateVisibility::Collapsed :n}");
+    Print(f"literal {{braces}} and // slashes");
+    Print(f"");
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list)
+    (block
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (format_string
+                (format_string_content)
+                (format_interpolation
+                  (call_expression
+                    (identifier)
+                    (argument_list)))
+                (format_string_content)
+                (format_interpolation
+                  (identifier)))))))
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (format_string
+                (format_interpolation
+                  (identifier)))))))
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (format_string
+                (format_interpolation
+                  (identifier)
+                  (format_spec)))))))
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (format_string
+                (format_string_content)
+                (format_interpolation
+                  (number)
+                  (format_spec)))))))
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (format_string
+                (format_string_content)
+                (format_interpolation
+                  (call_expression
+                    (identifier)
+                    (argument_list))
+                  (format_spec)))))))
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (format_string
+                (format_interpolation
+                  (qualified_identifier
+                    (identifier)
+                    (identifier))
+                  (format_spec)))))))
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (format_string
+                (format_string_content))))))
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (format_string))))))))
+
+================================================================================
+comments and preprocessor lines
+================================================================================
+
+#if EDITOR
+
+// line comment
+/* block
+   comment */
+/** doc comment */
+class UExample
+{
+};
+
+#endif
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (preproc_line)
+  (comment)
+  (comment)
+  (comment)
+  (class_declaration
+    (identifier)
+    (class_body))
+  (preproc_line))
+
+================================================================================
+template types and nested template closing
+================================================================================
+
+void Test()
+{
+    TArray<TArray<int>> Nested;
+    TMap<FString, TArray<AActor>> Lookup;
+    TArray<int>::Iterator It;
+    int Shifted = A >> B;
+    bool Compared = A < B;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list)
+    (block
+      (variable_declaration
+        (type
+          (template_type
+            (identifier)
+            (template_arguments
+              (type
+                (template_type
+                  (identifier)
+                  (template_arguments
+                    (type
+                      (primitive_type))))))))
+        (variable_declarator
+          (identifier)))
+      (variable_declaration
+        (type
+          (template_type
+            (identifier)
+            (template_arguments
+              (type
+                (identifier))
+              (type
+                (template_type
+                  (identifier)
+                  (template_arguments
+                    (type
+                      (identifier))))))))
+        (variable_declarator
+          (identifier)))
+      (variable_declaration
+        (type
+          (qualified_identifier
+            (template_type
+              (identifier)
+              (template_arguments
+                (type
+                  (primitive_type))))
+            (identifier)))
+        (variable_declarator
+          (identifier)))
+      (variable_declaration
+        (type
+          (primitive_type))
+        (variable_declarator
+          (identifier)
+          (binary_expression
+            (identifier)
+            (identifier))))
+      (variable_declaration
+        (type
+          (primitive_type))
+        (variable_declarator
+          (identifier)
+          (binary_expression
+            (identifier)
+            (identifier)))))))

@@ -1,0 +1,540 @@
+================================================================================
+namespace declaration
+================================================================================
+
+namespace Math::Detail
+{
+    const FName HealthName = n"Health";
+    float Sqrt(float Value);
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (namespace_declaration
+    (scoped_name
+      (identifier)
+      (identifier))
+    (namespace_body
+      (variable_declaration
+        (type
+          (identifier))
+        (variable_declarator
+          (identifier)
+          (name_literal)))
+      (function_declaration
+        (type
+          (primitive_type))
+        (identifier)
+        (parameter_list
+          (parameter
+            (type
+              (primitive_type))
+            (identifier)))))))
+
+================================================================================
+class with base and UCLASS specifiers
+================================================================================
+
+UCLASS(Abstract, meta = (DisplayName = "Example"))
+class AExampleActor : AActor
+{
+};
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    (uclass_specifiers
+      (macro_argument_list
+        (macro_argument
+          (identifier))
+        (macro_argument
+          (identifier)
+          (macro_argument_list
+            (macro_argument
+              (identifier)
+              (macro_value
+                (string_literal)))))))
+    (identifier)
+    (identifier)
+    (class_body)))
+
+================================================================================
+struct with template type parameters (.d.as)
+================================================================================
+
+struct TMap<K, V>
+{
+    V& opIndex(const K& Key);
+    int Num() const;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (struct_declaration
+    (identifier)
+    (type_parameters
+      (type_parameter)
+      (type_parameter))
+    (class_body
+      (function_declaration
+        (type
+          (identifier)
+          (reference_modifier))
+        (identifier)
+        (parameter_list
+          (parameter
+            (type
+              (identifier)
+              (reference_modifier))
+            (identifier))))
+      (function_declaration
+        (type
+          (primitive_type))
+        (identifier)
+        (parameter_list)))))
+
+================================================================================
+class members: UPROPERTY, UFUNCTION, default, constructor
+================================================================================
+
+class AExample : AActor
+{
+    UPROPERTY(DefaultComponent, Attach = Root, meta = (MakeEditWidget))
+    USceneComponent Component;
+
+    default bReplicates = true;
+    default Tags.Add(n"ExampleTag");
+
+    default
+    {
+        bHidden = false;
+    }
+
+    AExample()
+    {
+        Health.Initialize(100.0f);
+    }
+
+    ~AExample()
+    {
+    }
+
+    UFUNCTION(BlueprintOverride)
+    void Tick(float DeltaSeconds)
+    {
+    }
+
+    protected void ScriptOnly() const final
+    {
+    }
+};
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    (identifier)
+    (identifier)
+    (class_body
+      (variable_declaration
+        (uproperty_specifiers
+          (macro_argument_list
+            (macro_argument
+              (identifier))
+            (macro_argument
+              (identifier)
+              (macro_value
+                (identifier)))
+            (macro_argument
+              (identifier)
+              (macro_argument_list
+                (macro_argument
+                  (identifier))))))
+        (type
+          (identifier))
+        (variable_declarator
+          (identifier)))
+      (default_statement
+        (assignment_expression
+          (identifier)
+          (boolean_literal)))
+      (default_statement
+        (call_expression
+          (member_expression
+            (identifier)
+            (identifier))
+          (argument_list
+            (argument
+              (name_literal)))))
+      (default_statement
+        (default_block
+          (expression_statement
+            (assignment_expression
+              (identifier)
+              (boolean_literal)))))
+      (constructor_declaration
+        (identifier)
+        (parameter_list)
+        (block
+          (expression_statement
+            (call_expression
+              (member_expression
+                (identifier)
+                (identifier))
+              (argument_list
+                (argument
+                  (number)))))))
+      (destructor_declaration
+        (identifier)
+        (parameter_list)
+        (block))
+      (function_declaration
+        (ufunction_specifiers
+          (macro_argument_list
+            (macro_argument
+              (identifier))))
+        (type
+          (primitive_type))
+        (identifier)
+        (parameter_list
+          (parameter
+            (type
+              (primitive_type))
+            (identifier)))
+        (block))
+      (function_declaration
+        (type
+          (primitive_type))
+        (identifier)
+        (parameter_list)
+        (function_attribute)
+        (block)))))
+
+================================================================================
+access declarations and access specifiers
+================================================================================
+
+class UExample
+{
+    access Internal = private;
+    access ReadOnlyEverywhere = private, * (editdefaults, readonly);
+    access Mixed = protected, USceneComponent (inherited, readonly), APlayerController;
+
+    access:Internal
+    float PrivateValue = 0.0;
+
+    UPROPERTY(EditDefaultsOnly)
+    access:Mixed
+    bool bFlag = false;
+
+    access:Internal
+    void Method()
+    {
+    }
+};
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    (identifier)
+    (class_body
+      (access_declaration
+        (identifier))
+      (access_declaration
+        (identifier)
+        (access_grant
+          (access_modifier)
+          (access_modifier)))
+      (access_declaration
+        (identifier)
+        (access_grant
+          (scoped_name
+            (identifier))
+          (access_modifier)
+          (access_modifier))
+        (access_grant
+          (scoped_name
+            (identifier))))
+      (variable_declaration
+        (access_specifier
+          (identifier))
+        (type
+          (primitive_type))
+        (variable_declarator
+          (identifier)
+          (number)))
+      (variable_declaration
+        (uproperty_specifiers
+          (macro_argument_list
+            (macro_argument
+              (identifier))))
+        (access_specifier
+          (identifier))
+        (type
+          (primitive_type))
+        (variable_declarator
+          (identifier)
+          (boolean_literal)))
+      (function_declaration
+        (access_specifier
+          (identifier))
+        (type
+          (primitive_type))
+        (identifier)
+        (parameter_list)
+        (block)))))
+
+================================================================================
+enum with values and UMETA
+================================================================================
+
+UENUM(BlueprintType)
+enum EExampleEnum
+{
+    A,
+    B = 4,
+    C UMETA(DisplayName = "Cee"),
+};
+
+enum ENoTrailing
+{
+    X = 0,
+    Y = 1
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (enum_declaration
+    (uenum_specifiers
+      (macro_argument_list
+        (macro_argument
+          (identifier))))
+    (identifier)
+    (enum_body
+      (enumerator
+        (identifier))
+      (enumerator
+        (identifier)
+        (number))
+      (enumerator
+        (identifier)
+        (umeta_specifiers
+          (macro_argument_list
+            (macro_argument
+              (identifier)
+              (macro_value
+                (string_literal))))))))
+  (enum_declaration
+    (identifier)
+    (enum_body
+      (enumerator
+        (identifier)
+        (number))
+      (enumerator
+        (identifier)
+        (number)))))
+
+================================================================================
+delegate and event
+================================================================================
+
+delegate void FExampleDelegate(UObject Object, float Value);
+event void FExampleEvent(UObject Object, float Value);
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (delegate_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list
+      (parameter
+        (type
+          (identifier))
+        (identifier))
+      (parameter
+        (type
+          (primitive_type))
+        (identifier))))
+  (event_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list
+      (parameter
+        (type
+          (identifier))
+        (identifier))
+      (parameter
+        (type
+          (primitive_type))
+        (identifier)))))
+
+================================================================================
+asset declaration
+================================================================================
+
+asset ExampleTexture of UTexture2D
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (asset_declaration
+    (identifier)
+    (identifier)))
+
+================================================================================
+global functions, mixin, local, variables
+================================================================================
+
+UFUNCTION(Category = "Example")
+void ExampleFunction(AActor InputActor, FVector&out OutPosition)
+{
+}
+
+mixin void ExampleMixin(AActor Self, FVector Location)
+{
+}
+
+local void ExampleLocal()
+{
+}
+
+void DeclarationOnly(int A = 3, TArray<TArray<int>>& Nested);
+
+void WildcardParameter(? Address) const;
+
+FVector GlobalVector(1.0, 2.0, 3.0);
+int GlobalA = 1, GlobalB;
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (ufunction_specifiers
+      (macro_argument_list
+        (macro_argument
+          (identifier)
+          (macro_value
+            (string_literal)))))
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list
+      (parameter
+        (type
+          (identifier))
+        (identifier))
+      (parameter
+        (type
+          (identifier)
+          (reference_modifier))
+        (identifier)))
+    (block))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list
+      (parameter
+        (type
+          (identifier))
+        (identifier))
+      (parameter
+        (type
+          (identifier))
+        (identifier)))
+    (block))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list)
+    (block))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list
+      (parameter
+        (type
+          (primitive_type))
+        (identifier)
+        (number))
+      (parameter
+        (type
+          (template_type
+            (identifier)
+            (template_arguments
+              (type
+                (template_type
+                  (identifier)
+                  (template_arguments
+                    (type
+                      (primitive_type)))))))
+          (reference_modifier))
+        (identifier))))
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list
+      (parameter
+        (type
+          (wildcard_type))
+        (identifier))))
+  (variable_declaration
+    (type
+      (identifier))
+    (variable_declarator
+      (identifier)
+      (argument_list
+        (argument
+          (number))
+        (argument
+          (number))
+        (argument
+          (number)))))
+  (variable_declaration
+    (type
+      (primitive_type))
+    (variable_declarator
+      (identifier)
+      (number))
+    (variable_declarator
+      (identifier))))
+
+================================================================================
+virtual property
+================================================================================
+
+class UExample
+{
+    int Value
+    {
+        get const { return 1; }
+        set;
+    }
+};
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    (identifier)
+    (class_body
+      (virtual_property_declaration
+        (type
+          (primitive_type))
+        (identifier)
+        (virtual_property_accessor
+          (block
+            (return_statement
+              (number))))
+        (virtual_property_accessor)))))

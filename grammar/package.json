@@ -1,0 +1,30 @@
+{
+  "name": "tree-sitter-angelscript",
+  "version": "0.1.0",
+  "description": "Tree-sitter grammar for Unreal Angelscript (.as / .d.as)",
+  "main": "bindings/node",
+  "keywords": [
+    "tree-sitter",
+    "angelscript",
+    "unreal",
+    "parser"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "tree-sitter-cli": "^0.25.3"
+  },
+  "scripts": {
+    "generate": "tree-sitter generate",
+    "test": "tree-sitter test",
+    "parse": "tree-sitter parse"
+  },
+  "tree-sitter": [
+    {
+      "scope": "source.angelscript",
+      "file-types": [
+        "as"
+      ],
+      "injection-regex": "angelscript"
+    }
+  ]
+}

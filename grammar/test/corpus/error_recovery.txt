@@ -1,0 +1,109 @@
+================================================================================
+incomplete variable declaration (mid-typing)
+================================================================================
+
+class UExample
+{
+    UPROPERTY()
+    FVector
+
+    void Method()
+    {
+    }
+};
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    (identifier)
+    (class_body
+      (function_declaration
+        (uproperty_specifiers
+          (macro_argument_list))
+        (type
+          (identifier))
+        (ERROR
+          (identifier))
+        (identifier)
+        (parameter_list)
+        (block)))))
+
+================================================================================
+trailing scope operator
+================================================================================
+
+void Test()
+{
+    Math::
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list)
+    (block
+      (ERROR
+        (identifier)))))
+
+================================================================================
+unclosed block keeps following declarations
+================================================================================
+
+void Broken()
+{
+    Foo();
+
+void Recovered()
+{
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list)
+    (block
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list)))
+      (ERROR
+        (type
+          (primitive_type))
+        (variable_declarator
+          (identifier)
+          (argument_list))))))
+
+================================================================================
+incomplete member access
+================================================================================
+
+void Test()
+{
+    Actor.
+    Other();
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (type
+      (primitive_type))
+    (identifier)
+    (parameter_list)
+    (block
+      (expression_statement
+        (call_expression
+          (member_expression
+            (identifier)
+            (identifier))
+          (argument_list))))))
