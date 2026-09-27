@@ -140,8 +140,19 @@ Get-ChildItem test\corpus\*.txt | ForEach-Object {
 2. **`private` / `protected` / `access:Level` / `UPROPERTY()` / `UFUNCTION()` 是声明前缀**，
    不是独立成员节点，统一挂在 `function_declaration` / `variable_declaration` /
    `constructor_declaration` 等的开头（`specifiers` 字段 + 匿名关键字），顺序任意。
-3. **`(void)` 不是独立产生式**：解析为「单个类型为 `void` 的 `parameter`」。
-   消费侧把「仅一个 void 形参」视作空参表。
+3. **`(void)` 形参不可达**（2026-09 M5 实测，修正原文档的失实描述——原文称
+   「解析为单个类型为 `void` 的 `parameter`，消费侧把『仅一个 void 形参』视作
+   空参表」）：
+   `void_argument` 带 `prec(1)`，**裸** `void` 在括号语境恒解析为 `void_argument`
+   （调用位跳过 out 参数的引擎构造），压过 `primitive_type` 的 `void` ⇒
+   无名的 `(void)` 不可能走 `parameter_list` 路径。实测两种落点：
+   `void F(void) {}`（有函数体）→ **ERROR 节点**（错误恢复吞掉，M6 起由
+   `AS0903` 诊断兜底）；`void D(void);`（无体声明）→ 被变量声明的
+   `variable_declarator name(arguments)` 构造吞掉（读作「类型 `void` 的
+   变量 `D`，构造实参 `(void)`」，不报错但语义非预期）。
+   带名的 `void X` 形参**可达**（parameter 是唯一完整解析，prec 不参与），
+   但语料零出现。**消费侧无需任何「void 形参」特殊处理**——该节点形态
+   不会出现；`void_argument` 本身是活的（调用位语义，见 BNF）。
 4. **模板声明头 `struct TMap<K, V>`**（BNF 未收录，`.d.as` 实际存在）：
    新增 `type_parameters` / `type_parameter` 节点。该形态是 `.d.as` 独有的——
    引擎脚本侧根本不认（见上方「交叉，不是子集」表）。

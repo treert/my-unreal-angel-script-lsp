@@ -389,9 +389,13 @@ module.exports = grammar({
       'unsafe_during_construction',
     ),
 
-    // NOTE: the explicit empty-list form `(void)` is not a separate
-    // production — it parses as a single `parameter` whose type is `void`
-    // (see README.md "与 BNF 的偏差").
+    // NOTE: the explicit empty-list form `(void)` is UNREACHABLE here:
+    // `void_argument` (prec 1) wins over `primitive_type`'s `void` for a
+    // bare `void` inside parens, so `(void)` can never take the
+    // `parameter_list` path — it falls into error recovery or the
+    // `variable_declarator name(arguments)` reading (see README.md
+    // "与 BNF 的偏差" §3, verified 2026-09). A *named* `void X` parameter
+    // does parse (the only complete reading), but is never seen in corpus.
     parameter_list: $ => seq(
       '(',
       optional(seq(commaSep1($.parameter), optional(','))),
