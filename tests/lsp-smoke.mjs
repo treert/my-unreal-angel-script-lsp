@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 const exe = process.argv[2]
   ?? 'd:/WorkGit/my-angel-script-lsp/lsp/target/debug/as-lsp.exe';
 
-const src = 'class Foo : UObject\n{\n    int Count;\n    void Tick(float Delta)\n    {\n        Count = Count + 1;\n    }\n}\nUFUNCTION(Blueprint\nvoid GlobalFn() {}\n';
+const src = 'class Foo : UObject\n{\n    int Count;\n    void Tick(float Delta)\n    {\n        Count = Count + 1;\n        auto Total = Count + 1;\n        Wide(1, 2.5);\n    }\n}\nvoid Wide(int A, float B) {}\nUFUNCTION(Blueprint\nvoid GlobalFn() {}\n';
 const uri = 'file:///d%3A/WorkGit/UEProjs/SmokeTest.as';
 
 const p = spawn(exe, [], { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -127,12 +127,22 @@ send({
   params: { textDocument: { uri }, position: { line: 5, character: 23 } },
 });
 await sleep(400);
-// ---- M5c: completion ③（说明符语境：line 8 `UFUNCTION(Blueprint` 前缀
+// ---- M5c: completion ③（说明符语境：line 11 `UFUNCTION(Blueprint` 前缀
 // Blueprint → BlueprintCallable 等；char 19 = "Blueprint" 尾端点）----
 send({
   jsonrpc: '2.0', id: 14, method: 'textDocument/completion',
-  params: { textDocument: { uri }, position: { line: 8, character: 19 } },
+  params: { textDocument: { uri }, position: { line: 11, character: 19 } },
 });
+await sleep(400);
+// ---- M5d: signatureHelp（line 7 `Wide(1, 2.5);`——光标在 2.5 内 → 第 2 槽）----
+send({
+  jsonrpc: '2.0', id: 15, method: 'textDocument/signatureHelp',
+  params: { textDocument: { uri }, position: { line: 7, character: 18 } },
+});
+await sleep(400);
+// ---- M5d: inlayHint（全文件：auto Total → ": int"）----
+send({ jsonrpc: '2.0', id: 16, method: 'textDocument/inlayHint',
+  params: { textDocument: { uri }, range: { start: { line: 0, character: 0 }, end: { line: 13, character: 0 } } } });
 await sleep(400);
 send({ jsonrpc: '2.0', method: 'exit' });
 await sleep(800);
@@ -197,13 +207,13 @@ if (!hoverParam || !hoverParam.result) fail(`no param hover: ${JSON.stringify(ho
 const paramValue = hoverParam.result.contents?.value ?? '';
 if (!/float\s+Delta/.test(paramValue)) fail(`param hover missing 'float Delta': ${paramValue}`);
 
-// ---- M4: references（Count：声明 + 2 使用点）----
+// ---- M4: references（Count：声明 + 3 使用点——M5d 源加了 auto 行）----
 const refs = responses.get(7);
 if (!refs || !refs.result) fail(`no references response: ${JSON.stringify(refs)}`);
 const refLocs = refs.result;
-if (refLocs.length !== 3) fail(`references Count expect 3 (decl + 2 uses), got ${JSON.stringify(refLocs)}`);
+if (refLocs.length !== 4) fail(`references Count expect 4 (decl + 3 uses), got ${JSON.stringify(refLocs)}`);
 const refLines = refLocs.map((l) => l.range.start.line).sort((a, b) => a - b);
-if (JSON.stringify(refLines) !== '[2,5,5]') fail(`references lines: ${JSON.stringify(refLines)}`);
+if (JSON.stringify(refLines) !== '[2,5,5,6]') fail(`references lines: ${JSON.stringify(refLines)}`);
 if (!refLocs.every((l) => l.uri.includes('SmokeTest.as'))) fail(`references uri: ${JSON.stringify(refLocs)}`);
 
 // ---- M4: prepareRename ----
@@ -212,11 +222,11 @@ if (!prep || !prep.result) fail(`no prepareRename response: ${JSON.stringify(pre
 if (prep.result.placeholder !== 'Count') fail(`prepareRename placeholder: ${JSON.stringify(prep.result)}`);
 if (prep.result.range.start.line !== 2) fail(`prepareRename range: ${JSON.stringify(prep.result)}`);
 
-// ---- M4: rename（严格匹配 + 声明名 = 3 处编辑）----
+// ---- M4: rename（严格匹配 + 声明名 = 4 处编辑——M5d 源加了 auto 行）----
 const ren = responses.get(9);
 if (!ren || !ren.result) fail(`no rename response: ${JSON.stringify(ren)}`);
 const edits = Object.values(ren.result.changes ?? {}).flat();
-if (edits.length !== 3) fail(`rename expect 3 edits (decl + 2 uses), got ${JSON.stringify(ren.result)}`);
+if (edits.length !== 4) fail(`rename expect 4 edits (decl + 3 uses), got ${JSON.stringify(ren.result)}`);
 if (!edits.every((e) => e.newText === 'Count2')) fail(`rename newText: ${JSON.stringify(edits)}`);
 
 // ---- M4: workspaceSymbol ----
@@ -256,6 +266,23 @@ for (const want of ['BlueprintCallable', 'BlueprintEvent', 'BlueprintOverride', 
 }
 if (ls3.includes('Category')) fail(`specifier prefix should filter out 'Category': ${JSON.stringify(ls3)}`);
 
+// ---- M5d: signatureHelp ----
+const sh = responses.get(15);
+if (!sh || !sh.result) fail(`no signatureHelp response: ${JSON.stringify(sh)}`);
+if (sh.result.signatures.length !== 1) fail(`signatureHelp expect 1 signature: ${JSON.stringify(sh.result)}`);
+if (!/int\s+A,\s*float\s+B/.test(sh.result.signatures[0].label)) {
+  fail(`signatureHelp label: ${sh.result.signatures[0].label}`);
+}
+if (sh.result.activeParameter !== 1) fail(`activeParameter expect 1: ${JSON.stringify(sh.result)}`);
+
+// ---- M5d: inlayHint ----
+const ih = responses.get(16);
+if (!ih || !ih.result) fail(`no inlayHint response: ${JSON.stringify(ih)}`);
+const totalHint = ih.result.find((h) => h.position.line === 6);
+if (!totalHint || totalHint.label !== ': int') {
+  fail(`inlayHint line6 expect ': int' for auto Total: ${JSON.stringify(ih.result)}`);
+}
+
 // ---- M4: $/progress（references 长任务）----
 const progressMsgs = notifications.filter((n) => n.method === '$/progress');
 if (progressMsgs.length === 0) fail('no $/progress notifications for references');
@@ -279,6 +306,6 @@ if (typeof readyParams.floatIsFloat64 !== 'boolean') {
   fail(`indexStatus floatIsFloat64: ${JSON.stringify(readyParams)}`);
 }
 
-console.log(`SMOKE OK: legend ${legend.length} types, ${tokenCount} tokens, symbols OK, didOpen logged=${opened}, hover/definition/references/rename/workspaceSymbol/completion(+specifier) OK, $/progress msgs=${progressMsgs.length}, indexStatus files=${readyParams.files}`);
+console.log(`SMOKE OK: legend ${legend.length} types, ${tokenCount} tokens, symbols OK, didOpen logged=${opened}, hover/definition/references/rename/workspaceSymbol/completion(+specifier)/signatureHelp/inlayHint OK, $/progress msgs=${progressMsgs.length}, indexStatus files=${readyParams.files}`);
 p.kill();
 process.exit(0);

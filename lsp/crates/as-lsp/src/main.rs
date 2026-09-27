@@ -301,6 +301,11 @@ impl LanguageServer for Backend {
                     ..CompletionOptions::default()
                 }),
                 references_provider: Some(OneOf::Left(true)),
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+                    ..SignatureHelpOptions::default()
+                }),
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 rename_provider: Some(OneOf::Right(RenameOptions {
                     prepare_provider: Some(true),
                     work_done_progress_options: WorkDoneProgressOptions::default(),
@@ -685,6 +690,87 @@ impl LanguageServer for Backend {
             is_incomplete: false,
             items,
         })))
+    }
+
+    async fn signature_help(
+        &self,
+        params: SignatureHelpParams,
+    ) -> RpcResult<Option<SignatureHelp>> {
+        let Some((file, byte)) = self.doc_position(&params.text_document_position_params) else {
+            return Ok(None);
+        };
+        if !self.ws.is_ready() {
+            return Ok(None); // Loading：语义请求返回空（§6.1 默认）
+        }
+        self.ws.ensure_file_fresh(file, &self.docs);
+        // label/doc 提取在索引读锁内完成（with 闭包），壳只映射容器
+        let out = self
+            .ws
+            .with(|idx| {
+                as_core::signature::signature_help(idx, file, byte).map(|sh| {
+                    let signatures = sh
+                        .overloads
+                        .iter()
+                        .map(|&d| SignatureInformation {
+                            label: as_core::signature::overload_label(idx, d),
+                            documentation: as_core::signature::overload_doc(idx, d)
+                                .map(Documentation::String),
+                            parameters: None, // label 内联形参（客户端按子串高亮）
+                            active_parameter: None,
+                        })
+                        .collect();
+                    SignatureHelp {
+                        signatures,
+                        active_signature: Some(sh.active),
+                        active_parameter: Some(sh.active_parameter),
+                    }
+                })
+            })
+            .flatten();
+        Ok(out)
+    }
+
+    async fn inlay_hint(
+        &self,
+        params: InlayHintParams,
+    ) -> RpcResult<Option<Vec<InlayHint>>> {
+        // file 只需路径 intern（overlay 一致性由 ensure_file_fresh 保证）
+        let Some(file) = uri_path(&params.text_document.uri)
+            .and_then(|p| as_core::intern::file_id_of_path(&p))
+        else {
+            return Ok(None);
+        };
+        if !self.ws.is_ready() {
+            return Ok(None); // Loading：语义请求返回空（§6.1 默认）
+        }
+        self.ws.ensure_file_fresh(file, &self.docs);
+        let hints = self
+            .ws
+            .with(|idx| {
+                let doc = idx.files.get(&file)?;
+                let src = &doc.source;
+                let lines = &doc.lines;
+                Some(
+                    as_core::inlay::inlay_hints(idx, file)
+                        .into_iter()
+                        .map(|h| {
+                            let (line, character) = lines.line_col_utf16(src, h.position);
+                            InlayHint {
+                                position: Position { line, character },
+                                label: InlayHintLabel::String(h.ty),
+                                kind: Some(InlayHintKind::TYPE),
+                                text_edits: None,
+                                tooltip: None,
+                                padding_left: Some(true),
+                                padding_right: None,
+                                data: None,
+                            }
+                        })
+                        .collect(),
+                )
+            })
+            .flatten();
+        Ok(hints)
     }
 
     async fn goto_definition(

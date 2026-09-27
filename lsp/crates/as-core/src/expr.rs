@@ -74,14 +74,16 @@ pub(crate) fn expr_type(
         }
         "named_argument" => expr_type(idx, ctx, src, node.child_by_field_name("value")?),
         "void_argument" => None,
-        // 字面量（数字后缀 / 进制与 D25 同规则；f-string → FString；n"" → FName）
-        "number" => Some(base_ty(
+        // 字面量（数字后缀 / 进制与 D25 同规则；f-string → FString；n"" → FName）。
+        // FString/FName 是引擎类型（.d.as 声明），非内建——索引里没有该类型
+        // 声明时返回 None（宁缺毋假）
+        "number" => base_ty(
             idx,
             number_base_name(syntax::text(node, src), idx.config.float_is_float64),
-        )),
-        "string_literal" | "heredoc_string" | "format_string" => Some(base_ty(idx, "FString")),
-        "name_literal" => Some(base_ty(idx, "FName")),
-        "boolean_literal" => Some(base_ty(idx, "bool")),
+        ),
+        "string_literal" | "heredoc_string" | "format_string" => base_ty(idx, "FString"),
+        "name_literal" => base_ty(idx, "FName"),
+        "boolean_literal" => base_ty(idx, "bool"),
         "null_literal" => None,
         "identifier" => ident_type(idx, ctx, src, node),
         "member_expression" => member_type(idx, ctx, src, node),
@@ -222,7 +224,7 @@ fn binary_type(idx: &WorkspaceIndex, ctx: &SemCtx, src: &str, node: Node<'_>) ->
         .unwrap_or("");
     // 比较 / 逻辑：结果恒为 bool（引擎 opEquals/opCmp 的比较结果类型）
     if matches!(op, "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||") {
-        return Some(base_ty(idx, "bool"));
+        return base_ty(idx, "bool");
     }
     let left = expr_type(idx, ctx, src, node.child_by_field_name("left")?)?;
     let right = expr_type(idx, ctx, src, node.child_by_field_name("right")?);
@@ -235,7 +237,7 @@ fn unary_type(idx: &WorkspaceIndex, ctx: &SemCtx, src: &str, node: Node<'_>) -> 
         .map(|o| syntax::text(o, src))
         .unwrap_or("");
     match op {
-        "!" => Some(base_ty(idx, "bool")),
+        "!" => base_ty(idx, "bool"),
         "+" => expr_type(idx, ctx, src, node.child_by_field_name("argument")?),
         "-" | "~" => {
             let t = expr_type(idx, ctx, src, node.child_by_field_name("argument")?)?;
@@ -286,7 +288,8 @@ fn arithmetic_type(
                     return None; // 位运算不跨域
                 }
                 match numeric_rank(rt) {
-                    Some(rrank) if rrank > lrank => Some(base_ty(idx, rt)),
+                    // rt 已验内建 primitive → base_ty 必命中
+                    Some(rrank) if rrank > lrank => base_ty(idx, rt),
                     Some(_) => Some(left),
                     None => None, // bool/void 不参与
                 }
@@ -522,11 +525,11 @@ fn pick_overload(
 // 类型辅助（从 resolve.rs 迁入 / 新增）
 // ---------------------------------------------------------------------------
 
-/// 基名 → ExprTy（含内建合成——bool/int/float64/FString…；syn 为 None：
-/// 字面量没有声明侧形态）。
-fn base_ty(idx: &WorkspaceIndex, name: &str) -> ExprTy {
-    let base = named_def_of(idx, intern_sym(name)).expect("内建类型必须已注入（D25）");
-    ExprTy { base, syn: None }
+/// 基名 → ExprTy（内建合成 bool/int/float64 一定命中；FString/FName 是
+/// 引擎类型（.d.as 声明），索引里缺失时 None——宁缺毋假，D14）。
+/// syn 为 None：字面量没有声明侧形态。
+fn base_ty(idx: &WorkspaceIndex, name: &str) -> Option<ExprTy> {
+    named_def_of(idx, intern_sym(name)).map(|base| ExprTy { base, syn: None })
 }
 
 /// DefId 的定型：字段/全局变量走声明 SynType；可调用走返回类型；
