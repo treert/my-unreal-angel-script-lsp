@@ -14,6 +14,7 @@
 pub mod config;
 pub mod decl_tags;
 pub mod expand;
+pub mod expr;
 pub mod hover;
 pub mod id;
 pub mod index;

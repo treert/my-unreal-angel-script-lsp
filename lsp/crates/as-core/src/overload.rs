@@ -91,8 +91,8 @@ fn param_base_name(idx: &WorkspaceIndex, ty: &SynType) -> Option<Sym> {
 /// 形参、且全部**可定型实参**与形参基名一致的候选。恰好一个 ⇒ 唯一命中；
 /// 否则 None（消歧失败——保留全部重载，消费方「报全部重载」）。
 ///
-/// 实参侧的定型子集见 `resolve::arg_type_base`（字面量 / 标识符 / 链式成员；
-/// 运算符 / f-string / range-for 留 M5 与 signatureHelp 同批）。
+/// 实参侧的定型见 `expr::expr_type`（M5a 全量子集：字面量 / 运算符重载 /
+/// f-string / range-for / 链式成员 / 调用返回……，D28 欠账清偿）。
 /// 不可定型实参（None）不排除也不确认候选——两个候选都过 ⇒ 仍 None。
 pub fn disambiguate(
     idx: &WorkspaceIndex,

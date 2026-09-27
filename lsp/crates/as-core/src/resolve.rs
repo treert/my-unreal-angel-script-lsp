@@ -13,19 +13,20 @@
 //! 参数是**字节偏移**而非 Pos——as-core 不引入行列概念（规划 §3.2.1）。
 //! 查询基于 `idx.files[file]` 的 CST 快照（server 侧保证 open 文件先重索引）。
 //!
-//! 本模块附带 `expr_type` 的 **M3 最小子集**（标识符 / this / 成员访问链 /
-//! 调用返回），供成员访问定位；auto / 字面量 / 运算符 / f-string 返回 None
-//! （宁缺毋假，D14），M4+ 扩。模板成员不做实例化（Phase 3 惰性，规划 §3.3）。
+//! 表达式定型管线在 `crate::expr`（M5a 从本模块迁出并完整化：字面量 /
+//! 运算符重载 / f-string / range-for 双跳 / 模板实参替换——D14/D28 欠账
+//! 清偿）。auto 局部与 range-for 迭代变量在 SemCtx 构建期惰性定型
+//!（请求驱动，扫描阶段仍不碰定型，D14）。
 
 use as_syntax::tree_sitter::Node;
 
-use crate::id::{DefId, FileId, Sym, TypeId};
+use crate::id::{DefId, FileId, Sym};
 use crate::index::WorkspaceIndex;
 use crate::intern::{intern_sym, sym_str};
 use crate::range::TextRange;
-use crate::symbol::{DefData, DefExtra, DefFlags, DefKind};
+use crate::symbol::{DefData, DefFlags, DefKind};
 use crate::syntax;
-use crate::types::{SynType, TypeKind};
+use crate::types::SynType;
 
 /// 查找链命中级数（§4.5 的 0-6）。
 pub const LEVEL_THIS_SUPER: u8 = 0;
@@ -79,14 +80,14 @@ pub struct Resolution {
 
 /// 光标处的语义语境：沿根→叶路径收集 namespace 链 / 所在类型 / 所在函数 /
 /// 可见局部。
-struct SemCtx<'t> {
-    ns_defs: Vec<DefId>, // innermost → outermost
-    ns_syms: Vec<Sym>,
-    type_def: Option<DefId>,
-    fn_def: Option<DefId>,
+pub(crate) struct SemCtx<'t> {
+    pub(crate) ns_defs: Vec<DefId>, // innermost → outermost
+    pub(crate) ns_syms: Vec<Sym>,
+    pub(crate) type_def: Option<DefId>,
+    pub(crate) fn_def: Option<DefId>,
     /// 参数 + 块内局部（入栈序：参数 → 外块 → 内块；查找**逆序** = 内层优先）
-    locals: Vec<LocalDecl>,
-    file: FileId,
+    pub(crate) locals: Vec<LocalDecl>,
+    pub(crate) file: FileId,
     _tree: std::marker::PhantomData<&'t ()>,
 }
 
@@ -177,26 +178,41 @@ impl<'t> SemCtx<'t> {
                     }
                 }
                 "block" => {
-                    collect_block_locals(node, src, byte, &mut ctx.locals);
+                    collect_block_locals(node, src, byte, idx, &mut ctx);
                 }
                 "for_statement" => {
                     // classic for 的初始化声明在整条 for 语句内可见
                     for (_f, child) in syntax::children_with_fields(node) {
                         if child.kind() == "variable_declaration" {
-                            collect_declarators(&child, src, byte, &mut ctx.locals);
+                            collect_declarators(&child, src, byte, idx, &mut ctx);
                         }
                     }
                 }
                 "for_each_statement" => {
                     // range-for 迭代变量：整条语句内可见（range 表达式里不可见
                     // ——声明点之后才入栈）。M4 修正：M3 写的 "range_for_statement"
-                    // 是不存在的节点 kind（死分支），正确 kind 是 for_each_statement
+                    // 是不存在的节点 kind（死分支），正确 kind 是 for_each_statement。
+                    // M5a：声明类型是 auto 时按引擎双跳协议定型
+                    // （expr::for_each_element，as_compiler.cpp:5745-5873）；
+                    // 失败保留 Auto（宁缺毋假，D14）
                     if let Some(name_node) = node.child_by_field_name("name") {
                         let span = syntax::span(name_node);
                         if span.start <= byte {
-                            let ty = node
+                            let declared = node
                                 .child_by_field_name("type")
                                 .and_then(|t| syntax::parse_syn_type(t, src));
+                            let ty = match &declared {
+                                Some(t) if crate::expr::is_auto_type(t) => {
+                                    crate::expr::for_each_element(idx, &ctx, src, node)
+                                        .map(|e| {
+                                            e.syn
+                                                .clone()
+                                                .unwrap_or_else(|| crate::expr::syn_of_base(idx, e.base))
+                                        })
+                                        .or(declared)
+                                }
+                                _ => declared,
+                            };
                             ctx.locals.push(LocalDecl {
                                 name: intern_sym(syntax::text(name_node, src)),
                                 kind: DefKind::LocalVar,
@@ -215,15 +231,29 @@ impl<'t> SemCtx<'t> {
 }
 
 /// 块内直接子声明语句的 declarator（声明点在 byte 之前才可见）。
-fn collect_block_locals(node: Node<'_>, src: &str, byte: u32, out: &mut Vec<LocalDecl>) {
+/// **边收集边入栈**：auto 定型要看见同块先行声明（`Vec A; auto S = A + B;`），
+/// 攒批回填会让先行局部在定型瞬间不可见。
+fn collect_block_locals(
+    node: Node<'_>,
+    src: &str,
+    byte: u32,
+    idx: &WorkspaceIndex,
+    ctx: &mut SemCtx,
+) {
     for (_f, child) in syntax::children_with_fields(node) {
         if child.kind() == "variable_declaration" {
-            collect_declarators(&child, src, byte, out);
+            collect_declarators(&child, src, byte, idx, ctx);
         }
     }
 }
 
-fn collect_declarators(decl: &Node<'_>, src: &str, byte: u32, out: &mut Vec<LocalDecl>) {
+fn collect_declarators(
+    decl: &Node<'_>,
+    src: &str,
+    byte: u32,
+    idx: &WorkspaceIndex,
+    ctx: &mut SemCtx,
+) {
     let ty = decl
         .child_by_field_name("type")
         .and_then(|t| syntax::parse_syn_type(t, src));
@@ -236,12 +266,34 @@ fn collect_declarators(decl: &Node<'_>, src: &str, byte: u32, out: &mut Vec<Loca
         if span.start > byte {
             continue; // 声明点在使用点之后：不可见
         }
-        out.push(LocalDecl {
+        // auto 定型（M5a，D14）：声明类型 auto + 有初始化式 + 查询点不在自身
+        // 初始化式内 → 取初始化表达式定型（失败保留 Auto——宁缺毋假）。
+        // 查询点在初始化式内时跳过（`auto X = F(|X|)` 的自引用防抖）
+        let ty = match (&ty, child.child_by_field_name("value")) {
+            (Some(t), Some(init)) if crate::expr::is_auto_type(t) => {
+                let inside_init =
+                    (init.start_byte() as u32) <= byte && byte < (init.end_byte() as u32);
+                if inside_init {
+                    ty.clone()
+                } else {
+                    match crate::expr::expr_type(idx, ctx, src, init) {
+                        Some(e) => Some(
+                            e.syn
+                                .clone()
+                                .unwrap_or_else(|| crate::expr::syn_of_base(idx, e.base)),
+                        ),
+                        None => ty.clone(),
+                    }
+                }
+            }
+            _ => ty.clone(),
+        };
+        ctx.locals.push(LocalDecl {
             name: intern_sym(syntax::text(name_node, src)),
             kind: DefKind::LocalVar,
             name_span: span,
             full_span: syntax::span(*decl),
-            ty: ty.clone(),
+            ty,
         });
     }
 }
@@ -365,7 +417,7 @@ pub fn resolve_at_node(
             resolve_scoped_last(idx, &ctx, scope_name, name)
         }
         Role::MemberProperty { object } => {
-            let recv = expr_type(idx, &ctx, src, object);
+            let recv = crate::expr::expr_type(idx, &ctx, src, object).map(|t| t.base);
             resolve_member(idx, &ctx, recv, name, /*scoped=*/false)
         }
         Role::Callee { call } => {
@@ -494,91 +546,17 @@ fn arg_type_bases(
     src: &str,
     call: Node<'_>,
 ) -> Vec<Option<DefId>> {
+    // M5a：实参定型统一走 expr::expr_type（字面量 / 运算符 / f-string /
+    // 链式成员 / 调用返回……全量子集，D28 欠账清偿）
     call.child_by_field_name("arguments")
         .map(|args| {
             syntax::children_with_fields(args)
                 .into_iter()
                 .filter(|(_, c)| c.kind() == "argument")
-                .map(|(_, a)| arg_type_base(idx, ctx, src, a))
+                .map(|(_, a)| crate::expr::expr_type(idx, ctx, src, a).map(|t| t.base))
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// 单实参的类型基（M4 可定型子集：字面量 / 标识符 / this / 链式成员 /
-/// 调用返回 / Cast 表达式；其余——运算符、f-string、initializer_list——None，
-/// 宁缺毋假，D14）。实参经 `expr_type`（M3 子集）或字面量规则定型。
-fn arg_type_base(
-    idx: &WorkspaceIndex,
-    ctx: &SemCtx<'_>,
-    src: &str,
-    arg: Node<'_>,
-) -> Option<DefId> {
-    // `argument` 是包装节点（argument_list 的直接子节点）：取其第一个具名子节点
-    let expr = if arg.kind() == "argument" {
-        syntax::children_with_fields(arg)
-            .into_iter()
-            .find(|(_, c)| c.is_named())
-            .map(|(_, c)| c)?
-    } else {
-        arg
-    };
-    let expr = match expr.kind() {
-        "named_argument" => expr.child_by_field_name("value")?,
-        "void_argument" => return None,
-        _ => expr,
-    };
-    match expr.kind() {
-        "number" => named_def_of(
-            idx,
-            intern_sym(number_base_name(syntax::text(expr, src), idx.config.float_is_float64)),
-        ),
-        "string_literal" | "heredoc_string" => named_def_of(idx, intern_sym("FString")),
-        "name_literal" => named_def_of(idx, intern_sym("FName")),
-        "boolean_literal" => named_def_of(idx, intern_sym("bool")),
-        "cast_expression" => expr
-            .child_by_field_name("type")
-            .and_then(|t| t.child_by_field_name("name"))
-            .and_then(|n| named_def_of(idx, intern_sym(syntax::text(n, src)))),
-        "parenthesized_expression" => {
-            let inner = syntax::children_with_fields(expr)
-                .into_iter()
-                .find(|(_, c)| c.is_named())
-                .map(|(_, c)| c)?;
-            arg_type_base(idx, ctx, src, inner)
-        }
-        _ => expr_type(idx, ctx, src, expr),
-    }
-}
-
-/// 数字字面量的基类型名（引擎语义：无后缀整数 → int；`1.5f` → float32；
-/// 其余浮点 → 裸 float，宽度按 IndexConfig 归一化——与 D25 同规则）。
-/// 进制前缀（0x/0b/0o/0d）优先判定，避免 `0x1E` 里的 E 被当科学计数法。
-fn number_base_name(text: &str, float_is_f64: bool) -> &'static str {
-    if text.ends_with('f') || text.ends_with('F') {
-        return "float32";
-    }
-    let radix_prefixed = text
-        .get(..2)
-        .map_or(false, |p| matches!(p, "0x" | "0X" | "0b" | "0B" | "0o" | "0O" | "0d" | "0D"));
-    if radix_prefixed || !(text.contains('.') || text.contains('e') || text.contains('E')) {
-        return "int";
-    }
-    if float_is_f64 {
-        "float64"
-    } else {
-        "float32"
-    }
-}
-
-/// 名字 → 类型 DefId（**含内建合成**——bool/int/float64；与 `type_def_of`
-/// 的差别只在不排除 SYNTHETIC，供实参定型比对用）。
-fn named_def_of(idx: &WorkspaceIndex, name: Sym) -> Option<DefId> {
-    idx.main
-        .get(&name)?
-        .iter()
-        .copied()
-        .find(|&id| idx.def(id).kind.is_type_like())
 }
 
 // ---------------------------------------------------------------------------
@@ -752,7 +730,7 @@ fn resolve_member(
 }
 
 /// 裸标识符（非调用）：0 this/super → 1 局部 → 2/3 成员(隐式 this) → 5/6。
-fn resolve_plain(idx: &WorkspaceIndex, ctx: &SemCtx, name: Sym) -> Option<Resolution> {
+pub(crate) fn resolve_plain(idx: &WorkspaceIndex, ctx: &SemCtx, name: Sym) -> Option<Resolution> {
     let name_str = sym_str(name);
 
     // 0. this / super（仅类/struct 方法体内；this 在静态/命名空间函数中不存在）
@@ -816,7 +794,12 @@ fn resolve_plain(idx: &WorkspaceIndex, ctx: &SemCtx, name: Sym) -> Option<Resolu
 
 /// 调用 callee（裸标识符）：1 局部 → 2/3 方法(隐式 this) → 4 mixin → 5/6。
 /// 与 plain 的差别：mixin 生效（引擎 :13436-13449——方法体内隐式压 this）。
-fn resolve_callee(idx: &WorkspaceIndex, ctx: &SemCtx, name: Sym, _argc: usize) -> Option<Resolution> {
+pub(crate) fn resolve_callee(
+    idx: &WorkspaceIndex,
+    ctx: &SemCtx,
+    name: Sym,
+    _argc: usize,
+) -> Option<Resolution> {
     let name_str = sym_str(name);
 
     if name_str == "this" || name_str == "Super" || name_str == "super" {
@@ -901,7 +884,7 @@ fn visible_global(idx: &WorkspaceIndex, id: DefId, ctx: &SemCtx) -> bool {
 
 /// 成员查找的逐层序列（近者在前）：class = self + 继承闭包；struct 单层（D16）；
 /// delegate/event = 展开成员集（M3b）。内建 primitive 无成员。
-fn member_search_space(idx: &WorkspaceIndex, def: DefId) -> Vec<DefId> {
+pub(crate) fn member_search_space(idx: &WorkspaceIndex, def: DefId) -> Vec<DefId> {
     let d = idx.def(def);
     if d.flags.contains(DefFlags::SYNTHETIC) {
         return vec![def];
@@ -918,7 +901,7 @@ fn member_search_space(idx: &WorkspaceIndex, def: DefId) -> Vec<DefId> {
     }
 }
 
-fn members_named(
+pub(crate) fn members_named(
     idx: &WorkspaceIndex,
     space: &[DefId],
     name: Sym,
@@ -937,7 +920,7 @@ fn members_named(
 /// 属性访问器模拟（§4.5 第 3 级）：Get<Name>/Set<Name>。
 /// 反向默认——不带 NOT_PROPERTY 即候选（§2.4.5）。
 /// 命名匹配两种拼写：`Get` + 原名 / `Get` + 首字母大写。
-fn find_accessors(idx: &WorkspaceIndex, space: &[DefId], name: Sym) -> Vec<DefId> {
+pub(crate) fn find_accessors(idx: &WorkspaceIndex, space: &[DefId], name: Sym) -> Vec<DefId> {
     let name_str = sym_str(name);
     let mut keys: Vec<Sym> = Vec::with_capacity(4);
     for prefix in ["Get", "Set"] {
@@ -1005,7 +988,7 @@ fn namespaces_named(idx: &WorkspaceIndex, name: Sym) -> Vec<DefId> {
         .unwrap_or_default()
 }
 
-fn builtin_target(idx: &WorkspaceIndex, name: Sym) -> Option<Target> {
+pub(crate) fn builtin_target(idx: &WorkspaceIndex, name: Sym) -> Option<Target> {
     idx.main
         .get(&name)?
         .iter()
@@ -1018,154 +1001,9 @@ fn builtin_target(idx: &WorkspaceIndex, name: Sym) -> Option<Target> {
 }
 
 // ---------------------------------------------------------------------------
-// 表达式定型（M3 最小子集，D14：失败返回 None——宁缺毋假）
+// 表达式定型：已迁出至 crate::expr（M5a 完整化——字面量 / 运算符重载 /
+// f-string / range-for 双跳 / 模板实参替换 / auto 惰性定型）
 // ---------------------------------------------------------------------------
-
-/// 表达式的「成员查找基类型」（具名 DefId）。不做模板实例化（Phase 3 惰性）。
-fn expr_type(idx: &WorkspaceIndex, ctx: &SemCtx, src: &str, node: Node<'_>) -> Option<DefId> {
-    match node.kind() {
-        "identifier" => {
-            if syntax::text(node, src) == "this" {
-                return ctx.type_def;
-            }
-            let name = intern_sym(syntax::text(node, src));
-            match resolve_plain(idx, ctx, name)?.targets.into_iter().next()? {
-                Target::Def(id) => def_type_base(idx, id),
-                Target::Local(l) => syn_type_base(idx, l.ty.as_ref()?),
-            }
-        }
-        "member_expression" => {
-            let base = expr_type(idx, ctx, src, node.child_by_field_name("object")?)?;
-            let prop = node.child_by_field_name("property")?;
-            let name = intern_sym(syntax::text(prop, src));
-            let space = member_search_space(idx, base);
-            // 字段优先；否则访问器 Get 的返回类型
-            if let Some(&f) = members_named(idx, &space, name, |d| d.kind == DefKind::Field).first()
-            {
-                return def_type_base(idx, f);
-            }
-            for a in find_accessors(idx, &space, name) {
-                if let Some(t) = call_return_base(idx, a) {
-                    return Some(t);
-                }
-            }
-            None
-        }
-        "call_expression" => {
-            let f = node.child_by_field_name("function")?;
-            let argc = argument_count(node);
-            match f.kind() {
-                "identifier" => {
-                    let name = intern_sym(syntax::text(f, src));
-                    let res = resolve_callee(idx, ctx, name, argc)?;
-                    match res.targets.into_iter().next()? {
-                        Target::Def(id) => {
-                            match idx.def(id).kind {
-                                // 构造调用 `FVector(1,2,3)`：返回类型即类型本身
-                                DefKind::Class | DefKind::Struct | DefKind::Enum => Some(id),
-                                _ => call_return_base(idx, id),
-                            }
-                        }
-                        Target::Local(l) => syn_type_base(idx, l.ty.as_ref()?),
-                    }
-                }
-                "member_expression" => {
-                    let base = expr_type(idx, ctx, src, f.child_by_field_name("object")?)?;
-                    let prop = f.child_by_field_name("property")?;
-                    let name = intern_sym(syntax::text(prop, src));
-                    let space = member_search_space(idx, base);
-                    let mut cands = members_named(idx, &space, name, |d| {
-                        matches!(d.kind, DefKind::Method | DefKind::Function)
-                    });
-                    if cands.is_empty() {
-                        cands = find_accessors(idx, &space, name);
-                    }
-                    // 实参个数排序（真实类型 M4/M5 接入）
-                    let placeholders = vec![TypeId::from_raw(0); argc];
-                    let ranked = crate::overload::resolve_overload(idx, &cands, &placeholders);
-                    for r in ranked {
-                        if r.score != crate::overload::OverloadScore::ArityMiss {
-                            return call_return_base(idx, r.def);
-                        }
-                    }
-                    cands.first().and_then(|&c| call_return_base(idx, c))
-                }
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-/// DefId 的类型基（字段/全局变量走 resolved；类型与 delegate/event 即自身）。
-fn def_type_base(idx: &WorkspaceIndex, def: DefId) -> Option<DefId> {
-    match idx.def(def).kind {
-        DefKind::Class | DefKind::Struct | DefKind::Enum | DefKind::Delegate | DefKind::Event => {
-            Some(def)
-        }
-        DefKind::Field | DefKind::GlobalVar | DefKind::VirtualProperty | DefKind::AssetDecl => {
-            let &t = idx.resolved.get(&def)?;
-            named_base(idx, t)
-        }
-        _ => None,
-    }
-}
-
-/// TypeId 剥壳取具名基类（index::named_base_of 的只读版）。
-fn named_base(idx: &WorkspaceIndex, t: TypeId) -> Option<DefId> {
-    let mut cur = t;
-    loop {
-        match idx.types.get(cur) {
-            TypeKind::Named { def, .. } => return Some(*def),
-            TypeKind::Ref(inner, _) | TypeKind::Const(inner) | TypeKind::Array(inner) => cur = *inner,
-            _ => return None,
-        }
-    }
-}
-
-/// 语法层类型 → 具名基类型（局部/形参不走 resolved，直接查名）。
-fn syn_type_base(idx: &WorkspaceIndex, syn: &SynType) -> Option<DefId> {
-    match syn {
-        SynType::Primitive(name, _) => {
-            let key = if sym_str(*name) == "float" {
-                intern_sym(if idx.config.float_is_float64 { "float64" } else { "float32" })
-            } else {
-                *name
-            };
-            builtin_target(idx, key).map(|t| match t {
-                Target::Def(d) => d,
-                _ => unreachable!(),
-            })
-        }
-        SynType::Named(name, _) | SynType::Template { name, .. } => {
-            type_def_of(idx, *name)
-        }
-        SynType::Const(inner) | SynType::Ref(inner, _) | SynType::UnresolvedObject(inner) => {
-            syn_type_base(idx, inner)
-        }
-        // `T[]` 的成员查找落在 TArray 模板本体上（实例化 Phase 3 惰性）
-        SynType::Array(_) => type_def_of(idx, intern_sym("TArray")),
-        SynType::Qualified(_) | SynType::Auto | SynType::Wildcard => None,
-    }
-}
-
-fn type_def_of(idx: &WorkspaceIndex, name: Sym) -> Option<DefId> {
-    idx.main
-        .get(&name)?
-        .iter()
-        .copied()
-        .find(|&id| {
-            idx.def(id).kind.is_type_like() && !idx.def(id).flags.contains(DefFlags::SYNTHETIC)
-        })
-}
-
-/// 可调用的返回类型基（Callable.return_type → 具名基类）。
-fn call_return_base(idx: &WorkspaceIndex, def: DefId) -> Option<DefId> {
-    match &idx.def(def).extra {
-        DefExtra::Callable { return_type: Some(t), .. } => syn_type_base(idx, t),
-        _ => None,
-    }
-}
 
 #[cfg(test)]
 mod tests {
