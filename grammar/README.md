@@ -185,7 +185,7 @@ Get-ChildItem test\corpus\*.txt | ForEach-Object {
 | 全局变量 / 类成员上的 `&` | `ParseDeclaration` 用 `!isClassProp && !isGlobalVar` 守卫引用后缀，只有**局部**变量能是引用。 |
 | 直接把赋值当实参 `f(a = b)` | 实参是 `ParseCondition()` 而非 ASSIGN；且 `a = b` 会被优先当成命名实参。 |
 | 裸 enum 值 `Value`（不带 `MyEnum::`） | `asEP_REQUIRE_ENUM_SCOPE = 1`，符号查找跳过裸值兜底分支（`as_compiler.cpp:11815`），落入通用「未找到」错误（诊断归 `AS04xx`，P3/P4 占号）。 |
-| **`.as` 里的模板声明头** `class TFoo<T> {...}` | 本文法接受（`type_parameters` 为 `.d.as` 而设，同一 parser 无法按后缀关闭）。引擎侧 `ParseClass` 在标识符后不认 `<` → **parse error `Expected '{'`**；UE 预处理器的类名正则也不含 `<>`（`AngelscriptPreprocessor.cpp:723`）。语义层须报诊断，待取证占号（码表 §7.1）。 |
+| **`.as` 里的模板声明头** `class TFoo<T> {...}` | 本文法接受（`type_parameters` 为 `.d.as` 而设，同一 parser 无法按后缀关闭）。引擎侧 `ParseClass` 在标识符后不认 `<` → **parse error `Expected '{'`**；UE 预处理器的类名正则也不含 `<>`（`AngelscriptPreprocessor.cpp:723`）。若要报错须由语义层做，**是否实现按需决定**（素材见 `docs/诊断码表.md` §2 末段）。 |
 | **`.as` 里的 `?` / `unresolved_object`** | 同理：为 `.d.as` 而设的节点在 `.as` 中一律非法（引擎内部语法 §1.4 / §3.2）。 |
 
 > lambda 与 import 原先也在此表（语法放行 + `AS0107`/`AS0904` 语义诊断），
