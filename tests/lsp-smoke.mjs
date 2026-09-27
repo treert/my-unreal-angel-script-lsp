@@ -213,6 +213,20 @@ if (!beginOk || !endOk) {
   fail(`progress begin/end missing: ${JSON.stringify(progressMsgs.map((n) => n.params?.value))}`);
 }
 
-console.log(`SMOKE OK: legend ${legend.length} types, ${tokenCount} tokens, symbols OK, didOpen logged=${opened}, hover/definition/references/rename/workspaceSymbol OK, $/progress msgs=${progressMsgs.length}`);
+// ---- M4 可观测性：myas/indexStatus（索引就绪自定义通知）----
+// 注：冒烟场景 workspace 为空（rootUri null），初始 ready 的 files=0 是
+// 正确行为（overlay 文件按需惰性索引）——数量断言在真实工作区 e2e 做
+const ready = notifications.filter((n) => n.method === 'myas/indexStatus');
+if (ready.length === 0) fail('no myas/indexStatus notification');
+const readyParams = ready[ready.length - 1]?.params ?? {};
+if (readyParams.state !== 'ready') fail(`indexStatus state: ${JSON.stringify(readyParams)}`);
+if (typeof readyParams.files !== 'number') {
+  fail(`indexStatus files: ${JSON.stringify(readyParams)}`);
+}
+if (typeof readyParams.floatIsFloat64 !== 'boolean') {
+  fail(`indexStatus floatIsFloat64: ${JSON.stringify(readyParams)}`);
+}
+
+console.log(`SMOKE OK: legend ${legend.length} types, ${tokenCount} tokens, symbols OK, didOpen logged=${opened}, hover/definition/references/rename/workspaceSymbol OK, $/progress msgs=${progressMsgs.length}, indexStatus files=${readyParams.files}`);
 p.kill();
 process.exit(0);

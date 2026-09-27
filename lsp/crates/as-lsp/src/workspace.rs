@@ -59,6 +59,10 @@ pub struct WorkspaceState {
     /// 重建互斥（`.d.as` 防抖触发 vs 配置变更触发的全量重建不并发——
     /// `watch::run_rebuild` 自旋占用）
     pub building: AtomicBool,
+    /// 索引就绪通知通道（`myas/indexStatus`）：后台 std 线程（冷启动 /
+    /// 防抖重建）不能跨 await 调 client——经 unbounded channel 转给 main
+    /// 里 spawn 的 tokio 转发任务。None = 通道未接（单测）
+    ready_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>>,
 }
 
 impl WorkspaceState {
@@ -70,6 +74,25 @@ impl WorkspaceState {
             stale: Mutex::new(HashSet::new()),
             use_cache: Mutex::new(HashMap::new()),
             building: AtomicBool::new(false),
+            ready_tx: Mutex::new(None),
+        }
+    }
+
+    /// 接上索引就绪通知通道（main 启动转发任务时调用）。
+    pub fn set_ready_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>) {
+        *self.ready_tx.lock().unwrap() = Some(tx);
+    }
+
+    /// 索引快照发布后发 `myas/indexStatus`（状态栏 ready + floatIsFloat64
+    /// 生效值——架构设计 §8 风险 11 的既定缓解项）。send 是非阻塞的。
+    pub fn notify_ready(&self, float_is_float64: bool, files: usize, elapsed_ms: u128) {
+        if let Some(tx) = self.ready_tx.lock().unwrap().as_ref() {
+            let _ = tx.send(serde_json::json!({
+                "state": "ready",
+                "files": files,
+                "floatIsFloat64": float_is_float64,
+                "elapsedMs": elapsed_ms as u64,
+            }));
         }
     }
 

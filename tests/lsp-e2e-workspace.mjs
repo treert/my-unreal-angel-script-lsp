@@ -122,7 +122,12 @@ const progressMsgs = notifications.filter((n) => n.method === '$/progress');
 const beginOk = progressMsgs.some((n) => n.params?.value?.kind === 'begin');
 const endOk = progressMsgs.some((n) => n.params?.value?.kind === 'end');
 if (!beginOk || !endOk) fail(`$/progress begin/end missing (${progressMsgs.length} msgs)`);
-console.log(`references -> ${refs.length} sites across ${declFiles.size} files; $/progress msgs=${progressMsgs.length}`);
+// myas/indexStatus：真实工作区应报告全部收集文件（27 script + 414 decl）
+const ready = notifications.filter((n) => n.method === 'myas/indexStatus').map((n) => n.params);
+if (!ready.some((p) => p?.state === 'ready' && p.files === 441)) {
+  fail(`myas/indexStatus expected 441 files, got: ${JSON.stringify(ready)}`);
+}
+console.log(`references -> ${refs.length} sites across ${declFiles.size} files; $/progress msgs=${progressMsgs.length}; indexStatus files=${ready[ready.length - 1]?.files}`);
 
 console.log(`E2E OK: hover=struct FVector; definition -> ${decodeURIComponent(locs[0].uri).split('/').pop()}:${locs[0].range.start.line + 1}; references=${refs.length}`);
 p.kill();

@@ -46,19 +46,42 @@ struct Backend {
     debouncer: OnceLock<DeclDebouncer>,
 }
 
+/// 自定义通知 `myas/indexStatus`（server → client）：索引快照发布后的
+/// 可观测性——状态栏 ready + `floatIsFloat64` 生效值（架构设计 §8 风险 11
+/// 的既定缓解项）。Params 用 `serde_json::Value`（免直接依赖 serde derive）。
+struct IndexStatus;
+impl ls::notification::Notification for IndexStatus {
+    type Params = serde_json::Value;
+    const METHOD: &'static str = "myas/indexStatus";
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::build(|client| Backend {
-        client,
-        docs: Arc::new(Mutex::new(DocStore::new())),
-        config: Arc::new(Mutex::new(WorkspaceConfig::default())),
-        ws: Arc::new(WorkspaceState::new()),
-        folders: Arc::new(Mutex::new(Vec::new())),
-        watch_supported: Mutex::new(false),
-        debouncer: OnceLock::new(),
+    let (service, socket) = LspService::build(|client| {
+        // 索引就绪通知转发：后台 std 线程（冷启动 / 防抖重建）不能跨 await
+        // 调 client——经 unbounded channel 转给本 tokio 任务（current_thread
+        // runtime 由 serve() 驱动，任务随之运行）
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+        let notifier = client.clone();
+        tokio::spawn(async move {
+            while let Some(v) = rx.recv().await {
+                let _ = notifier.send_notification::<IndexStatus>(v).await;
+            }
+        });
+        let ws = Arc::new(WorkspaceState::new());
+        ws.set_ready_tx(tx);
+        Backend {
+            client,
+            docs: Arc::new(Mutex::new(DocStore::new())),
+            config: Arc::new(Mutex::new(WorkspaceConfig::default())),
+            ws,
+            folders: Arc::new(Mutex::new(Vec::new())),
+            watch_supported: Mutex::new(false),
+            debouncer: OnceLock::new(),
+        }
     })
     .finish();
 

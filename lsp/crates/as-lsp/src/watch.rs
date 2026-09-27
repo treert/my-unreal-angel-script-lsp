@@ -164,8 +164,11 @@ pub fn run_rebuild(
         let store = docs.lock().unwrap();
         store.overlays()
     };
+    let t0 = std::time::Instant::now();
     let idx = workspace::build_index(&cfg, &folders, &overlays);
+    let files = idx.files.len();
     ws.publish_and_replay(idx, docs);
+    ws.notify_ready(cfg.float_is_float64, files, t0.elapsed().as_millis());
     ws.building.store(false, Ordering::SeqCst);
 }
 

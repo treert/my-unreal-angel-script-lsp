@@ -106,7 +106,14 @@ Write-Host "    Target ($LaunchTargetLabel): $LaunchTarget"
 # batch wrapper; Start-Process mangles embedded quotes when handing args to
 # cmd.exe, which broke workspace opening. The CLI detaches itself and
 # returns immediately, so direct invocation is both correct and non-blocking.
-& $EditorCli "--extensionDevelopmentPath=$ExtDir" "$LaunchTarget"
+#
+# --new-window: `code` hands the request to an already-running VS Code
+# instance; if the target workspace is ALREADY open in a normal (non-EDH)
+# window, VS Code focuses that window and silently ignores
+# --extensionDevelopmentPath — the dev extension never loads and every
+# feature appears "not working". Forcing a new window guarantees the EDH
+# (with our dev extension) actually opens.
+& $EditorCli "--new-window" "--extensionDevelopmentPath=$ExtDir" "$LaunchTarget"
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Editor CLI exited with code $LASTEXITCODE."
     exit $LASTEXITCODE
