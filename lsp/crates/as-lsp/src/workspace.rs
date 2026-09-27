@@ -22,7 +22,8 @@ use as_core::intern::{file_id_of_path, file_path, intern_file};
 use as_core::references::{resolve_file_uses, UseResolution};
 use as_core::{filename_to_module_name, FileInput, FileKind, IndexConfig, WorkspaceIndex};
 
-use crate::as_log;
+use as_core::as_log;
+
 use crate::docs::DocStore;
 
 /// 索引级配置（§5）。任一变更 ⇒ 后台全量重建（§5.3）。

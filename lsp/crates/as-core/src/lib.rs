@@ -17,6 +17,7 @@ pub mod hover;
 pub mod id;
 pub mod index;
 pub mod intern;
+pub mod logger;
 pub mod outline;
 pub mod overload;
 pub mod range;

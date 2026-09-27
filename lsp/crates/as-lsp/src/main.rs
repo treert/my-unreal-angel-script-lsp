@@ -11,9 +11,12 @@
 //! UTF-16 ↔ 字节换算只在本层发生（经 as-core `range.rs` 原语，§3.2.1）。
 
 mod docs;
-mod logger;
 mod watch;
 mod workspace;
+
+// 文件日志设施在 as-core（宏随 `#[macro_export]` 落 as_core crate 根），
+// init 由本 crate 在配置加载后调用（见 initialized）
+use as_core::as_log;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -330,7 +333,7 @@ impl LanguageServer for Backend {
         self.client.log_message(MessageType::INFO, msg).await;
         // 文件日志（logger::init 必须早于索引构建，会话头/构建过程才能进文件）
         let folders = self.folders.lock().unwrap().clone();
-        logger::init(&folders, *self.debug_file_log.lock().unwrap());
+        as_core::logger::init(&folders, *self.debug_file_log.lock().unwrap());
         {
             let config = self.config.lock().unwrap();
             as_log!(

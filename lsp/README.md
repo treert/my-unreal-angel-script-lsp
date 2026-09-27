@@ -209,3 +209,7 @@ server 侧日志写 `<第一个 workspace 根>/.vscode/my-as-lsp.log`（截断�
 exe 路径 + mtime、配置、工作区根）、索引重建（roots / 文件数 / 耗时）、
 pending dirty 重放、编辑重索引（含声明面指纹变化）、watched-files 处置、
 `.d.as` 防抖触发、references 耗时。关闭时零开销（AtomicBool 快速门）。
+
+设施本体在 `as-core/src/logger.rs`（依赖图底层——as-core / as-lsp / as-cli
+都能 `as_log!`；`init` 由 as-lsp 在配置加载后调用）。这是 as-core「纯库
+no IO」原则的显式例外：核心逻辑只调 `as_log!`，不做 IO 决策。

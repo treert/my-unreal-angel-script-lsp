@@ -101,6 +101,7 @@ name = "as-core"
 version = "0.1.0"
 dependencies = [
  "as-syntax",
+ "chrono",
  "lasso",
  "rayon",
 ]
@@ -110,7 +111,6 @@ name = "as-lsp"
 version = "0.1.0"
 dependencies = [
  "as-core",
- "chrono",
  "serde_json",
  "tokio",
  "tower-lsp-server",

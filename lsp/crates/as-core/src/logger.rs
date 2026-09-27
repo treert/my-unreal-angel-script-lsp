@@ -1,6 +1,11 @@
-//! 文件日志（仿 mylua-lsp `logger.rs`）：`myAngelScriptLsp.debug.fileLog`
-//! 开启时写 `<第一个 workspace folder>/.vscode/my-as-lsp.log`，并双写
-//! stderr——被 vscode-languageclient 捕获进「my-as-lsp」输出通道。
+//! 文件日志（仿 mylua-lsp `logger.rs`，下沉到 as-core 供全部上游 crate
+//! 使用）：`myAngelScriptLsp.debug.fileLog` 开启时写
+//! `<第一个 workspace folder>/.vscode/my-as-lsp.log`，并双写 stderr——被
+//! vscode-languageclient 捕获进「my-as-lsp」输出通道。
+//!
+//! **as-core 纯库原则的唯二例外之一**（IO）：本模块是可选调试设施——由
+//! 宿主 crate（as-lsp）在配置加载后调用 [`init`] 开关；关闭时（默认）
+//! [`as_log!`] 宏零成本，核心逻辑完全无感。核心逻辑自身不调用 `init`。
 //!
 //! 设计要点（与 mylua 同款）：
 //! - **快速门**：`as_log!` 宏先读 `AtomicBool`（单次 relaxed load）再
