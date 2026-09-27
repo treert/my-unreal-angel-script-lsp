@@ -311,6 +311,22 @@ fn collect_identifiers(node: Node<'_>, src: &str) -> Vec<(Sym, TextRange)> {
     out
 }
 
+/// 标识符是否处于说明符语境（UPROPERTY/UFUNCTION/UCLASS 宏参数、方法属性、
+/// 说明符列表）——这些标识符是 specifier 而非符号使用点，查找链不解析。
+pub fn in_specifier_context(ident: Node<'_>) -> bool {
+    let mut a = ident.parent();
+    while let Some(p) = a {
+        match p.kind() {
+            "macro_argument" | "function_attribute" => return true,
+            k if k.ends_with("_specifiers") => return true,
+            "source_file" => return false,
+            _ => {}
+        }
+        a = p.parent();
+    }
+    false
+}
+
 /// 形参数：`(void)` 视为空参表（grammar 偏差 §3）。
 pub fn param_count(node: Node<'_>, src: &str) -> usize {
     let Some(params) = node.child_by_field_name("parameters") else {
@@ -361,6 +377,7 @@ pub fn param_decls(node: Node<'_>, src: &str) -> Vec<ParamDecl> {
             .and_then(|t| parse_syn_type(t, src));
         out.push(ParamDecl {
             name: intern_sym(name_str),
+            span: span(name_node),
             ty,
             flags,
         });

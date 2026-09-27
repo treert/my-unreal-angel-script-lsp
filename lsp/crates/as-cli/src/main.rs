@@ -55,6 +55,10 @@ enum Command {
         /// 只列出指定名字的符号（kind + 位置 + tags + doc 首行）
         #[arg(long)]
         sym: Option<String>,
+
+        /// 对全部 .as 脚本的标识符使用点跑查找链（M3 验收：命中率 + 未命中样本）
+        #[arg(long)]
+        resolve_stats: bool,
     },
 }
 
@@ -62,8 +66,8 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::DumpTree { paths, trees } => dump_tree(&paths, trees),
-        Command::DumpIndex { paths, float_is_float32, sym } => {
-            dump_index(&paths, !float_is_float32, sym)
+        Command::DumpIndex { paths, float_is_float32, sym, resolve_stats } => {
+            dump_index(&paths, !float_is_float32, sym, resolve_stats)
         }
     }
 }
@@ -224,7 +228,12 @@ fn render_node(node: Node<'_>, src: &str, indent: usize, prefix: &str, out: &mut
 // dump-index（M1）
 // ===========================================================================
 
-fn dump_index(paths: &[PathBuf], float_is_float64: bool, sym_filter: Option<String>) -> ExitCode {    let files = match collect_inputs(paths) {
+fn dump_index(
+    paths: &[PathBuf],
+    float_is_float64: bool,
+    sym_filter: Option<String>,
+    resolve_stats: bool,
+) -> ExitCode {    let files = match collect_inputs(paths) {
         Ok(files) => files,
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -404,11 +413,87 @@ fn dump_index(paths: &[PathBuf], float_is_float64: bool, sym_filter: Option<Stri
         }
     }
 
+    // --resolve-stats：对全部 .as 脚本的标识符使用点跑查找链（M3 验收体检）。
+    // specifier 语境（UPROPERTY 宏参数等）与命名实参名不计入——前者不是符号
+    // 使用点，后者的解析（callee 形参匹配）随 M5 签名帮助同批。
+    if resolve_stats {
+        let mut total = 0usize;
+        let mut hit = 0usize;
+        let mut skipped_spec = 0usize;
+        let mut skipped_named_arg = 0usize;
+        let mut misses: Vec<String> = Vec::new();
+        let script_files: Vec<_> = idx
+            .files
+            .iter()
+            .filter(|(_, s)| s.kind == FileKind::Script)
+            .map(|(f, _)| *f)
+            .collect();
+        for file in script_files {
+            let snap = idx.files.get(&file).unwrap();
+            let src = &snap.source;
+            for ident in collect_identifier_nodes(snap.tree.root_node()) {
+                if as_core::syntax::in_specifier_context(ident) {
+                    skipped_spec += 1;
+                    continue;
+                }
+                if ident.parent().map(|p| p.kind() == "named_argument").unwrap_or(false) {
+                    skipped_named_arg += 1;
+                    continue;
+                }
+                total += 1;
+                if as_core::resolve::resolve_at(&idx, file, ident.start_byte() as u32).is_some() {
+                    hit += 1;
+                } else if misses.len() < 20 {
+                    let text = ident.utf8_text(src.as_bytes()).unwrap_or("");
+                    let (line, col) = snap.lines.line_col_debug(ident.start_byte() as u32);
+                    misses.push(format!(
+                        "  MISS {}:{}:{col} {text}",
+                        file_path(file).unwrap_or("?"),
+                        line
+                    ));
+                }
+            }
+        }
+        println!(
+            "--- resolve-stats (script identifiers) ---\n  hit {hit}/{total} ({:.1}%), skipped: specifiers {skipped_spec}, named-args {skipped_named_arg}",
+            if total == 0 { 0.0 } else { hit as f64 / total as f64 * 100.0 }
+        );
+        if !misses.is_empty() {
+            println!("  miss samples:");
+            for m in &misses {
+                println!("{m}");
+            }
+        }
+    }
+
     if n_err > 0 || read_failures > 0 || bad_utf8 > 0 {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// 收集全部 identifier / primitive_type 节点（使用点 + 声明点都算——
+/// 声明点走 LEVEL_DECL_SELF 自指命中，也在统计内）。
+fn collect_identifier_nodes(root: Node<'_>) -> Vec<Node<'_>> {
+    let mut out = Vec::new();
+    fn walk<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
+        if node.kind() == "identifier" || node.kind() == "primitive_type" {
+            out.push(node);
+            return; // 叶子，不再下潜
+        }
+        let mut c = node.walk();
+        if c.goto_first_child() {
+            loop {
+                walk(c.node(), out);
+                if !c.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+    walk(root, &mut out);
+    out
 }
 
 /// `.as` 与 `.d.as` 都以 `.as` 结尾；`.d.as` → Decl（Phase 0 文件类别标签）。

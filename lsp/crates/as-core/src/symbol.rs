@@ -71,6 +71,15 @@ impl DefKind {
         matches!(self, DefKind::Class | DefKind::Struct | DefKind::Enum)
     }
 
+    /// 类型**名**可指向的声明全集：is_type_decl + delegate/event
+    /// （delegate/event 也是类型——可声明变量、作形参类型；展开成员集见 expand）。
+    pub fn is_type_like(self) -> bool {
+        matches!(
+            self,
+            DefKind::Class | DefKind::Struct | DefKind::Enum | DefKind::Delegate | DefKind::Event
+        )
+    }
+
     /// 是否为类型体的成员（成员表 / member_count 对账口径）。
     pub fn is_type_member(self) -> bool {
         matches!(
@@ -148,6 +157,8 @@ impl std::ops::BitOrAssign for DefFlags {
 #[derive(Clone, Debug)]
 pub struct ParamDecl {
     pub name: Sym,
+    /// 名字 token（局部形参 definition/hover 的锚点）
+    pub span: TextRange,
     /// 声明类型（语法层，未归一化）
     pub ty: Option<SynType>,
     /// `InArgN` 占位名 → UNNAMED_PARAM（架构设计 §2.4.6，命名实参补全须跳过）

@@ -790,14 +790,14 @@ impl WorkspaceIndex {
         }
     }
 
-    /// 名字 → 类型声明 DefId（class/struct/enum；同名 namespace 不算——
-    /// §2.2.1 推论 1 的类型/命名空间双落点按语境择一是查找链的事）。
+    /// 名字 → 类型声明 DefId（class/struct/enum/delegate/event；同名 namespace
+    /// 不算——§2.2.1 推论 1 的类型/命名空间双落点按语境择一是查找链的事）。
     pub fn lookup_type_def(&self, name: Sym) -> Option<DefId> {
         self.main
             .get(&name)?
             .iter()
             .copied()
-            .find(|&id| self.symbols.get(id).kind.is_type_decl())
+            .find(|&id| self.symbols.get(id).kind.is_type_like())
     }
 
     /// 类型渲染（dump/调试用）。

@@ -19,6 +19,7 @@ pub mod intern;
 pub mod outline;
 pub mod overload;
 pub mod range;
+pub mod resolve;
 pub mod symbol;
 pub mod syntax;
 pub mod tokens;
@@ -32,6 +33,10 @@ pub use index::{filename_to_module_name, FileInput, FileKind, IndexConfig, Works
 pub use outline::{document_symbols, folding_ranges, Fold, FoldKind, OutlineKind, OutlineSymbol};
 pub use overload::{OverloadScore, Ranked};
 pub use range::{LineIndex, TextRange};
+pub use resolve::{
+    resolve_at, LocalDecl, Resolution, Target, LEVEL_ACCESSOR, LEVEL_DECL_SELF, LEVEL_GLOBAL,
+    LEVEL_LOCAL, LEVEL_MEMBER, LEVEL_MIXIN, LEVEL_NAMESPACE, LEVEL_THIS_SUPER,
+};
 pub use symbol::{BaseRef, DefData, DefExtra, DefFlags, DefKind, ParamDecl, SymbolTable};
 pub use tokens::{semantic_tokens, SemanticToken, LEGEND};
 pub use types::{RefKind, SynType, TypeKind, TypeTable};
