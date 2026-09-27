@@ -33,9 +33,10 @@ npx tree-sitter parse -q -s '<glob>'         # 批量语料验证（统计错误
 | `Demo_AS/Script/**/*.as`（含 unreal-angelscript 官方 demo） | 27 | 100% 无 ERROR |
 | `Demo_AS/Saved/AS-Cache/*.d.as`（UE 导出的类型声明） | 414 | 100% 无 ERROR |
 | `UnrealEngine/Script-Examples/**/*.as` | 26 | 100% 无 ERROR |
-| `test/corpus` | 42 条 | 全部通过 |
+| `test/corpus` | 40 条 | 全部通过 |
 
-corpus 覆盖率：**具名节点 97/97、终结符 132/132，均 100%**。
+corpus 覆盖率：**具名节点 94/94、终结符 129/129，均 100%**。
+（2026-09 移除 lambda / import 两条用例与三个节点后复算。）
 新增文法节点/终结符时应同步补用例以保持该数字，复算脚本（PowerShell）：
 
 ```powershell
@@ -128,9 +129,15 @@ Get-ChildItem test\corpus\*.txt | ForEach-Object {
 6. **`default` 语句接受任意表达式**（`default Tags.Add(n"Tag");`），不限于赋值。
 7. **表达式层级**按 BNF Part 4 的显式优先级实现（引擎是扁平 EXPR + 编译期定序）；
    `**` 右结合，其余二元运算左结合。
-8. **未实现 `[dead]` 顶层声明**（`import` / `typedef` / `interface` / `funcdef`）与
+8. **未实现 `[dead]` 顶层声明**（`typedef` / `interface` / `funcdef`，token 已从引擎移除）与
    引擎内部类型修饰（`+`、`if_handle_then_const`、`handle_only`、`__auto_constref_type`、
-   `__any_implicit_integer`）—— 前者 token 已从引擎移除，后者只出现在 C++ 注册串里。
+   `__any_implicit_integer`，后者只出现在 C++ 注册串里）。
+   **`import` 与 lambda 也不实现**（BNF 标 `[paper]`）：两者的 token 都是活的、引擎 parser
+   都接受，但下游**永远不可用**——lambda 恒报编译错误（唯一出口是转换到 funcdef，而
+   funcdef 已死，`as_compiler.cpp:6291`）；import 的宿主绑定在 AngelscriptCode 全模块为 0
+   （运行期才报 "Unbound function called"）。文法层直接拒绝比「放行再报语义错」更贴近
+   实际运行的东西。同因不实现 mixin class：引擎 `ParseMixin` 只接受 mixin **函数**
+   （`as_parser.cpp:3700`），mixin class 在引擎侧就是 parse error。
    `?`（通配类型，`.d.as` 的 `void opCast(? Address)`）和 `unresolved_object` 已实现。
 9. **f-string 嵌套格式说明符**（`f"{a:{fmt}}"`）暂不支持，会落入错误恢复。
 
@@ -147,6 +154,10 @@ Get-ChildItem test\corpus\*.txt | ForEach-Object {
 | `struct` 内的 `default` 语句 | `ParseClass` 用 `!isStruct` 守卫，`default` 仅限 `class`。 |
 | 全局变量 / 类成员上的 `&` | `ParseDeclaration` 用 `!isClassProp && !isGlobalVar` 守卫引用后缀，只有**局部**变量能是引用。 |
 | 直接把赋值当实参 `f(a = b)` | 实参是 `ParseCondition()` 而非 ASSIGN；且 `a = b` 会被优先当成命名实参。 |
+| 裸 enum 值 `Value`（不带 `MyEnum::`） | `asEP_REQUIRE_ENUM_SCOPE = 1`，符号查找跳过裸值兜底分支（`as_compiler.cpp:11815`），落入通用「未找到」错误（诊断归 `AS04xx`，P3/P4 占号）。 |
+
+> lambda 与 import 原先也在此表（语法放行 + `AS0107`/`AS0904` 语义诊断），
+> 2026-09 决策改为**文法层直接不实现**（见偏差 §8），两个诊断码随之 retired。
 
 虚属性访问器的属性集与普通方法相同（`ParseVirtualPropertyDecl` 直接调
 `ParseMethodAttributes`），`function_attribute` 已覆盖其全部 12 个 token：

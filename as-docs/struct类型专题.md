@@ -2,8 +2,8 @@
 
 > 版本：v0.2
 > 上游文档：[`原版AngelScript与UE-fork对比.md`](原版AngelScript与UE-fork对比.md)（方言差异总览）
-> 诊断码定义：[`诊断码表.md`](诊断码表.md)（本文只引用码号，不定义）
-> 相关文档：[`架构设计.md`](架构设计.md)、[`../grammar/angelscript.bnf`](../grammar/angelscript.bnf)
+> 诊断码定义：[`诊断码表.md`](../docs/诊断码表.md)（本文只引用码号，不定义）
+> 相关文档：[`架构设计.md`](../docs/架构设计.md)、[`../grammar/angelscript.bnf`](../../grammar/angelscript.bnf)
 > 证据来源（只读参考）：
 > - `[ENGINE]` = `d:/WorkGit/UnrealEngine/Engine/Plugins/Angelscript/ThirdParty/source/`
 > - `[UE]` = `d:/WorkGit/UnrealEngine/Engine/Plugins/Angelscript/Source/AngelscriptCode/`
@@ -21,7 +21,7 @@
 本 LSP 的类型系统、成员查找、hover、`Cast<>` 判定、GC 诊断全都依赖这些结论，
 散落在对比文档各章节里容易漏读，故独立成篇。
 
-**诊断码不在本文定义**，统一由 [`诊断码表.md`](诊断码表.md) 管理；本文只引用码号。
+**诊断码不在本文定义**，统一由 [`诊断码表.md`](../docs/诊断码表.md) 管理；本文只引用码号。
 
 ## 1. 起源：原版 AngelScript 没有 `struct`
 
@@ -359,8 +359,8 @@ hover 时应标注「此方法会被 UE 用于结构体比较 / 哈希 / 序列�
 
 本文涉及的码：`AS0001` `AS0102` `AS0103` `AS0105` `AS0106` `AS0201` `AS0202` `AS0203` `AS0301` `AS0302`。
 
-消息文本、range 与 quick fix 约定统一见 [`诊断码表.md`](诊断码表.md)
-（§2-§5 各段表 + [§8 range 与 quick fix 约定](诊断码表.md#8-range-与-quick-fix-约定)）。
+消息文本、range 与 quick fix 约定统一见 [`诊断码表.md`](../docs/诊断码表.md)
+（§2-§5 各段表 + [§8 range 与 quick fix 约定](../docs/诊断码表.md#8-range-与-quick-fix-约定)）。
 **本文不重复这些内容**，只提供触发它们的语义背景。
 
 ### 9.3 `.d.as` 导出插件（模块一）待补的元信息
@@ -392,5 +392,5 @@ hover 时应标注「此方法会被 UE 用于结构体比较 / 哈希 / 序列�
 
 | 版本 | 内容 |
 |---|---|
-| v0.2 | §9.2 的 range/quick-fix 表移交 [`诊断码表.md`](诊断码表.md) §8，本节改为「涉及码号清单 + 指引」，避免两处维护 |
+| v0.2 | §9.2 的 range/quick-fix 表移交 [`诊断码表.md`](../docs/诊断码表.md) §8，本节改为「涉及码号清单 + 指引」，避免两处维护 |
 | v0.1 | 从对比文档 §2 独立成篇，并补入：描述符/实例三层模型、映射严格性边界（`.d.as` 实测）、继承四道锁与展平机制、`FASStructOps` 方法映射表、LSP 实现要求与导出插件待办、使用者速查 |

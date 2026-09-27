@@ -1,11 +1,11 @@
 # 原版 AngelScript 与 Unreal fork 的差异
 
-> 版本：v0.4
+> 版本：v0.5.3
 > 下游专题：
 > - [`struct类型专题.md`](struct类型专题.md)（`class`/`struct` 全量对照、UE 映射、继承与展平）
-> - [`诊断码表.md`](诊断码表.md)（`AS0xxx` 权威码表，唯一码号分配处）
+> - [`诊断码表.md`](../docs/诊断码表.md)（`AS0xxx` 权威码表，唯一码号分配处）
 >
-> 前置文档：[`../grammar/angelscript.bnf`](../grammar/angelscript.bnf)（Layer A 完整语法规范）、[`架构设计.md`](架构设计.md)
+> 前置文档：[`../grammar/angelscript.bnf`](../../grammar/angelscript.bnf)（Layer A 完整语法规范）、[`架构设计.md`](../docs/架构设计.md)
 > 证据来源（绝对路径，均为只读参考）：
 > - `[ENGINE]` = `d:/WorkGit/UnrealEngine/Engine/Plugins/Angelscript/ThirdParty/source/`
 > - `[UE]` = `d:/WorkGit/UnrealEngine/Engine/Plugins/Angelscript/Source/AngelscriptCode/`
@@ -39,7 +39,8 @@ Unreal Angelscript（Hazelight 的 UE 插件）**不是**原版 AngelScript 加�
 
 > **对 LSP 的影响**：`interface` / `funcdef` / `typedef` 的解析器分支在 `as_parser.cpp` 里仍然存在但**不可达**
 > （token 进不来）。BNF §2.9 把它们标为 `[dead]`，`grammar.js` 未实现——这是正确的。
-> 但 `import` **不是**死 token（`as_tokendef.h:275` 仍然激活），只是 UE 脚本从不用。
+> 但 `import` **不是**死 token（`as_tokendef.h:275` 仍然激活），只是 UE 脚本从不用——
+> 它的实际拦截点在宿主层（宿主从不绑定），见 [§5.2](#52-清单已逐项取证)。
 
 ### 1.2 fork 新增的 token
 
@@ -121,7 +122,7 @@ if (isStruct) {
 `: Base` 继承列表 parser 也接受，由上层拒绝 → `AS0201`。
 
 > **文法决策**：`struct F : G {}` 在 tree-sitter 层应当**正常解析成功**，
-> 继承违规由 LSP 报语义诊断（见 [§5.4](#54-as02xx--ue-反射约束)）。`grammar.js` 现状符合此约定。
+> 继承违规由 LSP 报语义诊断（见 [`诊断码表.md` §4](../docs/诊断码表.md#4-as02xx--ue-反射约束)）。`grammar.js` 现状符合此约定。
 
 ### 2.4 一句话结论
 
@@ -206,8 +207,8 @@ if (PropertyType.RequiresProperty())
 ```
 
 struct 里只要成员**可能**含 UObject 引用，即使没写 `UPROPERTY()` 也会被强制生成属性；
-生成不了就直接编译报错（`AS0301`，见 [§5.5](#55-as03xx--gc--属性生成)）。这与 UE C++ 中
-「`USTRUCT` 内必须 `UPROPERTY()` 才被 GC 追踪」是同一模型。
+生成不了就直接编译报错（`AS0301`，见 [`诊断码表.md` §5](../docs/诊断码表.md#5-as03xx--gc--属性生成)）。
+这与 UE C++ 中「`USTRUCT` 内必须 `UPROPERTY()` 才被 GC 追踪」是同一模型。
 
 ## 4. 其它已确认的机制级差异
 
@@ -222,9 +223,59 @@ struct 里只要成员**可能**含 UObject 引用，即使没写 `UPROPERTY()` 
 | POD 推导 | — | struct 无自定义赋值运算符时自动加 `asOBJ_POD` | `as_builder.cpp:885-978` |
 | 字节码缓存 / 静态 JIT | 无 | `PrecompiledData` + C++ 离线转译 | `[UE]Private/StaticJIT/` |
 
-## 5. 诊断：引擎错误文本如何落成诊断码
+## 5. 解析层放行、实际不可用的构造（paper features）
 
-> **完整码表已独立成篇：[`诊断码表.md`](诊断码表.md)**
+> 本节回答一个问题：**哪些语法 token 活着、parser 也认，但写出来必然失败？**
+> （§1.1 的死 token 是词法层拦截，不在本节重复。）
+> 这直接决定 LSP 的诊断发在哪一层：parse 层的 ERROR 节点（树崩掉），
+> 还是 semantic 层带 code 的诊断（树保持完整）。本节是这类构造的权威清单。
+
+### 5.1 四层拦截模型
+
+一个构造从「写得出来」到「跑得起来」要过四道闸门：
+
+| 层 | 闸门 | 死在这层的形态 |
+|---|---|---|
+| L1 词法 | `as_tokendef.h` token 表 | parse error（§1.1：`@` / `null` / `is` / `interface` / `funcdef` / `typedef` …） |
+| L2 编译 | `as_compiler.cpp` / `as_builder.cpp` | 编译期报错 |
+| L3 UE 认领 | 预处理器 / ClassGenerator | VM 编译通过，但 UClass 世界里无人认领 |
+| L4 宿主绑定 | AngelscriptCode 运行时 | 运行期才报错 |
+
+### 5.2 清单（已逐项取证）
+
+| 构造 | 层 | 机制 | 证据 | LSP 处置 |
+|---|---|---|---|---|
+| **lambda** `function(...) {...}` | L2 | 编译器对 lambda 的唯一出口是隐式转换到 funcdef（`ImplicitConvLambdaToFunc` 开头即 `asASSERT(to.IsFuncdef() && ctx->IsLambda())`）；而 funcdef 是死 token（§1.1），且 AngelscriptCode 从不注册脚本可见的 funcdef → lambda 恒报 `Invalid expression: stand-alone anonymous function` | `[ENGINE]as_compiler.cpp:8339`（断言）、`6291`（报错点）、`as_texts.h:150`；AngelscriptCode 全模块无 `RegisterFuncDef` | **文法不实现**（parse error，2026-09 决策）：语法层拒绝与「实际跑不起来」一致；原 `AS0107` 随之 retired |
+| **裸 enum 值** `Value`（非 `MyEnum::Value`） | L2 | `asEP_REQUIRE_ENUM_SCOPE = 1`：符号查找跳过「不写枚举类型名」的兜底分支，落入通用「未找到」错误 | `[UE]Private/AngelscriptManager.cpp:337`；`[ENGINE]as_compiler.cpp:11815`（`!engine->ep.requireEnumScope` 守卫） | 归入 `AS04xx`（符号解析，P3/P4 落地时占号） |
+| **mixin class** `mixin class Foo {...}` | L2 | `mixin` token 活着，但 `ParseMixin` 已被重定义为「mixin + **函数**声明」；`as_builder` 里的 mixin class 机器（`RegisterMixinClass` / `IncludeMethodsFromMixins` 等）是上游遗留、不可达 | `[ENGINE]as_parser.cpp:3700-3714`（"A mixin token must be followed by a function declaration"）；`as_builder.cpp:2022 / 2872 / 3827` | parse error 是**正确**行为：grammar 不实现 mixin class，与引擎一致。注意 mixin **function**（`mixin void f() {...}`）是活功能（BNF §2.6） |
+| **import** `import void f() from "mod";` | L4 | token 活、`ParseScript` 正常分发（`ttImport` → `ParseImport`）、VM 编译通过；但宿主必须调 `BindAllImportedFunctions` 才可用——AngelscriptCode 全模块 **0** 调用 → 调用时运行期报 `Unbound function called` | `[ENGINE]as_tokendef.h:275`、`as_parser.cpp:2471`、`as_texts.h:363` | **文法不实现**（parse error，2026-09 决策）：语法层拒绝比「放行再等运行期炸」更诚实；原 `AS0904` 随之 retired |
+| **虚属性（带 body）** `int X { get { ... } }` | L3 | VM 把访问器编译成 opGet/opSet 方法，但预处理器 / ClassGenerator 对 VirtualProperty **零处理**，UClass 侧无人认领；官方 pegjs 无此语法，引擎/插件全部脚本零使用 | AngelscriptCode 全模块 `VirtualProperty` **0** 命中；`grammar.js` / BNF §2.3.7 注释已记录 | 语法放行；语义层**暂不报错**（使用率为零，低优先级）；bodyless 形态已有 `AS0005` |
+
+### 5.3 对照：Hazelight 官方 LSP 的「有效语法集合」
+
+官方扩展的 pegjs 语法（`language-server/pegjs/angelscript.js`、`grammar/node_types.js`）
+里没有：lambda、interface、funcdef、import、mixin class、虚属性、`@`。
+这个集合基本是「真正可用」的**下界**。本 LSP 的取向（2026-09 决策）：**文法与实际可运行
+的集合对齐**——lambda / import / mixin class / `@` 一律不实现（parse error，与 pegjs 一致）；
+例外是虚属性（AS VM 自身完整支持，拦截发生在 UE 认领层，且 bodyless 形态有 `AS0005`
+诊断依赖），语法放行、语义层暂不报错。
+
+### 5.4 相关引擎属性开关
+
+`[UE]Private/AngelscriptManager.cpp:325-355` 集中设置了一批引擎属性，与「写了能不能编过」直接相关的：
+
+| 属性 | 值 | 后果 |
+|---|---|---|
+| `asEP_REQUIRE_ENUM_SCOPE` | 1 | 裸 enum 值编译报错（见 §5.2） |
+| `asEP_TYPECHECK_SWITCH_ENUMS` | 1 | `switch` 条件与 `case` 值的枚举类型严格校验 |
+| `asEP_PROPERTY_ACCESSOR_MODE` | `AS_PROPERTY_ACCESSOR_MODE` = 3（`AngelscriptManager.h:24`） | 绑定层用 `property` 方法属性暴露属性访问（引擎默认模式 3）——脚本虚属性（§5.2）与之无关 |
+
+（浮点宽度 `asEP_FLOAT_IS_FLOAT64` 见 §1.3；命名实参 `asEP_ALTER_SYNTAX_NAMED_ARGS` 见 §4；
+隐式句柄 `asEP_ALLOW_IMPLICIT_HANDLE_TYPES` 见 §1.1。）
+
+## 6. 诊断：引擎错误文本如何落成诊断码
+
+> **完整码表已独立成篇：[`诊断码表.md`](../docs/诊断码表.md)**
 > 该文是**唯一的码号分配处**，含编码规则、6 个区段的全部码号、range/quick-fix 约定、
 > 实施约束与占用总览。新增诊断必须先在那里占号。
 
@@ -244,16 +295,18 @@ struct 里只要成员**可能**含 UObject 引用，即使没写 `UPROPERTY()` 
 引擎错误原文统一由码表的 `Message` 列承载——**不要在本文再抄一份**，
 否则改措辞时必然两处不一致。
 
-## 6. 对本项目各模块的影响
+## 7. 对本项目各模块的影响
 
-### 6.1 grammar（模块二）
+### 7.1 grammar（模块二）
 
 - 已正确不实现 `[dead]` 顶层声明与 `@` / `null` / `is` / `and`/`or`/`xor`；
 - `struct` 与 `class` 作为独立节点，`default_statement` 只出现在 `class_declaration` 内；
 - struct 的继承列表、struct 内 `UFUNCTION()` **照常解析**，交给 LSP 报诊断；
+- paper features（§5.2）中 lambda / import / mixin class **不实现**（parse error，
+  2026-09 决策，见 §5.3）；虚属性照常解析（§5.2，AS VM 支持）；
 - 浮点字面量的 `f` 后缀需要保留在 CST 中（`float32` vs `float64` 影响类型推导）。
 
-### 6.2 lsp（模块三）类型系统
+### 7.2 lsp（模块三）类型系统
 
 必须在类型模型里区分**值类型 / 引用类型**。值/引用二分衍生出的完整能力清单见
 [专题 §9.1](struct类型专题.md#91-类型系统模块三)，本文只列非 struct 相关的部分：
@@ -267,17 +320,20 @@ struct 里只要成员**可能**含 UObject 引用，即使没写 `UPROPERTY()` 
 | `interface` / `funcdef` / `typedef` 不作为关键字 | §1.1 | — |
 | `fallthrough` 位置校验 | §4 | `AS0003` |
 | `local` 函数不进跨模块符号表 | §4 | — |
+| 虚属性（语法放行、UE 不认领） | §5.2 | `AS0005`（bodyless 形态） |
 
-### 6.3 文档职责划分与同步约定
+### 7.3 文档职责划分与同步约定
 
-`docs/` 下四份文档的职责边界：
+文档分两个目录（2026-09 拆分）：`as-docs/` = UE Angelscript **语言分析**（与 LSP 实现无关的真值），
+`docs/` = **LSP 设计**；`docs/` 单向引用 `as-docs/`（本文偶尔指回 docs 的实现契约属例外）。
 
-| 文档 | 唯一负责 |
-|---|---|
-| **本文** | 原版 ↔ fork 的方言差异（token 增删、GC 归属、机制演化）及其**因果** |
-| [`struct类型专题.md`](struct类型专题.md) | `class`/`struct` 二分的全部细节、UE 映射、继承与展平、成员查找规则 |
-| [`诊断码表.md`](诊断码表.md) | **码号分配**、引擎错误原文、range/quick-fix 约定 |
-| [`架构设计.md`](架构设计.md) | 模块划分、数据流、路线图、风险 |
+| 文档 | 目录 | 唯一负责 |
+|---|---|---|
+| **本文** | `as-docs/` | 原版 ↔ fork 的方言差异（token 增删、GC 归属、机制演化）及其**因果** |
+| [`设计取舍与使用限制.md`](设计取舍与使用限制.md) | `as-docs/` | **设计取舍总纲**：两条第一性原则、取舍因果链、「想要 X 用 Y」速查 |
+| [`struct类型专题.md`](struct类型专题.md) | `as-docs/` | `class`/`struct` 二分的全部细节、UE 映射、继承与展平、成员查找规则 |
+| [`诊断码表.md`](../docs/诊断码表.md) | `docs/` | **码号分配**、引擎错误原文、range/quick-fix 约定 |
+| [`架构设计.md`](../docs/架构设计.md) | `docs/` | 模块划分、数据流、路线图、风险 |
 
 以下改动必须同步更新对应文档：
 
@@ -285,17 +341,22 @@ struct 里只要成员**可能**含 UObject 引用，即使没写 `UPROPERTY()` 
 |---|---|
 | 新增/调整任何诊断 | **码表**对应子表 + §10 占用总览（**先占号再写代码**） |
 | 引擎错误措辞变化 | **码表** `Message` 列（其它文档不得抄录原文） |
-| 发现新的 fork 与原版差异 | 本文 §1 / §4，并在 §7 追加版本记录 |
+| 发现新的 fork 与原版差异 | 本文 §1 / §4，并在 §8 追加版本记录 |
+| 发现新的 paper feature（解析放行但不可用） | 本文 §5.2 清单，需诊断的同步在**码表** `AS01xx`/`AS09xx` 占号 |
+| 发现新的设计取舍 / 官方替代品 | [`设计取舍与使用限制.md`](设计取舍与使用限制.md) §2 / §3 |
 | 发现新的 `class`/`struct` 语义差异 | **专题** §3 / §4，并在专题 §11 追加记录 |
 | `grammar.js` 放宽/收紧某个形态 | 本文 §2.3 或专题 §3、`grammar/README.md`「语法接受 ≠ 语义合法」表 |
 | 类型系统实现值/引用二分 | 专题 §9.1 能力表（标注实现状态） |
 | `.d.as` 导出格式新增元信息 | 专题 §9.3 待办表 + `架构设计.md` §2 |
 
-## 7. 变更记录
+## 8. 变更记录
 
 | 版本 | 内容 |
 |---|---|
-| v0.4 | §5 瘦身为「诊断分工说明 + 段位速查」，完整码表独立为 [`诊断码表.md`](诊断码表.md)；§6.3 升级为四文档职责划分表 |
+| v0.5.2 | §7.3 职责表与同步约定加入新文档 [`设计取舍与使用限制.md`](设计取舍与使用限制.md)（设计取舍总纲，「为什么」层面的因果在此展开，本文保持「是什么」） |
+| v0.5.3 | 文档目录拆分：语言分析类（本文 / struct 专题 / 设计取舍）移入 `as-docs/`，LSP 设计类（架构设计 / 诊断码表 / 引擎内部语法）留在 `docs/`；跨目录引用全部更新 |
+| v0.5 | 新增 §5「解析层放行、实际不可用的构造（paper features）」：四层拦截模型（L1 词法 / L2 编译 / L3 UE 认领 / L4 宿主绑定）、五项逐项取证清单（lambda / 裸 enum 值 / mixin class / import / 带体虚属性）、Hazelight 官方 LSP 有效语法对照、相关引擎属性开关表；原 §5/§6/§7 顺移为 §6/§7/§8；修正 §3.3 指向旧 §5.5 的失效锚点 |
+| v0.5.1 | §5.2/§5.3/§7.1：lambda 与 import 的 LSP 处置从「语法放行 + `AS0107`/`AS0904`」改为**文法层不实现**（2026-09 决策：文法与实际可运行集合对齐）；虚属性维持语法放行（AS VM 自身支持）。两个诊断码在码表 retired |
 | v0.3 | §2 瘦身为摘要，`struct` 完整内容独立为 [`struct类型专题.md`](struct类型专题.md)；§6.2 改为只列非 struct 能力，避免与专题重复；§6.3 同步约定覆盖两份文档 |
 | v0.2 | §5 升级为**诊断码表**（`AS0001`+，含编码规则、6 个区段、实施约束）；正文差异表加诊断码交叉引用；补 §6.3 文档同步约定；`架构设计.md` 前置文档与 P5 行加入本文链接 |
 | v0.1 | 首版：token 增删、`struct` 起源、GC 摘除与 UObject 内存共享、错误文本清单 |

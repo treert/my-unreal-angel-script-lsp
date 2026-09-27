@@ -573,26 +573,6 @@ class UForwardClass
     (class_body)))
 
 ================================================================================
-import declaration (live token, unused by UE scripts)
-================================================================================
-
-import void ExternalFunction(int Value) from "OtherModule";
-
---------------------------------------------------------------------------------
-
-(source_file
-  (import_declaration
-    (type
-      (primitive_type))
-    (identifier)
-    (parameter_list
-      (parameter
-        (type
-          (primitive_type))
-        (identifier)))
-    (string_literal)))
-
-================================================================================
 complete method attribute set
 ================================================================================
 

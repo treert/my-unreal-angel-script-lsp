@@ -4,7 +4,11 @@
 
 使用 **tree-sitter（文法）+ Rust（LSP 核心）+ TypeScript（VSCode 扩展）** 实现 Unreal Angelscript 的 LSP。
 
-架构参考 `c:\MyGit\ai-mylua-lsp` 的三层方案，总体设计见 [`docs/架构设计.md`](docs/架构设计.md)，引擎内部语法的专门约定见 [`docs/架构设计-引擎内部语法.md`](docs/架构设计-引擎内部语法.md)，方言差异见 [`docs/原版AngelScript与UE-fork对比.md`](docs/原版AngelScript与UE-fork对比.md)。
+架构参考 `c:\MyGit\ai-mylua-lsp` 的三层方案，总体设计见 [`docs/架构设计.md`](docs/架构设计.md)，引擎内部语法的专门约定见 [`docs/架构设计-引擎内部语法.md`](docs/架构设计-引擎内部语法.md)。语言分析类文档在 `as-docs/`：方言差异见 [`as-docs/原版AngelScript与UE-fork对比.md`](as-docs/原版AngelScript与UE-fork对比.md)，设计取舍见 [`as-docs/设计取舍与使用限制.md`](as-docs/设计取舍与使用限制.md)。
+
+**文档分两类，`docs/` 单向引用 `as-docs/`**：
+- `as-docs/` — Unreal Angelscript 语言分析（方言差异、struct 语义、设计取舍），与 LSP 实现无关的真值
+- `docs/` — my-as-lsp 设计文档（架构、诊断码表、引擎内部语法的 LSP 处理约定）
 
 ## 仓库结构
 
@@ -19,7 +23,8 @@ my-angel-script-lsp/
 │       └── as-cli/           # CLI 入口（dump-tree / dump-index，调试用）
 ├── vscode-extension/ # VS Code 扩展（TypeScript）
 ├── tests/            # 手工测试用 .as 文件（可随意增删改，Rust 测试不依赖此目录）
-└── docs/             # 设计文档中心
+├── as-docs/          # UE Angelscript 语言分析文档（方言差异、设计取舍、struct 专题）
+└── docs/             # LSP 设计文档中心（架构、诊断码表）
 ```
 
 ## 关键外部目录

@@ -52,6 +52,11 @@
 #   #            line comment (this file only)
 #   /re/         lexical regex (terminal)
 #   [dead]       production exists in code but unreachable in the UE fork
+#   [paper]      token live & engine parser accepts, but NEVER usable
+#                downstream (compiler rejects / host never binds) — AND this
+#                grammar deliberately does NOT implement it (parse error is
+#                the intended behavior).  Full list & evidence:
+#                as-docs/原版AngelScript与UE-fork对比.md §5
 #
 # ============================================================================
 
@@ -220,10 +225,13 @@ top_declaration   ::= namespace_decl                      (* 2.2 *)
                           top level too: ParseScript calls
                           ParseVirtualPropertyDecl(false,false) *)
                     | asset_decl                          (* 2.8  [pproc] *)
-                    | import_decl                         (* 2.9 — NOT dead *)
                     | typedef_decl                        (* 2.9  [dead] *)
                     | interface_decl                      (* 2.9  [dead] *)
                     | funcdef_decl                        (* 2.9  [dead] *)
+                    (* import_decl (2.9 [paper]) removed from this grammar —
+                       engine token is live but the host never binds imported
+                       functions; see 2.9 for the full note.  mixin_function
+                       and local_function (2.6) remain live. *)
 
 # ----------------------------------------------------------------------------
 # 2.2  Namespace  [core]  (BNF:1 NAMESPACE — nested names supported)
@@ -331,7 +339,7 @@ class_method      ::= [ access_specifier ]
                       [ access_specifier ]
                       function_decl
 
-# 2.3.7 — Virtual property  [core]  (BNF:1 VIRTPROP)
+# 2.3.7 — Virtual property  [core] [paper]  (BNF:1 VIRTPROP)
 #   Engine parser supports this (ParseVirtualPropertyDecl), but it is a paper
 #   feature in the UE fork: ZERO usage in all engine/plugin .as scripts, and
 #   the official LSP grammar (pegjs) has no rule for it.  UE's equivalents are
@@ -440,11 +448,19 @@ asset_decl        ::= 'asset' IDENTIFIER 'of' IDENTIFIER
 # commented out in as_tokendef.h tokenWords[], so the parser branches that
 # test for them are unreachable).  'import' is NOT among them.
 
-# [live] — asTokenDef("import", ttImport) is active and ParseScript
-# dispatches ttImport to ParseImport().  Unused by UE scripts in practice,
-# but syntactically valid; a tolerant parser should accept it.
-import_decl      ::= 'import' TYPE ['&'] IDENTIFIER parameter_list 'from'
-                     StringLiteral ';'
+# [live] [paper] — asTokenDef("import", ttImport) is active and ParseScript
+# dispatches ttImport to ParseImport().  The VM compiles it, but the engine
+# host NEVER calls BindAllImportedFunctions (zero occurrences in all of
+# AngelscriptCode), so calling the function fails at RUNTIME with
+# "Unbound function called" (as_texts.h:363).
+#
+# DECISION (2026-09): NOT implemented in this grammar.  The engine gives no
+# compile-time error for an import, but the feature can never work in UE —
+# a parse error here is more honest than accepting the declaration and
+# failing at runtime.  Production kept below, commented, for reference.
+#
+# import_decl      ::= 'import' TYPE ['&'] IDENTIFIER parameter_list 'from'
+#                      StringLiteral ';'
 typedef_decl     ::= 'typedef' PRIMTYPE IDENTIFIER ';'  (* token removed *)
 interface_decl   ::= 'interface' IDENTIFIER [':' IDENTIFIER {',' IDENTIFIER}]
                      '{' { virtual_property | interface_method } '}'  (* removed *)
@@ -697,7 +713,7 @@ expr_term         ::= 'void'                        (* skip-out-arg marker *)
                     | literal
                     | init_list                     (* anonymous { ... } *)
                     | TYPE '=' init_list            (* temp obj w/ init list *)
-                    | lambda_expression             (* legacy, see 4.6 *)
+                    (* lambda_expression (4.6 [paper]) removed — see 4.6 *)
                     | '(' condition ')'
 
 # 4.3 — Cast  (BNF:12 CAST; UE fork capitalizes it as keyword 'Cast')
@@ -745,14 +761,25 @@ literal           ::= NUMBER
                     | 'true' | 'false' | 'nullptr'
 (* 'void' in argument position: Function(void) skips an out-parameter *)
 
-# 4.6 — Anonymous function (lambda)  [core]  (BNF:12 LAMBDA)
+# 4.6 — Anonymous function (lambda)  [paper]  (BNF:12 LAMBDA)
 #   function(a, b) { ... }   — types optional per-param.
-#   Rarely used in UE code (delegates are the UE way); keep for completeness.
-
-lambda_expression ::= 'function' '('
-                        [ [ TYPE TYPEMOD ] IDENTIFIER
-                          { ',' [ TYPE TYPEMOD ] IDENTIFIER } ]
-                      ')' statement_block
+#
+#   PAPER FEATURE in the UE fork: the compiler's ONLY exit for a lambda is
+#   ImplicitConvLambdaToFunc (as_compiler.cpp:8339), which asserts the target
+#   is a funcdef — but 'funcdef' is a dead token (1.1 / 2.9) and AngelscriptCode
+#   never registers a script-visible funcdef.  A lambda therefore ALWAYS fails
+#   with "Invalid expression: stand-alone anonymous function"
+#   (as_compiler.cpp:6291).  The official pegjs grammar has no lambda.
+#   UE's way is a named UFUNCTION + AddUFunction(this, n"...").
+#
+#   DECISION (2026-09): NOT implemented in this grammar — a parse error is
+#   consistent with what actually runs.  Production kept below, commented,
+#   for reference.
+#
+# lambda_expression ::= 'function' '('
+#                        [ [ TYPE TYPEMOD ] IDENTIFIER
+#                          { ',' [ TYPE TYPEMOD ] IDENTIFIER } ]
+#                      ')' statement_block
 
 
 # ############################################################################

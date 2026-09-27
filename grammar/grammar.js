@@ -115,24 +115,25 @@ module.exports = grammar({
       $.delegate_declaration,
       $.event_declaration,
       $.asset_declaration,
-      $.import_declaration,
       $.function_declaration,
       $.variable_declaration,
       // ParseScript dispatches virtual properties at top level too
       $.virtual_property_declaration,
     ),
 
-    // `import` is still a live token (as_tokendef.h) and ParseScript
-    // dispatches it, even though UE scripts never use it.
-    import_declaration: $ => seq(
-      'import',
-      field('type', $.type),
-      field('name', $.identifier),
-      field('parameters', $.parameter_list),
-      'from',
-      field('source', $.string_literal),
-      ';',
-    ),
+    // REMOVED (see angelscript.bnf §2.9 [paper]): `import` is a live token
+    // and the engine parser accepts it, but the UE host never binds imported
+    // functions (runtime failure "Unbound function called").  Not implemented
+    // to keep the grammar aligned with what actually runs.
+    // import_declaration: $ => seq(
+    //   'import',
+    //   field('type', $.type),
+    //   field('name', $.identifier),
+    //   field('parameters', $.parameter_list),
+    //   'from',
+    //   field('source', $.string_literal),
+    //   ';',
+    // ),
 
     // ========================================================================
     // Part 2.2 — Namespace
@@ -635,7 +636,6 @@ module.exports = grammar({
       $.member_expression,
       $.subscript_expression,
       $.cast_expression,
-      $.lambda_expression,
       $.parenthesized_expression,
     ),
 
@@ -784,19 +784,23 @@ module.exports = grammar({
 
     _initializer_item: $ => choice($._expression, $.initializer_list),
 
-    // Part 4.6 — anonymous function
-    lambda_expression: $ => seq(
-      'function',
-      '(',
-      commaSep($.lambda_parameter),
-      ')',
-      field('body', $.block),
-    ),
-
-    lambda_parameter: $ => seq(
-      optional(field('type', $.type)),
-      field('name', $.identifier),
-    ),
+    // REMOVED (see angelscript.bnf §4.6 [paper]): the engine parser accepts
+    // `function(...) {...}`, but the compiler's only exit for a lambda is an
+    // implicit conversion to a funcdef — and funcdef is a dead token in the
+    // UE fork, so a lambda ALWAYS fails to compile.  Not implemented to keep
+    // the grammar aligned with what actually runs.
+    // lambda_expression: $ => seq(
+    //   'function',
+    //   '(',
+    //   commaSep($.lambda_parameter),
+    //   ')',
+    //   field('body', $.block),
+    // ),
+    //
+    // lambda_parameter: $ => seq(
+    //   optional(field('type', $.type)),
+    //   field('name', $.identifier),
+    // ),
 
     // ========================================================================
     // Part 1 — Lexical
