@@ -14,7 +14,7 @@
 
 use as_syntax::tree_sitter::Node;
 
-use crate::syntax::{self, DeclCtx};
+use crate::syntax;
 
 /// Legend（**wire 名**，`as_` 前缀 + 与 Hazelight `SemanticTypeList` 同序——
 /// 其 server.ts 在声明 legend 时对内部名单做 `"as_" + t` 映射；索引即

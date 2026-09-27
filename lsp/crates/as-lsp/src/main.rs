@@ -136,6 +136,14 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let doc = params.text_document;
         if let Some(path) = uri_path(&doc.uri) {
+            // 可观测性：确认文件真正到达本 server（语言归属排查用——
+            // 架构设计 §8 风险 4：与 Hazelight 扩展共存时 .as 归属可能旁落）
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!("didOpen {path} (languageId={})", doc.language_id),
+                )
+                .await;
             let mut store = self.docs.lock().unwrap();
             store.open(&path, doc.version, doc.text);
         }
@@ -282,6 +290,7 @@ fn to_lsp_symbol(s: outline::OutlineSymbol, text: &str, lines: &LineIndex) -> Do
         detail: None,
         kind: to_symbol_kind(s.kind),
         tags: None,
+        #[allow(deprecated)]
         deprecated: None,
         range: to_lsp_range(s.range, text, lines),
         selection_range: to_lsp_range(s.selection_range, text, lines),
