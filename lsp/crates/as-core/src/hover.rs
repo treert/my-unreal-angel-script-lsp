@@ -199,7 +199,8 @@ pub fn render_doc(doc: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{FileInput, FileKind, IndexConfig};
+    use crate::config::IndexConfig;
+    use crate::index::{FileInput, FileKind};
     use crate::intern::{intern_file, intern_sym};
     use crate::resolve::{resolve_at, LEVEL_DECL_SELF};
 

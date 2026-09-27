@@ -19,6 +19,7 @@ use as_syntax::tree_sitter::Node;
 use as_syntax::SyntaxError;
 
 use crate::decl_tags::{parse_comment_texts, TagKind, TagValue};
+use crate::config::IndexConfig;
 use crate::id::{DefId, FileId, Sym, TypeId};
 use crate::intern::{intern_file, intern_sym, sym_str};
 use crate::range::{LineIndex, TextRange};
@@ -26,20 +27,6 @@ use crate::symbol::{DefData, DefExtra, DefFlags, DefKind, SymbolTable};
 use crate::syntax::{self, DeclCtx};
 use crate::types::{SynType, TypeKind, TypeTable};
 use crate::uses::UseSite;
-
-/// 索引构建输入参数（规划 §3.3）。改动该配置 ⇒ 视同全量重建（§5.3）。
-#[derive(Clone, Copy, Debug)]
-pub struct IndexConfig {
-    /// 对应引擎 `bScriptFloatIsFloat64`（默认 true）：裸 `float` 归一化到
-    /// `float64`（true）还是 `float32`（false）。架构设计 §2.5 / §5。
-    pub float_is_float64: bool,
-}
-
-impl Default for IndexConfig {
-    fn default() -> Self {
-        IndexConfig { float_is_float64: true }
-    }
-}
 
 /// 文件类别（Phase 0 的实质产出之一：两类失效粒度与允许构造不同，D19）。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

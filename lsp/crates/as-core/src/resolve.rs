@@ -1170,7 +1170,8 @@ fn call_return_base(idx: &WorkspaceIndex, def: DefId) -> Option<DefId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{FileInput, FileKind, IndexConfig};
+    use crate::config::IndexConfig;
+    use crate::index::{FileInput, FileKind};
     use crate::intern::intern_file;
 
     fn build(srcs: &[(&str, &str)]) -> WorkspaceIndex {

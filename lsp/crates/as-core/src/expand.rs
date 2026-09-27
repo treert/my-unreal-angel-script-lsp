@@ -347,7 +347,8 @@ fn decl_span(idx: &WorkspaceIndex, decl: DefId) -> TextRange {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{FileInput, FileKind, IndexConfig};
+    use crate::config::IndexConfig;
+    use crate::index::{FileInput, FileKind};
     use crate::intern::{intern_file, intern_sym, sym_str};
 
     fn build(srcs: &[(&str, &str)]) -> WorkspaceIndex {
