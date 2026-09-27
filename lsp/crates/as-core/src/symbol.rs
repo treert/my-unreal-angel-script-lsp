@@ -144,6 +144,16 @@ impl std::ops::BitOrAssign for DefFlags {
     }
 }
 
+/// 一个形参（语法层记录，进 Callable 特化数据）。
+#[derive(Clone, Debug)]
+pub struct ParamDecl {
+    pub name: Sym,
+    /// 声明类型（语法层，未归一化）
+    pub ty: Option<SynType>,
+    /// `InArgN` 占位名 → UNNAMED_PARAM（架构设计 §2.4.6，命名实参补全须跳过）
+    pub flags: DefFlags,
+}
+
 /// 继承基名（Phase 1 语法层记录，未解析；class 闭包在 Phase 2 构建）。
 #[derive(Clone, Debug)]
 pub struct BaseRef {
@@ -162,10 +172,10 @@ pub enum DefExtra {
         bases: Vec<BaseRef>,
         template_params: Vec<Sym>,
     },
-    /// 函数/方法/构造/析构/delegate/event：返回类型（语法层）+ 形参数
+    /// 函数/方法/构造/析构/delegate/event：返回类型（语法层）+ 形参列表
     Callable {
         return_type: Option<SynType>,
-        param_count: usize,
+        params: Vec<ParamDecl>,
     },
     /// 字段/全局变量/asset/虚属性：声明类型（语法层）
     Variable {

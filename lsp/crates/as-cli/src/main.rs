@@ -224,8 +224,7 @@ fn render_node(node: Node<'_>, src: &str, indent: usize, prefix: &str, out: &mut
 // dump-index（M1）
 // ===========================================================================
 
-fn dump_index(paths: &[PathBuf], float_is_float64: bool, sym_filter: Option<String>) -> ExitCode {
-    let files = match collect_inputs(paths) {
+fn dump_index(paths: &[PathBuf], float_is_float64: bool, sym_filter: Option<String>) -> ExitCode {    let files = match collect_inputs(paths) {
         Ok(files) => files,
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -253,7 +252,12 @@ fn dump_index(paths: &[PathBuf], float_is_float64: bool, sym_filter: Option<Stri
         };
         let path_str = path.to_string_lossy().into_owned();
         let file = intern_file(&path_str, 0);
-        inputs.push(FileInput { file, kind: file_kind_of(path), source });
+        inputs.push(FileInput {
+            file,
+            kind: file_kind_of(path),
+            module: module_of(paths, path),
+            source,
+        });
     }
 
     let config = IndexConfig { float_is_float64 };
@@ -356,6 +360,11 @@ fn dump_index(paths: &[PathBuf], float_is_float64: bool, sym_filter: Option<Stri
         idx.cycle_classes.len()
     );
     println!(
+        "mixins: indexed {}, pending {}",
+        idx.mixin_index.values().map(Vec::len).sum::<usize>(),
+        idx.mixin_pending.len()
+    );
+    println!(
         "types: interned {}, variable decl types resolved {}/{}",
         idx.types.len(),
         idx.resolved.len(),
@@ -410,6 +419,26 @@ fn file_kind_of(path: &Path) -> FileKind {
     } else {
         FileKind::Script
     }
+}
+
+/// 模块名：相对首个包含它的 CLI 收集根；直接传入的文件取文件名主干。
+fn module_of(roots: &[PathBuf], path: &Path) -> Option<as_core::id::Sym> {
+    for root in roots {
+        if let Ok(rel) = path.strip_prefix(root) {
+            let rel = rel.to_string_lossy();
+            if !rel.is_empty() {
+                return Some(as_core::intern::intern_sym(
+                    &as_core::index::filename_to_module_name(&rel),
+                ));
+            }
+        }
+    }
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    let stem = name
+        .strip_suffix(".d.as")
+        .or_else(|| name.strip_suffix(".as"))
+        .unwrap_or(&name);
+    Some(as_core::intern::intern_sym(stem))
 }
 
 fn collect_inputs(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {

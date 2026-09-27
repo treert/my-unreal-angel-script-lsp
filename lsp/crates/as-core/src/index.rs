@@ -62,6 +62,21 @@ pub struct FileInput {
     pub file: FileId,
     pub kind: FileKind,
     pub source: String,
+    /// 模块名（引擎 `FilenameToModuleName`，相对收集根计算——Phase 0 产出，
+    /// 规划 §4：决定 `local` 符号的可见域）。`.d.as` 侧可不给（无 local 函数）。
+    pub module: Option<Sym>,
+}
+
+/// 引擎 `FilenameToModuleName`：去 `.as` / `.d.as` 扩展、`/` / `\` → `.`。
+/// 输入应是相对模块根的路径（根的确定是 Phase 0 的事，本函数不感知）。
+pub fn filename_to_module_name(rel_path: &str) -> String {
+    let stem = rel_path
+        .strip_suffix(".d.as")
+        .or_else(|| rel_path.strip_suffix(".as"))
+        .unwrap_or(rel_path);
+    stem.chars()
+        .map(|c| if c == '/' || c == '\\' { '.' } else { c })
+        .collect()
 }
 
 /// 每文件的持久快照（CST + 行首表是 Phase 2 产物，规划 §4）。
@@ -108,6 +123,14 @@ pub struct WorkspaceIndex {
     /// 字段/全局变量/asset 的声明类型解析结果（M1 子集；方法签名 M3）
     pub resolved: HashMap<DefId, TypeId>,
     pub files: HashMap<FileId, FileSnapshot>,
+    /// 模块归属表（规划 §4 Phase 2）：FileId → 模块名（`local` 符号可见域过滤）
+    pub modules: HashMap<FileId, Sym>,
+    /// mixin 倒排（D23）：首参类型 DefId → mixin 函数 DefId 列表。
+    /// **键不预展开到子类**——查询时沿继承闭包逐级查（`DerivesOrShadows` 语义）。
+    /// C++ `ScriptMixin` 库函数不进此表（导出时已是成员方法，§4.5.2）
+    pub mixin_index: HashMap<DefId, Vec<DefId>>,
+    /// 首参类型未解析的 mixin（待定桶，不阻塞构建）
+    pub mixin_pending: Vec<DefId>,
 }
 
 impl WorkspaceIndex {
@@ -145,6 +168,9 @@ impl WorkspaceIndex {
             types: TypeTable::new(),
             resolved: HashMap::new(),
             files: HashMap::new(),
+            modules: HashMap::new(),
+            mixin_index: HashMap::new(),
+            mixin_pending: Vec::new(),
         };
         idx.inject_builtins();
         idx
@@ -183,6 +209,10 @@ impl WorkspaceIndex {
         let file = input.file;
         let src = &input.source;
 
+        // 模块归属（Phase 0 产出，随文件落地）
+        if let Some(m) = input.module {
+            self.modules.insert(file, m);
+        }
         // 文件头 tag（.d.as 固定 4 行；@cache_format 识别不消费——D21）
         let header = syntax::leading_comment_texts(tree.root_node(), src);
         let header_block = parse_comment_texts(&header);
@@ -412,7 +442,7 @@ impl WorkspaceIndex {
         let return_type = node
             .child_by_field_name("type")
             .and_then(|t| syntax::parse_syn_type(t, src));
-        let param_count = syntax::param_count(node, src);
+        let params = syntax::param_decls(node, src);
         self.push_def(
             node,
             name_node,
@@ -421,7 +451,7 @@ impl WorkspaceIndex {
             kind,
             parent,
             flags,
-            DefExtra::Callable { return_type, param_count },
+            DefExtra::Callable { return_type, params },
             doc,
             tags,
         );
@@ -442,7 +472,7 @@ impl WorkspaceIndex {
         let return_type = node
             .child_by_field_name("type")
             .and_then(|t| syntax::parse_syn_type(t, src));
-        let param_count = syntax::param_count(node, src);
+        let params = syntax::param_decls(node, src);
         self.push_def(
             node,
             name_node,
@@ -451,7 +481,7 @@ impl WorkspaceIndex {
             kind,
             parent,
             flags,
-            DefExtra::Callable { return_type, param_count },
+            DefExtra::Callable { return_type, params },
             doc,
             tags,
         );
@@ -546,6 +576,7 @@ impl WorkspaceIndex {
     fn finish(&mut self) {
         self.build_closures();
         self.resolve_decl_types();
+        self.build_mixin_index();
     }
 
     /// class 继承闭包（struct 不建——`.d.as` 的 struct 无父类且 C++ 继承已
@@ -598,9 +629,15 @@ impl WorkspaceIndex {
     /// 字段/全局变量/asset 的声明类型 → 归一化 TypeId。
     /// 解析失败（未知名/qualified/模板实参未解析）不报错、不入表（宁缺毋假）。
     fn resolve_decl_types(&mut self) {
+        self.resolve_decl_types_in(None);
+    }
+
+    /// 同上，可限定单文件（reindex 后的局部重建，避免全量重跑）。
+    fn resolve_decl_types_in(&mut self, file: Option<FileId>) {
         let jobs: Vec<(DefId, SynType)> = self
             .symbols
             .iter()
+            .filter(|(_, d)| file.map_or(true, |f| d.file == f))
             .filter(|(_, d)| {
                 matches!(
                     d.kind,
@@ -617,6 +654,89 @@ impl WorkspaceIndex {
                 self.resolved.insert(def, t);
             }
         }
+    }
+
+    /// mixin 倒排（架构设计 §4.5.1 / D23）：首参类型的 DefId → mixin 函数。
+    /// 两种声明形式（前置 `mixin void F(..)` / 后置 `void F(..) mixin`）在
+    /// `scan_flags` 已等价打 MIXIN。首参类型解析失败 / 非具名类型（数组、
+    /// primitive 等非对象首参）→ 待定桶，不阻塞构建（坏源码容错）。
+    fn build_mixin_index(&mut self) {
+        self.mixin_index.clear();
+        self.mixin_pending.clear();
+        let jobs: Vec<(DefId, Option<SynType>)> = self
+            .symbols
+            .iter()
+            .filter(|(_, d)| d.flags.contains(DefFlags::MIXIN))
+            .filter_map(|(id, d)| {
+                let DefExtra::Callable { params, .. } = &d.extra else { return None };
+                Some((id, params.first().and_then(|p| p.ty.clone())))
+            })
+            .collect();
+        for (id, ty) in jobs {
+            let base = ty
+                .as_ref()
+                .and_then(|t| self.resolve_syn(t))
+                .and_then(|t| self.named_base_of(t));
+            match base {
+                Some(b) => self.mixin_index.entry(b).or_default().push(id),
+                None => self.mixin_pending.push(id),
+            }
+        }
+    }
+
+    /// 剥掉 Ref / Const / Array 包装，取具名基类的 DefId（mixin 首参定位用）。
+    fn named_base_of(&self, t: TypeId) -> Option<DefId> {
+        let mut cur = t;
+        loop {
+            match self.types.get(cur) {
+                TypeKind::Named { def, .. } => return Some(*def),
+                TypeKind::Ref(inner, _) | TypeKind::Const(inner) | TypeKind::Array(inner) => {
+                    cur = *inner
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// 单文件重索引（规划 §5.2 的粗粒度落地，M3）：remove + re-add。
+    /// 旧 DefId 遗留 arena（append-only）但从全部查询表摘除，不可达。
+    /// 闭包 / mixin 倒排 / 声明类型按需重建（闭包与倒排全量重建——量级毫秒；
+    /// 声明类型只重算该文件）。精确声明级 diff 与联动失效留 M4 按需。
+    pub fn reindex_file(&mut self, file: FileId, kind: FileKind, source: String) {
+        let module = self.modules.get(&file).copied();
+        self.remove_file_defs(file);
+        let tree = as_syntax::parse(&source, None);
+        let errors = as_syntax::verify_tree(&tree);
+        let lines = LineIndex::new(&source);
+        self.add_file(
+            FileInput { file, kind, module, source },
+            tree,
+            errors,
+            lines,
+        );
+        self.build_closures();
+        self.resolve_decl_types_in(Some(file));
+        self.build_mixin_index();
+    }
+
+    /// 从全部查询表摘除该文件的 DefId（arena 不回收，D18 墓碑语义的索引侧对应）。
+    fn remove_file_defs(&mut self, file: FileId) {
+        for defs in self.main.values_mut() {
+            defs.retain(|&id| self.symbols.get(id).file != file);
+        }
+        self.main.retain(|_, v| !v.is_empty());
+        // 该文件声明的容器（class/namespace 等）：成员表整个 entry 删除
+        self.members.retain(|&parent, _| self.symbols.get(parent).file != file);
+        // 其它文件的容器中属于该文件的子声明：摘除
+        for children in self.members.values_mut() {
+            children.retain(|&id| self.symbols.get(id).file != file);
+        }
+        // 闭包在 reindex_file 里全量重建，这里只清
+        self.closures.clear();
+        self.cycle_classes.clear();
+        self.resolved.retain(|&id, _| self.symbols.get(id).file != file);
+        self.files.remove(&file);
+        self.modules.remove(&file);
     }
 
     /// 语法层类型 → 归一化 TypeId。名字解析走主索引（类型声明 + 内建）。
@@ -716,6 +836,7 @@ mod tests {
                 file: intern_file(path, 0),
                 kind: if path.ends_with(".d.as") { FileKind::Decl } else { FileKind::Script },
                 source: (*src).to_string(),
+                module: None,
             })
             .collect();
         WorkspaceIndex::build(config, inputs)
@@ -937,5 +1058,145 @@ asset Icon of Texture2D;
             .filter(|(_, d)| d.flags.contains(DefFlags::SYNTHETIC))
             .count();
         assert_eq!(synthetic_count, BUILTIN_PRIMITIVES.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // M3a：Callable 形参扩展 / mixin 倒排 / 模块归属表 / 单文件重索引
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn m3_params_extraction_and_unnamed_flag() {
+        // 注意：`(void)` 实测不出现于任何语料（414 .d.as + 27 .as 零命中），
+        // 且当前 GLR 会把 `void G(void);` 判成 variable_declaration
+        // （构造实参分支）——grammar README 偏差 §3 的「(void) → 单个 void
+        // 形参」实际不可达。此处不测，观察已记录进 M3 提交说明。
+        const SRC: &str = "\
+void F(float64 InX, int8 InArg0, const FVector&in V) {}
+class A
+{
+    A(int InArg2, bool B) {}
+}
+struct FVector {}
+";
+        let idx = build(&[("m3-params.as", SRC)], IndexConfig::default());
+        let f = idx.main.get(&intern_sym("F")).unwrap()[0];
+        let DefExtra::Callable { params, .. } = &idx.def(f).extra else {
+            panic!("F 应有 Callable extra")
+        };
+        assert_eq!(params.len(), 3);
+        assert_eq!(sym_str(params[0].name), "InX");
+        assert!(!params[0].flags.contains(DefFlags::UNNAMED_PARAM));
+        assert!(params[1].flags.contains(DefFlags::UNNAMED_PARAM), "InArg0 是占位名");
+        // 语法层类型形态保留（const &in 包装）
+        assert!(matches!(&params[2].ty, Some(SynType::Ref(..))));
+
+        // 构造函数形参同样提取
+        let ctor = idx
+            .main
+            .get(&intern_sym("A"))
+            .unwrap()
+            .iter()
+            .copied()
+            .find(|&id| idx.def(id).kind == DefKind::Constructor)
+            .unwrap();
+        let DefExtra::Callable { params, .. } = &idx.def(ctor).extra else {
+            panic!("构造函数应有 Callable extra")
+        };
+        assert_eq!(params.len(), 2);
+        assert!(params[0].flags.contains(DefFlags::UNNAMED_PARAM));
+        assert_eq!(sym_str(params[1].name), "B");
+    }
+
+    #[test]
+    fn m3_mixin_reverse_index() {
+        // 前置 / 后置两种声明形式都要进倒排（架构设计 §4.5.1）
+        const SRC: &str = "\
+struct FVector {}
+class AActor {}
+mixin void Heal(AActor Target, float Amount) {}
+void AlsoMixin(const FVector&in V) mixin {}
+mixin void Unresolvable(TMissing M) {}
+mixin void NoParam() {}
+";
+        let idx = build(&[("m3-mixin.as", SRC)], IndexConfig::default());
+        let actor = idx.lookup_type_def(intern_sym("AActor")).unwrap();
+        let hits = idx.mixin_index.get(&actor).expect("AActor 应有 mixin 倒排");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(sym_str(idx.def(hits[0]).name), "Heal");
+
+        // const&in 剥壳取 Named 基名；struct 可作首参（§4.5.1）
+        let fvector = idx.lookup_type_def(intern_sym("FVector")).unwrap();
+        assert_eq!(idx.mixin_index.get(&fvector).unwrap().len(), 1);
+
+        // 未解析基名 / 无首参 → 待定桶，不阻塞
+        assert_eq!(idx.mixin_pending.len(), 2);
+    }
+
+    #[test]
+    fn m3_module_names() {
+        assert_eq!(filename_to_module_name("MyDir/MyFile.as"), "MyDir.MyFile");
+        assert_eq!(filename_to_module_name("X.d.as"), "X");
+        assert_eq!(filename_to_module_name("a\\b\\c.as"), "a.b.c");
+        assert_eq!(filename_to_module_name("plain.as"), "plain");
+    }
+
+    #[test]
+    fn m3_modules_table_populated() {
+        let inputs = vec![FileInput {
+            file: intern_file("unique://m3mod/MyDir/MyFile.as", 0),
+            kind: FileKind::Script,
+            source: "void F() {}\n".to_string(),
+            module: Some(intern_sym("MyDir.MyFile")),
+        }];
+        let idx = WorkspaceIndex::build(IndexConfig::default(), inputs);
+        let file = intern_file("unique://m3mod/MyDir/MyFile.as", 0);
+        assert_eq!(sym_str(idx.modules[&file]), "MyDir.MyFile");
+    }
+
+    #[test]
+    fn m3_reindex_file_replaces_declarations() {
+        const V1: &str = "class C : P { int X; }\nclass P { int Base; }\n";
+        const V2: &str = "class C : Q { int Y; void M() {} }\nclass Q { int Base; }\nclass P { int Base; }\n";
+        let path = "unique://m3re/r.as";
+        let mut idx = build(&[(path, V1)], IndexConfig::default());
+        let file = intern_file(path, 0);
+        let c1 = idx.lookup_type_def(intern_sym("C")).unwrap();
+        assert!(idx.main.get(&intern_sym("X")).is_some());
+        assert!(idx.resolved.contains_key(&idx.main.get(&intern_sym("X")).unwrap()[0]));
+
+        idx.reindex_file(file, FileKind::Script, V2.to_string());
+
+        // 旧成员从主索引消失、新成员就位
+        assert!(idx.main.get(&intern_sym("X")).is_none(), "旧成员 X 应被摘除");
+        assert!(idx.main.get(&intern_sym("Y")).is_some());
+        assert!(idx.main.get(&intern_sym("M")).is_some());
+        // 旧 DefId 不可达、新 DefId 另发
+        let c2 = idx.lookup_type_def(intern_sym("C")).unwrap();
+        assert_ne!(c1, c2);
+        // 闭包更新：C 的父类改为 Q
+        let q = idx.lookup_type_def(intern_sym("Q")).unwrap();
+        assert_eq!(idx.closures.get(&c2).unwrap()[0], q);
+        // 声明类型只重算该文件：Y 有类型
+        let y = idx.main.get(&intern_sym("Y")).unwrap()[0];
+        assert!(idx.resolved.contains_key(&y));
+        // P 的成员不受牵连
+        let p = idx.lookup_type_def(intern_sym("P")).unwrap();
+        assert_eq!(idx.members.get(&p).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn m3_reindex_rebuilds_mixin_index() {
+        const V1: &str = "class T {}\n";
+        const V2: &str = "class T {}\nmixin void M(T X) {}\n";
+        let path = "unique://m3rmix/r.as";
+        let mut idx = build(&[(path, V1)], IndexConfig::default());
+        let file = intern_file(path, 0);
+        assert!(idx.mixin_index.is_empty());
+
+        idx.reindex_file(file, FileKind::Script, V2.to_string());
+        let t = idx.lookup_type_def(intern_sym("T")).unwrap();
+        let hits = idx.mixin_index.get(&t).expect("重索引后 mixin 倒排应重建");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(sym_str(idx.def(hits[0]).name), "M");
     }
 }

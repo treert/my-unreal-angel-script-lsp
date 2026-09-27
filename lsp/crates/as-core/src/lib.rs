@@ -26,9 +26,9 @@ pub use as_syntax;
 
 pub use decl_tags::{DocBlock, SemanticTag, TagKind, TagValue};
 pub use id::{DefId, FileId, Sym, TypeId};
-pub use index::{FileInput, FileKind, IndexConfig, WorkspaceIndex};
+pub use index::{filename_to_module_name, FileInput, FileKind, IndexConfig, WorkspaceIndex};
 pub use outline::{document_symbols, folding_ranges, Fold, FoldKind, OutlineKind, OutlineSymbol};
 pub use range::{LineIndex, TextRange};
-pub use symbol::{BaseRef, DefData, DefExtra, DefFlags, DefKind, SymbolTable};
+pub use symbol::{BaseRef, DefData, DefExtra, DefFlags, DefKind, ParamDecl, SymbolTable};
 pub use tokens::{semantic_tokens, SemanticToken, LEGEND};
 pub use types::{RefKind, SynType, TypeKind, TypeTable};

@@ -9,7 +9,7 @@ use as_syntax::tree_sitter::Node;
 use crate::id::Sym;
 use crate::intern::intern_sym;
 use crate::range::TextRange;
-use crate::symbol::{BaseRef, DefFlags, DefKind};
+use crate::symbol::{BaseRef, DefFlags, DefKind, ParamDecl};
 use crate::types::{RefKind, SynType};
 
 /// 声明所在的容器语境（function/variable 的 kind 由此决定，规划 §3.2）。
@@ -334,6 +334,46 @@ pub fn param_count(node: Node<'_>, src: &str) -> usize {
         }
     }
     params_list.len()
+}
+
+/// 形参列表（M3）：名字 + 语法层类型 + `InArgN` 占位标记（§2.4.6）。
+/// `(void)` 视为空参表（与 `param_count` 同口径）；无名参数（`(void)` 之外
+/// 属 ERROR 产物）跳过。
+pub fn param_decls(node: Node<'_>, src: &str) -> Vec<ParamDecl> {
+    let Some(params) = node.child_by_field_name("parameters") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (_field, child) in children_with_fields(params) {
+        if child.kind() != "parameter" {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue; // `(void)` 或无名残片
+        };
+        let name_str = text(name_node, src);
+        let mut flags = DefFlags::NONE;
+        if is_placeholder_param_name(name_str) {
+            flags |= DefFlags::UNNAMED_PARAM;
+        }
+        let ty = child
+            .child_by_field_name("type")
+            .and_then(|t| parse_syn_type(t, src));
+        out.push(ParamDecl {
+            name: intern_sym(name_str),
+            ty,
+            flags,
+        });
+    }
+    out
+}
+
+/// `InArgN` 占位名判定（引擎侧该参数无名时导出器生成的占位，§2.4.6）。
+fn is_placeholder_param_name(s: &str) -> bool {
+    match s.strip_prefix("InArg") {
+        Some(rest) => !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
