@@ -58,6 +58,11 @@ impl DocStore {
         self.docs.get(&file)
     }
 
+    /// 已打开文档迭代（M6：Ready 补推诊断用——锁内完成计算再发布）。
+    pub fn entries(&self) -> impl Iterator<Item = (FileId, &Doc)> {
+        self.docs.iter().map(|(f, d)| (*f, d))
+    }
+
     /// overlay 快照（FileId, version, text）——冷启动线程构建索引用（§5.1
     /// overlay 优先：不与本锁交叉持锁，快照后释放）。
     pub fn overlays(&self) -> Vec<(FileId, i32, String)> {

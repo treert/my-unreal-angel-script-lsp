@@ -10,6 +10,7 @@
 //! 语言 id：`angelscript-asl`（§5，避开与 Hazelight 扩展冲突）。
 //! UTF-16 ↔ 字节换算只在本层发生（经 as-core `range.rs` 原语，§3.2.1）。
 
+mod diag;
 mod docs;
 mod watch;
 mod workspace;
@@ -77,11 +78,24 @@ async fn main() {
                 let _ = notifier.send_notification::<IndexStatus>(v).await;
             }
         });
+        // M6 诊断补推转发（同模式）：后台线程发布快照后 → 对全部已打开文档
+        // 推一轮 publishDiagnostics（Loading 期不推、Ready 补推，D36）
+        let (diag_tx, mut diag_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let docs = Arc::new(Mutex::new(DocStore::new()));
         let ws = Arc::new(WorkspaceState::new());
+        let dclient = client.clone();
+        let ddocs = Arc::clone(&docs);
+        let dws = Arc::clone(&ws);
+        tokio::spawn(async move {
+            while diag_rx.recv().await.is_some() {
+                diag::publish_all_open(&dclient, &ddocs, &dws).await;
+            }
+        });
         ws.set_ready_tx(tx);
+        ws.set_diag_tx(diag_tx);
         Backend {
             client,
-            docs: Arc::new(Mutex::new(DocStore::new())),
+            docs,
             config: Arc::new(Mutex::new(WorkspaceConfig::default())),
             ws,
             folders: Arc::new(Mutex::new(Vec::new())),
@@ -393,6 +407,10 @@ impl LanguageServer for Backend {
             if !self.ws.is_ready() {
                 self.ws.mark_dirty(file);
             }
+            // M6（D36）：Ready 时推送诊断；Loading 期不推（发布瞬间补推）
+            if self.ws.is_ready() {
+                diag::publish_file(&self.client, &self.docs, &self.ws, &path).await;
+            }
         }
     }
 
@@ -408,9 +426,16 @@ impl LanguageServer for Backend {
             })
             .collect();
         if let Some(path) = uri_path(&params.text_document.uri) {
-            let mut store = self.docs.lock().unwrap();
-            if let Some(file) = as_core::intern::file_id_of_path(&path) {
-                store.apply_changes(file, params.text_document.version, changes);
+            {
+                let mut store = self.docs.lock().unwrap();
+                if let Some(file) = as_core::intern::file_id_of_path(&path) {
+                    store.apply_changes(file, params.text_document.version, changes);
+                }
+            }
+            // M6（D36）：Ready 时同步推送（verify_tree O(文件) 树走毫秒级，
+            // 不做防抖；体感卡顿再补）
+            if self.ws.is_ready() {
+                diag::publish_file(&self.client, &self.docs, &self.ws, &path).await;
             }
         }
     }
@@ -432,6 +457,10 @@ impl LanguageServer for Backend {
             // overlay 丢弃 → 下次语义请求前回落磁盘重读（§5.1）
             if let Some(f) = file {
                 self.ws.mark_stale(f);
+            }
+            // M6：推空数组清空该文档诊断（Loading 期清空同样安全）
+            if let Some(uri) = ls::Uri::from_file_path(&path) {
+                self.client.publish_diagnostics(uri, Vec::new(), None).await;
             }
         }
     }

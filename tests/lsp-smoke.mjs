@@ -144,6 +144,33 @@ await sleep(400);
 send({ jsonrpc: '2.0', id: 16, method: 'textDocument/inlayHint',
   params: { textDocument: { uri }, range: { start: { line: 0, character: 0 }, end: { line: 13, character: 0 } } } });
 await sleep(400);
+// ---- M6: publishDiagnostics 生命周期 ----
+// ① didOpen 已推：AS0903（line 11 `UFUNCTION(Blueprint` 未闭合，ERROR 节点）
+//    + AS0902（workspace 空 → 无任何 .d.as）
+// ② didChange 修复 line 11（插入 "Callable)"）→ AS0903 消失、AS0902 保留
+// ③ didChange 行 0 插入抑制注释 → AS0902 也消失（最终空数组）
+send({
+  jsonrpc: '2.0', method: 'textDocument/didChange',
+  params: {
+    textDocument: { uri, version: 2 },
+    contentChanges: [{
+      range: { start: { line: 11, character: 19 }, end: { line: 11, character: 19 } },
+      text: 'Callable)',
+    }],
+  },
+});
+await sleep(500);
+send({
+  jsonrpc: '2.0', method: 'textDocument/didChange',
+  params: {
+    textDocument: { uri, version: 3 },
+    contentChanges: [{
+      range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
+      text: '// as-ignore: AS0902\n',
+    }],
+  },
+});
+await sleep(500);
 send({ jsonrpc: '2.0', method: 'exit' });
 await sleep(800);
 
@@ -306,6 +333,36 @@ if (typeof readyParams.floatIsFloat64 !== 'boolean') {
   fail(`indexStatus floatIsFloat64: ${JSON.stringify(readyParams)}`);
 }
 
-console.log(`SMOKE OK: legend ${legend.length} types, ${tokenCount} tokens, symbols OK, didOpen logged=${opened}, hover/definition/references/rename/workspaceSymbol/completion(+specifier)/signatureHelp/inlayHint OK, $/progress msgs=${progressMsgs.length}, indexStatus files=${readyParams.files}`);
+// ---- M6: publishDiagnostics（didOpen 初始推送 + didChange 修复 + 抑制注释）----
+const pubs = notifications.filter((n) => n.method === 'textDocument/publishDiagnostics');
+if (pubs.length === 0) fail('no publishDiagnostics notifications');
+const forDoc = pubs.filter((n) => (n.params?.uri ?? '').includes('SmokeTest.as'));
+if (forDoc.length === 0) {
+  fail(`no publishDiagnostics for SmokeTest.as: ${JSON.stringify(pubs.map((n) => n.params?.uri))}`);
+}
+const hasCode = (n, c) => (n.params?.diagnostics ?? []).some((d) => d.code === c);
+// 初始推送：AS0902 + AS0903（range 起点在 line 11 或之后）
+const withErrIdx = forDoc.findIndex((n) => hasCode(n, 'AS0903'));
+if (withErrIdx < 0) fail(`initial publish should contain AS0903: ${JSON.stringify(forDoc.map((n) => n.params))}`);
+const errDiag = forDoc[withErrIdx].params.diagnostics.find((d) => d.code === 'AS0903');
+if (errDiag.severity !== 1) fail(`AS0903 severity expect 1 (Error): ${JSON.stringify(errDiag)}`);
+if (errDiag.range.start.line < 11) fail(`AS0903 range should be at line 11+: ${JSON.stringify(errDiag)}`);
+if (!forDoc.slice(0, withErrIdx + 1).some((n) => hasCode(n, 'AS0902'))) {
+  fail(`initial publish should contain AS0902 (empty workspace): ${JSON.stringify(forDoc[0].params)}`);
+}
+const as0902Diag = forDoc[0].params.diagnostics.find((d) => d.code === 'AS0902');
+if (as0902Diag.severity !== 2) fail(`AS0902 severity expect 2 (Warning): ${JSON.stringify(as0902Diag)}`);
+// 修复后：只剩 AS0902、无 AS0903
+const fixedOnly = forDoc.slice(withErrIdx + 1).filter((n) => hasCode(n, 'AS0902') && !hasCode(n, 'AS0903'));
+if (fixedOnly.length === 0) {
+  fail(`after fixing line 11 expect AS0902-only publish: ${JSON.stringify(forDoc.map((n) => n.params?.diagnostics))}`);
+}
+// 抑制注释后：最终推送为空数组
+const finalPub = forDoc[forDoc.length - 1];
+if ((finalPub.params?.diagnostics ?? []).length !== 0) {
+  fail(`final publish after suppression should be empty: ${JSON.stringify(finalPub.params)}`);
+}
+
+console.log(`SMOKE OK: legend ${legend.length} types, ${tokenCount} tokens, symbols OK, didOpen logged=${opened}, hover/definition/references/rename/workspaceSymbol/completion(+specifier)/signatureHelp/inlayHint OK, $/progress msgs=${progressMsgs.length}, indexStatus files=${readyParams.files}, diagnostics pubs=${forDoc.length} (AS0902+AS0903→fix→suppress)`);
 p.kill();
 process.exit(0);

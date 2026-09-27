@@ -65,6 +65,10 @@ pub struct WorkspaceState {
     /// 防抖重建）不能跨 await 调 client——经 unbounded channel 转给 main
     /// 里 spawn 的 tokio 转发任务。None = 通道未接（单测）
     ready_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>>,
+    /// 诊断补推通道（M6，D36）：快照发布后通知 tokio 侧对全部已打开文档
+    /// 推一轮诊断（Loading 期打开的文件 + AS0902 随重建刷新）。
+    /// None = 通道未接（单测）
+    diag_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>,
 }
 
 impl WorkspaceState {
@@ -77,12 +81,18 @@ impl WorkspaceState {
             use_cache: Mutex::new(HashMap::new()),
             building: AtomicBool::new(false),
             ready_tx: Mutex::new(None),
+            diag_tx: Mutex::new(None),
         }
     }
 
     /// 接上索引就绪通知通道（main 启动转发任务时调用）。
     pub fn set_ready_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>) {
         *self.ready_tx.lock().unwrap() = Some(tx);
+    }
+
+    /// 接上诊断补推通道（main 启动转发任务时调用）。
+    pub fn set_diag_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<()>) {
+        *self.diag_tx.lock().unwrap() = Some(tx);
     }
 
     /// 索引快照发布后发 `myas/indexStatus`（状态栏 ready + floatIsFloat64
@@ -132,6 +142,11 @@ impl WorkspaceState {
         as_log!("index published: {} pending dirty replay(s)", dirty.len());
         for file in dirty {
             self.ensure_file_fresh(file, docs);
+        }
+        // M6（D36）：快照发布 → 对全部已打开文档补推一轮诊断（Loading 期
+        // 打开的文件 + AS0902 的 decl 计数随重建刷新）。后台线程经通道转发。
+        if let Some(tx) = self.diag_tx.lock().unwrap().as_ref() {
+            let _ = tx.send(());
         }
     }
 
