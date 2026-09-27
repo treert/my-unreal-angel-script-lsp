@@ -200,3 +200,12 @@ cargo run -p as-cli --release -- dump-index --ref-stats `
 - **禁止任何 Rust 格式化**（`cargo fmt` / rustfmt / IDE format），改动只保持局部既有格式；
 - **单测 `.as` 用例一律内置源码字符串字面量**，禁止读 `../tests/` 外部文件；
 - 文法节点增删后须同步 `crates/as-syntax/src/node.rs`（文件头附再生成命令）。
+
+## 调试日志
+
+`myAngelScriptLsp.debug.fileLog`（默认 `false`，重启 server 生效）：开启后
+server 侧日志写 `<第一个 workspace 根>/.vscode/my-as-lsp.log`（截断式），并
+双写 stderr → VSCode「my-as-lsp」输出通道。记录点：会话头（构建 profile、
+exe 路径 + mtime、配置、工作区根）、索引重建（roots / 文件数 / 耗时）、
+pending dirty 重放、编辑重索引（含声明面指纹变化）、watched-files 处置、
+`.d.as` 防抖触发、references 耗时。关闭时零开销（AtomicBool 快速门）。

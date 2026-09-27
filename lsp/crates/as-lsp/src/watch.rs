@@ -138,6 +138,7 @@ where
                 }
             }
         }
+        crate::as_log!(".d.as debounce: window closed -> rebuild");
         fire();
     }
 }
@@ -165,10 +166,13 @@ pub fn run_rebuild(
         store.overlays()
     };
     let t0 = std::time::Instant::now();
+    crate::as_log!("rebuild: building (scriptRoots={:?}, declDirs={:?})…", cfg.script_roots, cfg.decl_dirs);
     let idx = workspace::build_index(&cfg, &folders, &overlays);
     let files = idx.files.len();
     ws.publish_and_replay(idx, docs);
-    ws.notify_ready(cfg.float_is_float64, files, t0.elapsed().as_millis());
+    let elapsed = t0.elapsed();
+    ws.notify_ready(cfg.float_is_float64, files, elapsed.as_millis());
+    crate::as_log!("rebuild: published {files} files in {elapsed:?}");
     ws.building.store(false, Ordering::SeqCst);
 }
 
@@ -191,8 +195,11 @@ pub async fn register_watcher(client: &tower_lsp_server::Client) {
         .register_capability(vec![registration])
         .await
     {
-        Ok(()) => {}
+        Ok(()) => {
+            crate::as_log!("watcher: registered **/*.as (create|change|delete)");
+        }
         Err(e) => {
+            crate::as_log!("watcher: registration FAILED: {e}");
             let _ = client
                 .log_message(ls::MessageType::WARNING, format!("watcher registration failed: {e}"))
                 .await;

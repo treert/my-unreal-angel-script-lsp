@@ -147,6 +147,11 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "对应引擎设置 `bScriptFloatIsFloat64`（AngelscriptSettings.h，引擎默认 `true`）：裸 `float` 按 `float64`（true）还是 `float32`（false）解析。**若项目在 DefaultEngine.ini 改过引擎设置，必须同步此项**——配错是静默错误（类型宽度偏差且无任何报错）。"
+        },
+        "myAngelScriptLsp.debug.fileLog": {
+          "type": "boolean",
+          "default": false,
+          "description": "输出 server 调试日志到工作区 .vscode/my-as-lsp.log（第一个 workspace 根下，截断式；同时镜像到「my-as-lsp」输出通道）。修改后需重启 language server 生效。"
         }
       }
     },

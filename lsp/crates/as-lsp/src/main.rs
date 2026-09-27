@@ -11,6 +11,7 @@
 //! UTF-16 ↔ 字节换算只在本层发生（经 as-core `range.rs` 原语，§3.2.1）。
 
 mod docs;
+mod logger;
 mod watch;
 mod workspace;
 
@@ -44,6 +45,8 @@ struct Backend {
     watch_supported: Mutex<bool>,
     /// `.d.as` 防抖器（initialized 注册成功后创建）
     debouncer: OnceLock<DeclDebouncer>,
+    /// `myAngelScriptLsp.debug.fileLog`（重启生效——见 logger.rs 模块头）
+    debug_file_log: Mutex<bool>,
 }
 
 /// 自定义通知 `myas/indexStatus`（server → client）：索引快照发布后的
@@ -81,6 +84,7 @@ async fn main() {
             folders: Arc::new(Mutex::new(Vec::new())),
             watch_supported: Mutex::new(false),
             debouncer: OnceLock::new(),
+            debug_file_log: Mutex::new(false),
         }
     })
     .finish();
@@ -144,6 +148,12 @@ impl Backend {
                     if !parsed.is_empty() {
                         cfg.decl_dirs = parsed;
                     }
+                }
+            }
+            if let Some(v) = values.first() {
+                if let Some(b) = v.get("debug").and_then(|d| d.get("fileLog")).and_then(|b| b.as_bool())
+                {
+                    *self.debug_file_log.lock().unwrap() = b;
                 }
             }
         }
@@ -318,6 +328,17 @@ impl LanguageServer for Backend {
             )
         };
         self.client.log_message(MessageType::INFO, msg).await;
+        // 文件日志（logger::init 必须早于索引构建，会话头/构建过程才能进文件）
+        let folders = self.folders.lock().unwrap().clone();
+        logger::init(&folders, *self.debug_file_log.lock().unwrap());
+        {
+            let config = self.config.lock().unwrap();
+            as_log!(
+                "[my-as-lsp] config: floatIsFloat64={} scriptRoots={:?} typeDeclarationDirs={:?} debug.fileLog={}",
+                config.float_is_float64, config.script_roots, config.decl_dirs,
+                *self.debug_file_log.lock().unwrap()
+            );
+        }
         // 文件监视动态注册（M4）：`**/*.as` 同时覆盖 `.d.as`；kind 7 = 增|改|删
         if *self.watch_supported.lock().unwrap() {
             watch::register_watcher(&self.client).await;
@@ -419,6 +440,7 @@ impl LanguageServer for Backend {
             match watch::classify(event.typ, &path, has_overlay, relevant) {
                 watch::WatchAction::DeclChange => {
                     // .d.as 任一变化 → 防抖（500ms/5s，D24）→ 全量重建
+                    as_log!("watch: DeclChange -> debounce: {path}");
                     if let Some(d) = self.debouncer.get() {
                         d.ping();
                     }
@@ -429,9 +451,11 @@ impl LanguageServer for Backend {
                     let Ok(text) = std::fs::read_to_string(&path) else { continue };
                     let file = as_core::intern::intern_file(&path, 0);
                     let module = workspace::module_for_path(&roots, &path);
+                    as_log!("watch: script create/change {path} -> index (module={module:?})");
                     self.ws.add_file(file, workspace::kind_of_path(&path), module, text);
                 }
                 watch::WatchAction::ScriptDelete => {
+                    as_log!("watch: ScriptDelete {path}");
                     if let Some(file) = file {
                         self.ws.remove_file(file);
                     }
@@ -660,7 +684,14 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
+        let t0 = std::time::Instant::now();
         let mut spans = self.collect_use_matches(&targets, false, "Finding references").await;
+        as_log!(
+            "references: {} query target(s) -> {} site(s) in {:?}",
+            targets.len(),
+            spans.len(),
+            t0.elapsed()
+        );
 
         // includeDeclaration：声明位置（Def 走 name_span——合成成员即源头声明
         // 的锚点，D10；Local 即声明 span）

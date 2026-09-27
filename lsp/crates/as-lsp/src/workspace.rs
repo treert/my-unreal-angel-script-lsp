@@ -22,6 +22,7 @@ use as_core::intern::{file_id_of_path, file_path, intern_file};
 use as_core::references::{resolve_file_uses, UseResolution};
 use as_core::{filename_to_module_name, FileInput, FileKind, IndexConfig, WorkspaceIndex};
 
+use crate::as_log;
 use crate::docs::DocStore;
 
 /// 索引级配置（§5）。任一变更 ⇒ 后台全量重建（§5.3）。
@@ -125,6 +126,7 @@ impl WorkspaceState {
         *self.indexed_versions.lock().unwrap() = versions;
         self.use_cache.lock().unwrap().clear();
         let dirty: Vec<FileId> = self.dirty.lock().unwrap().drain().collect();
+        as_log!("index published: {} pending dirty replay(s)", dirty.len());
         for file in dirty {
             self.ensure_file_fresh(file, docs);
         }
@@ -183,6 +185,7 @@ impl WorkspaceState {
         };
         let mut cache = self.use_cache.lock().unwrap();
         if surface_changed {
+            as_log!("reindex: decl surface changed -> use-site cache invalidated entirely");
             cache.clear();
         } else {
             cache.remove(&file);
@@ -192,12 +195,14 @@ impl WorkspaceState {
     /// watched-files 新增 / 改名（规划 §5.3）：单文件入索引（FileId 由调用方
     /// intern——同路径复活自动复用，D18）。结构性变更 ⇒ 整表失效解析缓存。
     pub fn add_file(&self, file: FileId, kind: FileKind, module: Option<Sym>, text: String) {
+        let bytes = text.len();
         {
             let mut idx = self.index.write().unwrap();
             if let Some(i) = idx.as_mut() {
                 i.reindex_file_full(file, kind, module, text);
             }
         }
+        as_log!("add_file: indexed {bytes} bytes (kind={:?})", kind);
         self.use_cache.lock().unwrap().clear();
     }
 
@@ -209,6 +214,7 @@ impl WorkspaceState {
                 i.remove_file(file);
             }
         }
+        as_log!("remove_file: tombstoned");
         self.use_cache.lock().unwrap().clear();
     }
 }
