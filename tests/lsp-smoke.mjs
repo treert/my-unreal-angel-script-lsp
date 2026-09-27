@@ -110,6 +110,23 @@ send({
   params: { textDocument: { uri }, position: { line: 2, character: 8 }, newName: 'class' },
 });
 await sleep(400);
+// ---- M5b: completion ----
+// ① `X.` 成员补全：Foo F; F.| —— Tick 体内 line 6 之前无局部，先补一版文本
+//    直接复用现有文档：Count/Count 相加在 line 5；此处用 this. 的成员位
+send({
+  jsonrpc: '2.0', id: 12, method: 'textDocument/completion',
+  params: { textDocument: { uri }, position: { line: 5, character: 21 } }, // `Count + 1` 的 1 前
+});
+await sleep(400);
+// ② 命名实参：Print 重载 + InArgN 跳过（虚构函数验证语义；用当前文档的
+//    调用语境——Tick(float Delta) 调用点没有；改用裸标识符位验证 Plain
+// ---- M5b: completion ②（无前缀 Plain → 全集）----
+// line 5 = `        Count = Count + 1;`：char 23 = "+ " 之后（无前缀表达式位）
+send({
+  jsonrpc: '2.0', id: 13, method: 'textDocument/completion',
+  params: { textDocument: { uri }, position: { line: 5, character: 23 } },
+});
+await sleep(400);
 send({ jsonrpc: '2.0', method: 'exit' });
 await sleep(800);
 
@@ -204,6 +221,24 @@ if (!wss.result.some((s) => s.name === 'Foo')) fail(`workspaceSymbol missing Foo
 const bad = responses.get(11);
 if (!bad || !bad.error) fail(`rename 'class' should error: ${JSON.stringify(bad)}`);
 
+// ---- M5b: completion ①（前缀过滤：char21 = 第二个 Count 的尾端点 →
+// 前缀 "Count" → 只剩 Count；Delta/其它关键字应被过滤）----
+const c1 = responses.get(12);
+if (!c1 || !c1.result) fail(`no completion response #12: ${JSON.stringify(c1)}`);
+const items1 = c1.result.items ?? c1.result;
+if (!Array.isArray(items1) || items1.length === 0) fail(`completion #12 empty: ${JSON.stringify(c1.result)}`);
+if (!items1.some((i) => i.label === 'Count')) fail(`completion #12 missing 'Count' (prefix): ${JSON.stringify(items1.map((i) => i.label))}`);
+if (items1.some((i) => i.label === 'Delta')) fail(`completion #12 should filter out 'Delta': ${JSON.stringify(items1.map((i) => i.label))}`);
+
+// ---- M5b: completion ②（无前缀 Plain：line5 char18 在 "+ " 之后 →
+// 全集；局部 Delta / 成员 Count / 关键字都可见）----
+const c2 = responses.get(13);
+if (!c2 || !c2.result) fail(`no completion response #13: ${JSON.stringify(c2)}`);
+const items2 = c2.result.items ?? c2.result;
+if (!items2.some((i) => i.label === 'Delta')) fail(`completion #13 missing local 'Delta': ${JSON.stringify(items2.map((i) => i.label))}`);
+if (!items2.some((i) => i.label === 'Count')) fail(`completion #13 missing member 'Count': ${JSON.stringify(items2.map((i) => i.label))}`);
+if (!items2.some((i) => i.kind === 14)) fail(`completion #13 missing keyword kind: ${JSON.stringify(items2.slice(0, 5))}`);
+
 // ---- M4: $/progress（references 长任务）----
 const progressMsgs = notifications.filter((n) => n.method === '$/progress');
 if (progressMsgs.length === 0) fail('no $/progress notifications for references');
@@ -227,6 +262,6 @@ if (typeof readyParams.floatIsFloat64 !== 'boolean') {
   fail(`indexStatus floatIsFloat64: ${JSON.stringify(readyParams)}`);
 }
 
-console.log(`SMOKE OK: legend ${legend.length} types, ${tokenCount} tokens, symbols OK, didOpen logged=${opened}, hover/definition/references/rename/workspaceSymbol OK, $/progress msgs=${progressMsgs.length}, indexStatus files=${readyParams.files}`);
+console.log(`SMOKE OK: legend ${legend.length} types, ${tokenCount} tokens, symbols OK, didOpen logged=${opened}, hover/definition/references/rename/workspaceSymbol/completion OK, $/progress msgs=${progressMsgs.length}, indexStatus files=${readyParams.files}`);
 p.kill();
 process.exit(0);

@@ -291,6 +291,15 @@ impl LanguageServer for Backend {
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![
+                        ".".to_string(),  // `X.` 成员
+                        ":".to_string(),  // `A::` 命名空间 / enum
+                        "(".to_string(),  // 实参位（命名实参）
+                        ",".to_string(),  // 实参位（下一实参）
+                    ]),
+                    ..CompletionOptions::default()
+                }),
                 references_provider: Some(OneOf::Left(true)),
                 rename_provider: Some(OneOf::Right(RenameOptions {
                     prepare_provider: Some(true),
@@ -618,6 +627,64 @@ impl LanguageServer for Backend {
             }),
             range: None,
         }))
+    }
+
+    async fn completion(&self, params: CompletionParams) -> RpcResult<Option<CompletionResponse>> {
+        // M5b：语境判定与候选收集在 as-core completion.rs；本层只做映射。
+        // CompletionParams 的位置字段（fork 无 _params 后缀）
+        let Some((file, byte)) = self.doc_position(&params.text_document_position) else {
+            return Ok(None);
+        };
+        if !self.ws.is_ready() {
+            return Ok(None); // Loading：语义请求返回空（§6.1 默认）
+        }
+        self.ws.ensure_file_fresh(file, &self.docs);
+        let cands = self
+            .ws
+            .with(|idx| as_core::completion::complete_at(idx, file, byte))
+            .unwrap_or_default();
+        let items = cands
+            .into_iter()
+            .map(|c| {
+                // 命名实参 `Name=` 后面直接继续输值；成员/方法不自动截断
+                let insert_fmt = c.insert.as_ref().map(|_| InsertTextFormat::SNIPPET);
+                CompletionItem {
+                    label: c.label,
+                    kind: Some(match c.kind {
+                        as_core::completion::CandidateKind::Field => CompletionItemKind::FIELD,
+                        as_core::completion::CandidateKind::Method => CompletionItemKind::METHOD,
+                        as_core::completion::CandidateKind::Function => CompletionItemKind::FUNCTION,
+                        as_core::completion::CandidateKind::Property => CompletionItemKind::FIELD,
+                        as_core::completion::CandidateKind::Class => CompletionItemKind::CLASS,
+                        as_core::completion::CandidateKind::Struct => CompletionItemKind::STRUCT,
+                        as_core::completion::CandidateKind::Enum => CompletionItemKind::ENUM,
+                        as_core::completion::CandidateKind::EnumValue => {
+                            CompletionItemKind::ENUM_MEMBER
+                        }
+                        as_core::completion::CandidateKind::Namespace => CompletionItemKind::MODULE,
+                        as_core::completion::CandidateKind::GlobalVar => {
+                            CompletionItemKind::VARIABLE
+                        }
+                        as_core::completion::CandidateKind::Param
+                        | as_core::completion::CandidateKind::LocalVar => {
+                            CompletionItemKind::VARIABLE
+                        }
+                        as_core::completion::CandidateKind::Keyword => CompletionItemKind::KEYWORD,
+                        as_core::completion::CandidateKind::Delegate
+                        | as_core::completion::CandidateKind::Event => CompletionItemKind::EVENT,
+                        as_core::completion::CandidateKind::NamedArg => CompletionItemKind::FIELD,
+                    }),
+                    detail: c.detail,
+                    insert_text: c.insert,
+                    insert_text_format: insert_fmt,
+                    ..CompletionItem::default()
+                }
+            })
+            .collect();
+        Ok(Some(CompletionResponse::List(CompletionList {
+            is_incomplete: false,
+            items,
+        })))
     }
 
     async fn goto_definition(

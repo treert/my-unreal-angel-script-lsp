@@ -118,13 +118,15 @@ impl WorkspaceState {
 
     /// 发布快照 + 重放 pending_dirty（§6.1：发布瞬间原子完成）。
     /// 全量换根 ⇒ UseSite 解析缓存整表失效。
+    ///
+    /// **indexed_versions 必须清空而非预填 overlay 版本**（M5b 修 M3 潜伏
+    /// bug）：新索引来自磁盘文本，与 overlay 版本无对应关系——预填会让
+    /// 重放的 `ensure_file_fresh` 判定「版本相等」而短路，didOpen 文本 ≠
+    /// 磁盘内容时（probe / 真实编辑）重放成空操作，hover 恒 null。清空后
+    /// dirty 集合的每个 overlay 文件都会真正 reindex。
     pub fn publish_and_replay(&self, idx: WorkspaceIndex, docs: &Mutex<DocStore>) {
-        let versions: HashMap<FileId, i32> = {
-            let store = docs.lock().unwrap();
-            store.overlays().into_iter().map(|(f, v, _)| (f, v)).collect()
-        };
         *self.index.write().unwrap() = Some(idx);
-        *self.indexed_versions.lock().unwrap() = versions;
+        self.indexed_versions.lock().unwrap().clear();
         self.use_cache.lock().unwrap().clear();
         let dirty: Vec<FileId> = self.dirty.lock().unwrap().drain().collect();
         as_log!("index published: {} pending dirty replay(s)", dirty.len());

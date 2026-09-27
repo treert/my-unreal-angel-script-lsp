@@ -13,6 +13,27 @@ const target = `${scriptRoot}/Script-Examples/Examples/Example_MovingObject.as`;
 const src = readFileSync(target, 'utf8');
 const uri = 'file:///' + target.replace(/:/g, '%3A').replace(/\\/g, '/');
 
+// M5：didOpen 用内置 probe 文本（overlay 唯一真值，D18——hover/definition/
+// references 断言不依赖原文件内容，FVector 字样仍在）。两处补全锚点：
+//   line4 `V.` 行尾 → Member（FVector 成员集）
+//   line5 `FVector::Zero;` 尾 → Scoped + 前缀 Zero
+// 注意行序：首个 FVector 必须在类型位（`FVector V(...)`）——`::` 限定段的
+// FVector 解析到 namespace（§2.2.1 语境择一），namespace hover 无签名会
+// 让 Ready 轮询假超时。
+const probe = [
+  'class Probe',
+  '{',
+  '    void Run()',
+  '    {',
+  '        FVector V(0.0, 0.0, 0.0);',
+  '        FVector::Zero;',
+  '        V.',
+  '    }',
+  '}',
+  '',
+].join('\n');
+const openText = probe;
+
 const p = spawn(exe, [], { stdio: ['pipe', 'pipe', 'pipe'] });
 p.stderr.on('data', (c) => console.error('[server-stderr]', c.toString()));
 p.on('exit', (c) => console.error('[server-exit]', c));
@@ -39,7 +60,13 @@ p.stdout.on('data', (chunk) => {
     else if (msg.id !== undefined) {
       notifications.push(msg);
       const isProgressCreate = msg.method === 'window/workDoneProgress/create';
-      send({ jsonrpc: '2.0', id: msg.id, result: isProgressCreate ? null : [] });
+      let result = isProgressCreate ? null : [];
+      // workspace/configuration：回 [] 会反序列化失败（M4 已知坑）——回真实
+      // 配置对象（debug.fileLog 开日志拿重放证据）
+      if (msg.method === 'workspace/configuration') {
+        result = [{ floatIsFloat64: true, debug: { fileLog: true } }];
+      }
+      send({ jsonrpc: '2.0', id: msg.id, result });
     } else if (msg.method) notifications.push(msg);
   }
 });
@@ -60,10 +87,10 @@ await sleep(500);
 send({ jsonrpc: '2.0', method: 'initialized', params: {} });
 await sleep(200);
 send({ jsonrpc: '2.0', method: 'textDocument/didOpen',
-  params: { textDocument: { uri, languageId: 'angelscript-asl', version: 1, text: src } } });
+  params: { textDocument: { uri, languageId: 'angelscript-asl', version: 1, text: openText } } });
 
 // 先定位 FVector 使用点，用它轮询 Ready（没 Ready 时 hover 返回 null）
-const lines = src.split(/\r?\n/);
+const lines = openText.split(/\r?\n/);
 function findPos(re) {
   for (let l = 0; l < lines.length; l++) {
     const m = re.exec(lines[l]);
@@ -85,7 +112,14 @@ for (let i = 0; i < 120; i++) {
   if (h && h.result) break;
 }
 console.error(`poll done after ${Date.now() - t0}ms, ready: ${!!(h && h.result)}`);
-if (!(h && h.result)) fail('index never became ready (check server stderr above)');
+if (!(h && h.result)) {
+  console.error('indexStatus notifications:',
+    JSON.stringify(notifications.filter((n) => n.method === 'myas/indexStatus').map((n) => n.params)));
+  console.error('all notification methods:',
+    JSON.stringify([...new Set(notifications.map((n) => n.method))]));
+  console.error('last hover response:', JSON.stringify(h));
+  fail('index never became ready (check server stderr above)');
+}
 const hv = h?.result?.contents?.value ?? '';
 if (!hv.includes('```angelscript_snippet')) fail(`hover no fence: ${hv.slice(0, 200)}`);
 if (!/struct\s+FVector/.test(hv)) fail(`hover no 'struct FVector': ${hv.slice(0, 300)}`);
@@ -129,6 +163,32 @@ if (!ready.some((p) => p?.state === 'ready' && p.files === 441)) {
 }
 console.log(`references -> ${refs.length} sites across ${declFiles.size} files; $/progress msgs=${progressMsgs.length}; indexStatus files=${ready[ready.length - 1]?.files}`);
 
-console.log(`E2E OK: hover=struct FVector; definition -> ${decodeURIComponent(locs[0].uri).split('/').pop()}:${locs[0].range.start.line + 1}; references=${refs.length}`);
+// ---- M5b: completion（真实工作区索引上的两类语境）----
+// ① Scoped：line5 `        FVector::Zero;` —— char20 = "Zero" 尾端点（前缀 Zero）
+const scopedPos = { line: 5, character: 20 };
+send({ jsonrpc: '2.0', id: 203, method: 'textDocument/completion',
+  params: { textDocument: { uri }, position: scopedPos } });
+await sleep(800);
+const c1 = responses.get(203);
+if (!c1 || !c1.result) fail(`no completion #203: ${JSON.stringify(c1)}`);
+const items1 = c1.result.items ?? c1.result;
+if (!items1.some((i) => i.label === 'ZeroVector')) {
+  fail(`Scoped FVector:: should offer ZeroVector (prefix Zero): ${JSON.stringify(items1.slice(0, 10))}`);
+}
+// ② Member：line6 `        V.` 行尾 → FVector 成员（字段 X/Y/Z + 方法 Dot）
+const memberPos = { line: 6, character: 10 };
+send({ jsonrpc: '2.0', id: 204, method: 'textDocument/completion',
+  params: { textDocument: { uri }, position: memberPos } });
+await sleep(800);
+const c2 = responses.get(204);
+if (!c2 || !c2.result) fail(`no completion #204: ${JSON.stringify(c2)}`);
+const items2 = c2.result.items ?? c2.result;
+const labels2 = items2.map((i) => i.label);
+for (const want of ['X', 'Y', 'Z', 'DotProduct']) {
+  if (!labels2.includes(want)) fail(`member completion missing '${want}': ${JSON.stringify(labels2.slice(0, 20))}`);
+}
+console.log(`completion -> scoped Zero=${items1.length} items (ZeroVector ok); member FVector=${items2.length} items (X/Y/Z/DotProduct ok)`);
+
+console.log(`E2E OK: hover=struct FVector; definition -> ${decodeURIComponent(locs[0].uri).split('/').pop()}:${locs[0].range.start.line + 1}; references=${refs.length}; completion scoped/member ok`);
 p.kill();
 process.exit(0);

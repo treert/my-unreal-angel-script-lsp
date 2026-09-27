@@ -12,6 +12,7 @@
 //! `pub use as_syntax` 取语法能力，不直连 as-syntax。
 
 pub mod config;
+pub mod completion;
 pub mod decl_tags;
 pub mod expand;
 pub mod expr;

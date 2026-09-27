@@ -106,6 +106,19 @@ impl<'t> SemCtx<'t> {
         idx: &WorkspaceIndex,
         file: FileId,
     ) -> SemCtx<'t> {
+        Self::at_byte(idx, file, src, ident.start_byte() as u32, ident)
+    }
+
+    /// 任意字节位置建语境（M5b 补全入口）：`node` 是光标处最深节点
+    /// （identifier / 运算符 token / ERROR 均可——上溯只看祖先种类），
+    /// `byte` 是可见性锚点（声明点在其后的局部不可见）。
+    pub(crate) fn at_byte(
+        idx: &WorkspaceIndex,
+        file: FileId,
+        src: &str,
+        byte: u32,
+        node: Node<'t>,
+    ) -> SemCtx<'t> {
         let mut ctx = SemCtx {
             ns_defs: Vec::new(),
             ns_syms: Vec::new(),
@@ -115,9 +128,8 @@ impl<'t> SemCtx<'t> {
             file,
             _tree: std::marker::PhantomData,
         };
-        let byte = ident.start_byte() as u32;
         let mut chain: Vec<Node<'t>> = Vec::new();
-        let mut cur = ident.parent();
+        let mut cur = node.parent();
         while let Some(n) = cur {
             chain.push(n);
             cur = n.parent();
@@ -976,7 +988,7 @@ fn mixin_candidates(idx: &WorkspaceIndex, recv: DefId, name: Sym, ns_syms: &[Sym
 }
 
 /// 同名 namespace 聚合（跨文件 + 合成 StaticClass 命名空间）。
-fn namespaces_named(idx: &WorkspaceIndex, name: Sym) -> Vec<DefId> {
+pub(crate) fn namespaces_named(idx: &WorkspaceIndex, name: Sym) -> Vec<DefId> {
     idx.main
         .get(&name)
         .map(|ds| {
