@@ -58,6 +58,15 @@ impl DocStore {
         self.docs.get(&file)
     }
 
+    /// overlay 快照（FileId, version, text）——冷启动线程构建索引用（§5.1
+    /// overlay 优先：不与本锁交叉持锁，快照后释放）。
+    pub fn overlays(&self) -> Vec<(FileId, i32, String)> {
+        self.docs
+            .iter()
+            .map(|(f, d)| (*f, d.version, d.text.clone()))
+            .collect()
+    }
+
     /// 应用一批增量/全量变更（按客户端发送顺序）。
     pub fn apply_changes(&mut self, file: FileId, version: i32, changes: Vec<TextChange>) {
         let Some(doc) = self.docs.get_mut(&file) else {

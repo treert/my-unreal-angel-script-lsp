@@ -21,9 +21,11 @@ as-lsp ──► as-core ──► as-syntax
 as-cli ──► as-core
 ```
 
-as-lsp 现有能力（M2）：`documentSymbol` / `foldingRange` / `semanticTokens(full)`
-（legend 19 类，wire 名与 Hazelight 对齐——`as_typename` 等）+ textDocumentSync
-Incremental + `myAngelScriptLsp.*` 配置读取。hover/definition 等随 M3。
+as-lsp 现有能力（M3）：`documentSymbol` / `foldingRange` / `semanticTokens(full)`
+（legend 19 类，wire 名与 Hazelight 对齐——`as_typename` 等）+ `hover` /
+`definition`（查找链 0-6 级，架构设计 §4.5）+ textDocumentSync Incremental +
+`myAngelScriptLsp.*` 配置读取 + 冷启动后台索引（Loading/Ready 状态机）。
+references / completion / signatureHelp 等随 M4/M5。
 
 ## 前置：先生成 grammar
 
@@ -132,6 +134,31 @@ cargo run -p as-cli --release -- dump-index `
 旁证：class 闭包解析中「未解析基类」恰好 20 个——与 20 个丢失 group 闭环对应。
 `--sym FVector` 抽查：`struct FVector` 落点 `Core.d.as:10103`，与架构设计
 §2.2.1 的源码行号引用一致。
+
+## M3 验收（已完成，可随时复跑）
+
+```powershell
+# ① 内置单测（77 条：查找链 0-6 级命中序、mixin 五条准入、delegate 展开、
+#    hover 渲染、重索引）
+cargo test --workspace
+
+# ② 冒烟（hover/definition 含 snippet fence 断言）
+node ..\tests\lsp-smoke.mjs
+
+# ③ 真实工作区端到端（双根布局；本机 Demo_AS 路径）
+node ..\tests\lsp-e2e-workspace.mjs
+# 预期：E2E OK: hover=struct FVector; definition -> Core.d.as:10103
+
+# ④ 语料批量 + 查找链体检
+cargo run -p as-cli --release -- dump-index --resolve-stats `
+    d:\WorkGit\UEProjs\Demo_AS\Script d:\WorkGit\UEProjs\Demo_AS\Saved\AS-Cache
+# 预期：对账数字不回归（13814/63338）；resolve-stats hit ≈ 93%
+#（未命中主要是 EnhancedInput 插件类型不在本机 AS-Cache + 表达式定型
+#  推迟子集——f-string 插值/字面量运算等，M4+ 扩）
+
+# ⑤ VSCode 体感验收（人工）：EDH + tools\test-extension.ps1 打开
+#    test-as-lsp.code-workspace，hover/F12 跳 .d.as
+```
 
 ## 约定提醒
 

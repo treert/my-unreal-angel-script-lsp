@@ -62,6 +62,22 @@ send({ jsonrpc: '2.0', id: 2, method: 'textDocument/semanticTokens/full', params
 await sleep(500);
 send({ jsonrpc: '2.0', id: 3, method: 'textDocument/documentSymbol', params: { textDocument: { uri } } });
 await sleep(400);
+// M3：hover / definition（空 workspace → 冷启动即时 Ready；overlay 即索引文本）
+send({
+  jsonrpc: '2.0', id: 4, method: 'textDocument/hover',
+  params: { textDocument: { uri }, position: { line: 2, character: 8 } }, // Count 声明名
+});
+await sleep(300);
+send({
+  jsonrpc: '2.0', id: 5, method: 'textDocument/definition',
+  params: { textDocument: { uri }, position: { line: 3, character: 21 } }, // Delta 形参名
+});
+await sleep(300);
+send({
+  jsonrpc: '2.0', id: 6, method: 'textDocument/hover',
+  params: { textDocument: { uri }, position: { line: 3, character: 20 } }, // Delta 形参名
+});
+await sleep(400);
 send({ jsonrpc: '2.0', method: 'exit' });
 await sleep(800);
 
@@ -103,6 +119,28 @@ if (!foo || foo.name !== 'Foo' || foo.children.length !== 2) {
 }
 
 const opened = notifications.some((n) => n.method === 'window/logMessage' && /didOpen/.test(n.params?.message ?? ''));
-console.log(`SMOKE OK: legend ${legend.length} types, ${tokenCount} tokens, symbols OK, didOpen logged=${opened}`);
+
+// ---- M3: hover ----
+const hoverCount = responses.get(4);
+if (!hoverCount || !hoverCount.result) fail(`no hover response: ${JSON.stringify(hoverCount)}`);
+const hoverValue = hoverCount.result.contents?.value ?? '';
+if (!hoverValue.includes('```angelscript_snippet')) fail(`hover missing snippet fence: ${JSON.stringify(hoverValue)}`);
+if (!/int\s+Count/.test(hoverValue)) fail(`hover missing 'int Count': ${hoverValue}`);
+
+// ---- M3: definition（Count 声明自指 → 本文件落点）----
+const defCount = responses.get(5);
+if (!defCount || !defCount.result) fail(`no definition response: ${JSON.stringify(defCount)}`);
+const defArr = Array.isArray(defCount.result) ? defCount.result : [defCount.result];
+if (defArr.length === 0) fail('definition returned no locations');
+if (!defArr[0].uri.includes('SmokeTest.as')) fail(`definition uri: ${defArr[0].uri}`);
+if (defArr[0].range.start.line !== 3) fail(`definition line: ${JSON.stringify(defArr[0].range)}`);
+
+// ---- M3: hover 形参（局部/形参渲染）----
+const hoverParam = responses.get(6);
+if (!hoverParam || !hoverParam.result) fail(`no param hover: ${JSON.stringify(hoverParam)}`);
+const paramValue = hoverParam.result.contents?.value ?? '';
+if (!/float\s+Delta/.test(paramValue)) fail(`param hover missing 'float Delta': ${paramValue}`);
+
+console.log(`SMOKE OK: legend ${legend.length} types, ${tokenCount} tokens, symbols OK, didOpen logged=${opened}, hover/definition OK`);
 p.kill();
 process.exit(0);

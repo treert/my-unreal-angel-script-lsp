@@ -11,8 +11,9 @@
 //! UTF-16 ↔ 字节换算只在本层发生（经 as-core `range.rs` 原语，§3.2.1）。
 
 mod docs;
+mod workspace;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tower_lsp_server::jsonrpc::Result as RpcResult;
 use tower_lsp_server::ls_types::{self as ls, *};
@@ -20,22 +21,20 @@ use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
 use as_core::id::FileId;
 use as_core::outline::{self, FoldKind, OutlineKind};
+use as_core::resolve::Target;
 use as_core::tokens;
 use as_core::{LEGEND, LineIndex, TextRange};
 
 use docs::{DocStore, TextChange};
-
-/// 索引级配置（M2 先存储；全量重建的消费方随 M3 落地，§5.3 / §8.1）。
-#[derive(Debug)]
-struct ServerConfig {
-    /// 对应引擎 `bScriptFloatIsFloat64`（默认 true，架构设计 §5 / G9）
-    float_is_float64: bool,
-}
+use workspace::{WorkspaceConfig, WorkspaceState};
 
 struct Backend {
     client: Client,
-    docs: Mutex<DocStore>,
-    config: Mutex<ServerConfig>,
+    docs: Arc<Mutex<DocStore>>,
+    /// 索引级配置（任一变更 ⇒ 后台全量重建，§5.3）
+    config: Mutex<WorkspaceConfig>,
+    ws: Arc<WorkspaceState>,
+    folders: Mutex<Vec<String>>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -45,21 +44,35 @@ async fn main() {
 
     let (service, socket) = LspService::build(|client| Backend {
         client,
-        docs: Mutex::new(DocStore::new()),
-        config: Mutex::new(ServerConfig { float_is_float64: true }),
+        docs: Arc::new(Mutex::new(DocStore::new())),
+        config: Mutex::new(WorkspaceConfig::default()),
+        ws: Arc::new(WorkspaceState::new()),
+        folders: Mutex::new(Vec::new()),
     })
     .finish();
 
     Server::new(stdin, stdout, socket).serve(service).await;
 }
 
-/// URI → 文件路径字符串（仅 file:// URI；Cow 免拷贝）。
+/// URI → 文件路径字符串（仅 file:// URI；分隔符规范化——`to_file_path`
+/// 在 Windows 返回正斜杠形态，须与索引侧统一，否则 FileId 分裂）。
 fn uri_path(uri: &ls::Uri) -> Option<String> {
     uri.to_file_path()
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|p| workspace::normalize_path(&p.to_string_lossy()))
 }
 
 impl Backend {
+    /// 语义请求的前置：URI+Position → (FileId, 字节偏移)。
+    /// 锁内完成 UTF-16 → 字节换算（§3.2.1：换算只在本层发生）。
+    fn doc_position(&self, p: &TextDocumentPositionParams) -> Option<(FileId, u32)> {
+        let path = uri_path(&p.text_document.uri)?;
+        let file = as_core::intern::file_id_of_path(&path)?;
+        let store = self.docs.lock().unwrap();
+        let doc = store.get(file)?;
+        let byte = doc.lines.offset_of_utf16(&doc.text, p.position.line, p.position.character);
+        Some((file, byte))
+    }
+
     /// URI → (FileId, 文档表锁)。文件未打开（无 overlay）→ None。
     fn doc_of(&self, uri: &ls::Uri) -> Option<(FileId, std::sync::MutexGuard<'_, DocStore>)> {
         let path = uri_path(uri)?;
@@ -75,20 +88,61 @@ impl Backend {
             section: Some("myAngelScriptLsp".to_string()),
         }];
         if let Ok(values) = self.client.configuration(items).await {
-            if let Some(b) = values
-                .first()
-                .and_then(|v| v.get("floatIsFloat64"))
-                .and_then(|v| v.as_bool())
-            {
-                self.config.lock().unwrap().float_is_float64 = b;
+            if let Some(v) = values.first() {
+                let mut cfg = self.config.lock().unwrap();
+                if let Some(b) = v.get("floatIsFloat64").and_then(|b| b.as_bool()) {
+                    cfg.float_is_float64 = b;
+                }
+                if let Some(roots) = v.get("scriptRoots").and_then(|r| r.as_array()) {
+                    let parsed: Vec<String> = roots
+                        .iter()
+                        .filter_map(|s| s.as_str().map(str::to_string))
+                        .collect();
+                    if !parsed.is_empty() {
+                        cfg.script_roots = parsed;
+                    }
+                }
+                if let Some(dirs) = v.get("typeDeclarationDirs").and_then(|r| r.as_array()) {
+                    let parsed: Vec<String> = dirs
+                        .iter()
+                        .filter_map(|s| s.as_str().map(str::to_string))
+                        .collect();
+                    if !parsed.is_empty() {
+                        cfg.decl_dirs = parsed;
+                    }
+                }
             }
         }
         // 客户端不支持 workspace/configuration 时保持默认值（G9：默认对齐引擎）
     }
+
+    /// 启动冷启动后台线程（§6：Phase 0-2 → 发布 → 重放 pending_dirty）。
+    fn spawn_index_build(&self) {
+        let cfg = self.config.lock().unwrap().clone();
+        let folders = self.folders.lock().unwrap().clone();
+        let docs = Arc::clone(&self.docs);
+        let ws = Arc::clone(&self.ws);
+        std::thread::spawn(move || {
+            let overlays = {
+                let store = docs.lock().unwrap();
+                store.overlays()
+            };
+            let idx = workspace::build_index(&cfg, &folders, &overlays);
+            ws.publish_and_replay(idx, &docs);
+        });
+    }
 }
 
 impl LanguageServer for Backend {
-    async fn initialize(&self, _params: InitializeParams) -> RpcResult<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> RpcResult<InitializeResult> {
+        // workspaceFolders：scriptRoots 空 = 全部根（§5）；${workspaceFolder} 展开
+        if let Some(folders) = params.workspace_folders {
+            let paths: Vec<String> = folders
+                .iter()
+                .filter_map(|f| uri_path(&f.uri))
+                .collect();
+            *self.folders.lock().unwrap() = paths;
+        }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -96,6 +150,8 @@ impl LanguageServer for Backend {
                 )),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                definition_provider: Some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
                         legend: SemanticTokensLegend {
@@ -124,9 +180,13 @@ impl LanguageServer for Backend {
         self.load_config().await;
         let msg = {
             let config = self.config.lock().unwrap();
-            format!("my-as-lsp M2 ready (floatIsFloat64={})", config.float_is_float64)
+            format!(
+                "my-as-lsp M3 ready (floatIsFloat64={}, scriptRoots={:?}, typeDeclarationDirs={:?})",
+                config.float_is_float64, config.script_roots, config.decl_dirs
+            )
         };
         self.client.log_message(MessageType::INFO, msg).await;
+        self.spawn_index_build();
     }
 
     async fn shutdown(&self) -> RpcResult<()> {
@@ -144,8 +204,14 @@ impl LanguageServer for Backend {
                     format!("didOpen {path} (languageId={})", doc.language_id),
                 )
                 .await;
-            let mut store = self.docs.lock().unwrap();
-            store.open(&path, doc.version, doc.text);
+            let file = {
+                let mut store = self.docs.lock().unwrap();
+                store.open(&path, doc.version, doc.text)
+            };
+            // Loading 期间的编辑记入 pending_dirty（§6.1；Ready 后惰性重索引）
+            if !self.ws.is_ready() {
+                self.ws.mark_dirty(file);
+            }
         }
     }
 
@@ -174,9 +240,17 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         if let Some(path) = uri_path(&params.text_document.uri) {
-            let mut store = self.docs.lock().unwrap();
-            if let Some(file) = as_core::intern::file_id_of_path(&path) {
-                store.close(file);
+            let file = {
+                let mut store = self.docs.lock().unwrap();
+                let file = as_core::intern::file_id_of_path(&path);
+                if let Some(f) = file {
+                    store.close(f);
+                }
+                file
+            };
+            // overlay 丢弃 → 下次语义请求前回落磁盘重读（§5.1）
+            if let Some(f) = file {
+                self.ws.mark_stale(f);
             }
         }
     }
@@ -188,25 +262,55 @@ impl LanguageServer for Backend {
             .get("myAngelScriptLsp")
             .and_then(|v| v.get("floatIsFloat64"))
             .and_then(|v| v.as_bool());
-        if let Some(b) = new_value {
-            let changed = {
-                let mut config = self.config.lock().unwrap();
+        let new_roots = params
+            .settings
+            .get("myAngelScriptLsp")
+            .and_then(|v| v.get("scriptRoots"))
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect::<Vec<String>>()
+            });
+        let new_dirs = params
+            .settings
+            .get("myAngelScriptLsp")
+            .and_then(|v| v.get("typeDeclarationDirs"))
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect::<Vec<String>>()
+            });
+        let mut changed = false;
+        {
+            let mut config = self.config.lock().unwrap();
+            if let Some(b) = new_value {
                 if config.float_is_float64 != b {
                     config.float_is_float64 = b;
-                    true
-                } else {
-                    false
+                    changed = true;
                 }
-            };
-            if changed {
-                // 配置变更 ⇒ 全量重建声明索引（§5.3）——消费方随 M3 落地
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!("floatIsFloat64 -> {b} (index rebuild applies from M3)"),
-                    )
-                    .await;
             }
+            if let Some(r) = new_roots {
+                if config.script_roots != r {
+                    config.script_roots = r;
+                    changed = true;
+                }
+            }
+            if let Some(d) = new_dirs {
+                if config.decl_dirs != d {
+                    config.decl_dirs = d;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            // 索引级配置变更 ⇒ 后台全量重建（§5.3——floatIsFloat64 是唯一
+            // 不可替代的全量触发源；roots/dirs 换根同理）
+            self.client
+                .log_message(MessageType::INFO, "index config changed -> rebuilding")
+                .await;
+            self.spawn_index_build();
         }
     }
 
@@ -278,6 +382,107 @@ impl LanguageServer for Backend {
             data,
         })))
     }
+
+    async fn hover(&self, params: HoverParams) -> RpcResult<Option<Hover>> {
+        let Some((file, byte)) = self.doc_position(&params.text_document_position_params) else {
+            return Ok(None);
+        };
+        if !self.ws.is_ready() {
+            return Ok(None); // Loading：语义请求返回空（§6.1 默认）
+        }
+        self.ws.ensure_file_fresh(file, &self.docs);
+        let contents = self
+            .ws
+            .with(|idx| {
+                as_core::resolve::resolve_at(idx, file, byte)
+                    .and_then(|r| as_core::hover::hover_markdown(idx, &r.targets))
+            })
+            .flatten();
+        Ok(contents.map(|value| Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value,
+            }),
+            range: None,
+        }))
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> RpcResult<Option<GotoDefinitionResponse>> {
+        let Some((file, byte)) = self.doc_position(&params.text_document_position_params) else {
+            return Ok(None);
+        };
+        if !self.ws.is_ready() {
+            return Ok(None);
+        }
+        // 请求文档快照（局部/形参的落点换算用；克隆避免跨锁持有）
+        let doc_snapshot = {
+            let store = self.docs.lock().unwrap();
+            store.get(file).map(|d| {
+                (
+                    params.text_document_position_params.text_document.uri.clone(),
+                    d.lines.clone(),
+                    d.text.clone(),
+                )
+            })
+        };
+        let Some((uri, lines, text)) = doc_snapshot else {
+            return Ok(None);
+        };
+        self.ws.ensure_file_fresh(file, &self.docs);
+        let locations = self
+            .ws
+            .with(|idx| {
+                as_core::resolve::resolve_at(idx, file, byte).map(|r| {
+                    let mut out: Vec<ls::Location> = Vec::new();
+                    for t in &r.targets {
+                        match t {
+                            Target::Def(id) => {
+                                if let Some(loc) = target_location(idx, *id) {
+                                    out.push(loc);
+                                }
+                            }
+                            Target::Local(l) => {
+                                let (sl, sc) = lines.line_col_utf16(&text, l.name_span.start);
+                                let (el, ec) = lines.line_col_utf16(&text, l.name_span.end);
+                                out.push(ls::Location {
+                                    uri: uri.clone(),
+                                    range: Range::new(Position::new(sl, sc), Position::new(el, ec)),
+                                });
+                            }
+                        }
+                    }
+                    out
+                })
+            })
+            .flatten()
+            .unwrap_or_default();
+        Ok((!locations.is_empty()).then(|| GotoDefinitionResponse::Array(locations)))
+    }
+}
+
+/// Def 落点 → LSP Location（origin 回落 D10：合成符号跳转源头声明；
+/// `.d.as` 声明是合法落点）。局部/形参的落点在请求文件内，
+/// 由 goto_definition 用请求文档的行首表换算。
+fn target_location(idx: &as_core::WorkspaceIndex, id: as_core::DefId) -> Option<ls::Location> {
+    let mut d = idx.def(id);
+    if let Some(origin) = d.origin {
+        let o = idx.def(origin);
+        if o.origin.is_none() {
+            d = o;
+        }
+    }
+    let path = as_core::intern::file_path(d.file)?;
+    let uri = ls::Uri::from_file_path(path)?;
+    let snap = idx.files.get(&d.file)?;
+    let (sl, sc) = snap.lines.line_col_utf16(&snap.source, d.name_span.start);
+    let (el, ec) = snap.lines.line_col_utf16(&snap.source, d.name_span.end);
+    Some(ls::Location {
+        uri,
+        range: Range::new(Position::new(sl, sc), Position::new(el, ec)),
+    })
 }
 
 // ---------------------------------------------------------------------------

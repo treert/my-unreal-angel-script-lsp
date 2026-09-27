@@ -38,7 +38,8 @@ AGENTS.md（仓库说明 + 测试硬性规则）
 | M0 Cargo workspace + as-syntax + dump-tree | ✅ 完成（`lsp/` 四 crate 就位，依赖单向图成立；27 `.as` + 414 `.d.as` dump 零 ERROR，与 grammar P2 验收同口径） |
 | M1 as-core 三阶段 + dump-index + tag 解析 | ✅ 完成（Phase 1 rayon 并行 parse + Phase 2 成员表/继承闭包/类型归一化；15 tag 全解析；对账：type_count 13814 vs manifest 14864、member_count 63338 vs 69337——差额 ≈ 20 个被覆盖 group 的 1050 个类型及其成员，与风险 7 相符；继承环/struct 无闭包/float 双取值/4 零语料 tag 均有内置单测；**D25**：基础类型为合成 builtin DefId） |
 | M2 as-lsp 壳 + documentSymbol/semanticTokens/folding + VSCode 扩展最小版 | ✅ 代码完成（tower-lsp-server + 增量同步 + overlay；legend 19 类 wire 名与 Hazelight 对齐 `as_typename`…；扩展 languageId `angelscript-asl` + 配置骨架 + cargo 开发模式。**VSCode 体感验收与 Hazelight 截图对照待人工执行**：F5 扩展开发宿主打开 Demo_AS/Script） |
-| M3-M6 实现 | ⬜ 待开工（里程碑与验收见 [`LSP实现规划.md`](LSP实现规划.md) §9） |
+| M3 查找链 + hover/definition + workspace 索引接入 | ✅ 完成（resolve.rs 0-6 级全量 + mixin 五条准入；expand.rs delegate/event 成员集 + StaticClass 合成（引擎取证 ProcessDelegates / BindStaticClass）；hover.rs snippet fence + doxygen markdown；server 冷启动 Loading/Ready + pending_dirty 重放 + 惰性单文件重索引（D26）；路径分隔符规范化防 FileId 分裂（D26）。77 单测全绿；语料 resolve-stats 命中 93.3%（未命中主要是 EnhancedInput 插件类型不在本机 AS-Cache）；端到端：hover `struct FVector` / definition → `Core.d.as:10103`（与架构设计 §2.2.1 记录一致）。**VSCode 体感验收待人工执行**（EDH + test-extension.ps1） |
+| M4-M6 实现 | ⬜ 待开工（里程碑与验收见 [`LSP实现规划.md`](LSP实现规划.md) §9） |
 
 ### 开工前的已知待办（不阻塞 M0/M1，但须在对应里程碑前处理）
 

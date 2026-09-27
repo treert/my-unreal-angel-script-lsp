@@ -13,6 +13,7 @@
 
 pub mod decl_tags;
 pub mod expand;
+pub mod hover;
 pub mod id;
 pub mod index;
 pub mod intern;
@@ -28,6 +29,7 @@ pub mod types;
 pub use as_syntax;
 
 pub use decl_tags::{DocBlock, SemanticTag, TagKind, TagValue};
+pub use hover::{hover_markdown, render_doc, render_syn, signature};
 pub use id::{DefId, FileId, Sym, TypeId};
 pub use index::{filename_to_module_name, FileInput, FileKind, IndexConfig, WorkspaceIndex};
 pub use outline::{document_symbols, folding_ranges, Fold, FoldKind, OutlineKind, OutlineSymbol};
