@@ -11,7 +11,7 @@
 //!
 //! 模块归属表（FilenameToModuleName → local 可见域）随 M3 落地——M1 无消费方。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rayon::prelude::*;
 
@@ -25,6 +25,7 @@ use crate::range::{LineIndex, TextRange};
 use crate::symbol::{DefData, DefExtra, DefFlags, DefKind, SymbolTable};
 use crate::syntax::{self, DeclCtx};
 use crate::types::{SynType, TypeKind, TypeTable};
+use crate::uses::UseSite;
 
 /// 索引构建输入参数（规划 §3.3）。改动该配置 ⇒ 视同全量重建（§5.3）。
 #[derive(Clone, Copy, Debug)]
@@ -86,6 +87,9 @@ pub struct FileSnapshot {
     pub tree: as_syntax::tree_sitter::Tree,
     pub lines: LineIndex,
     pub errors: Vec<SyntaxError>,
+    /// UseSite 记录（Phase 2 产物 / D5：`(name, span, 语法角色)`，不解析）。
+    /// 解析（Phase 3）由 `references::resolve_file_uses` 请求驱动 + 按文件缓存。
+    pub uses: Vec<UseSite>,
     /// `.d.as` 文件头 `@group`（hover 归属显示的完整包路径，§2.2.1 推论 2）
     pub group: Option<String>,
     /// 文件头 `@cache_format`——识别但不消费（D21）
@@ -131,6 +135,10 @@ pub struct WorkspaceIndex {
     pub mixin_index: HashMap<DefId, Vec<DefId>>,
     /// 首参类型未解析的 mixin（待定桶，不阻塞构建）
     pub mixin_pending: Vec<DefId>,
+    /// 引用倒排（规划 §4 Phase 2 产物）：name → 出现该名字的文件集合
+    /// （references 候选剪枝）。BTree 保证候选序稳定；随 add_file /
+    /// remove_file_defs 维护。
+    pub ref_index: BTreeMap<Sym, BTreeSet<FileId>>,
 }
 
 impl WorkspaceIndex {
@@ -171,6 +179,7 @@ impl WorkspaceIndex {
             modules: HashMap::new(),
             mixin_index: HashMap::new(),
             mixin_pending: Vec::new(),
+            ref_index: BTreeMap::new(),
         };
         idx.inject_builtins();
         idx
@@ -231,6 +240,12 @@ impl WorkspaceIndex {
             self.extract_decl(child, src, file, None, DeclCtx::Global);
         }
 
+        // Phase 2b：UseSite 提取 + 引用倒排（D5：只记录，不解析）
+        let uses = crate::uses::collect_use_sites(cursor_root, src);
+        for site in &uses {
+            self.ref_index.entry(site.name).or_default().insert(file);
+        }
+
         self.files.insert(
             file,
             FileSnapshot {
@@ -239,6 +254,7 @@ impl WorkspaceIndex {
                 tree,
                 lines,
                 errors,
+                uses,
                 group,
                 cache_format,
             },
@@ -657,6 +673,15 @@ impl WorkspaceIndex {
         }
     }
 
+    /// 当前可达的 DefId 集合（出现在 main 的任一名字桶里——`push_def` 的全部
+    /// 产物都进 main；合成成员不进 main，但它们不是展开 / 倒排的输入）。
+    /// remove+re-add 后 arena 遗留旧 DefId（append-only 不可达）——展开与
+    /// mixin 倒排必须按此过滤，否则被替换的旧声明会以合成 namespace /
+    /// mixin 候选的形式复活（幽灵符号，M3 遗留 bug，M4 修正）。
+    pub(crate) fn live_def_ids(&self) -> std::collections::HashSet<DefId> {
+        self.main.values().flat_map(|ds| ds.iter().copied()).collect()
+    }
+
     /// mixin 倒排（架构设计 §4.5.1 / D23）：首参类型的 DefId → mixin 函数。
     /// 两种声明形式（前置 `mixin void F(..)` / 后置 `void F(..) mixin`）在
     /// `scan_flags` 已等价打 MIXIN。首参类型解析失败 / 非具名类型（数组、
@@ -664,10 +689,11 @@ impl WorkspaceIndex {
     fn build_mixin_index(&mut self) {
         self.mixin_index.clear();
         self.mixin_pending.clear();
+        let live = self.live_def_ids();
         let jobs: Vec<(DefId, Option<SynType>)> = self
             .symbols
             .iter()
-            .filter(|(_, d)| d.flags.contains(DefFlags::MIXIN))
+            .filter(|(id, d)| live.contains(id) && d.flags.contains(DefFlags::MIXIN))
             .filter_map(|(id, d)| {
                 let DefExtra::Callable { params, .. } = &d.extra else { return None };
                 Some((id, params.first().and_then(|p| p.ty.clone())))
@@ -702,9 +728,24 @@ impl WorkspaceIndex {
     /// 单文件重索引（规划 §5.2 的粗粒度落地，M3）：remove + re-add。
     /// 旧 DefId 遗留 arena（append-only）但从全部查询表摘除，不可达。
     /// 闭包 / mixin 倒排 / 声明类型按需重建（闭包与倒排全量重建——量级毫秒；
-    /// 声明类型只重算该文件）。精确声明级 diff 与联动失效留 M4 按需。
-    pub fn reindex_file(&mut self, file: FileId, kind: FileKind, source: String) {
+    /// 声明类型只重算该文件）。返回值 = 声明面指纹是否变化（D29：跨文件
+    /// 缓存联动失效的判定——函数体/局部改动 false，对外可见声明增删改 true）。
+    /// 精确声明级 diff 留 M5+ 按需。
+    pub fn reindex_file(&mut self, file: FileId, kind: FileKind, source: String) -> bool {
         let module = self.modules.get(&file).copied();
+        self.reindex_file_full(file, kind, module, source)
+    }
+
+    /// 全量重索引入口：module 显式传入（文件**新增 / 改名**后模块名随新路径
+    /// 重算，规划 §5.3——改名 = 删 + 增，不能沿用旧 module）。
+    pub fn reindex_file_full(
+        &mut self,
+        file: FileId,
+        kind: FileKind,
+        module: Option<Sym>,
+        source: String,
+    ) -> bool {
+        let before = self.decl_surface(file);
         self.remove_file_defs(file);
         let tree = as_syntax::parse(&source, None);
         let errors = as_syntax::verify_tree(&tree);
@@ -719,6 +760,36 @@ impl WorkspaceIndex {
         self.build_closures();
         self.resolve_decl_types_in(Some(file));
         self.build_mixin_index();
+        self.decl_surface(file) != before
+    }
+
+    /// 删除文件（规划 §5.3）：摘除该 FileId 的全部 DefId（arena 遗留不可达——
+    /// 墓碑语义的索引侧对应），从主索引 / 成员表 / 引用倒排 / mixin 倒排 /
+    /// module 表摘除，闭包与 mixin 倒排全量重建，最后打墓碑（D18）。
+    /// 同路径重现由调用方 intern 后走 `reindex_file_full`（FileId 自动复用）。
+    pub fn remove_file(&mut self, file: FileId) {
+        self.remove_file_defs(file);
+        crate::expand::expand_all(self);
+        self.build_closures();
+        self.build_mixin_index();
+        crate::intern::tombstone_file(file);
+    }
+
+    /// 该文件的「声明面」指纹：main 中属于该文件的 `(名字, kind, 父名)`
+    /// 有序集（含合成 namespace——类名隐含）。函数体 / 局部 / 注释改动
+    /// 不改变指纹；对外可见声明的增删改（含重载增删）会改变。
+    fn decl_surface(&self, file: FileId) -> Vec<(Sym, DefKind, Option<Sym>)> {
+        let mut out = Vec::new();
+        for (name, defs) in &self.main {
+            for &id in defs {
+                let d = self.symbols.get(id);
+                if d.file == file {
+                    out.push((*name, d.kind, d.parent.map(|p| self.symbols.get(p).name)));
+                }
+            }
+        }
+        out.sort();
+        out
     }
 
     /// 从全部查询表摘除该文件的 DefId（arena 不回收，D18 墓碑语义的索引侧对应）。
@@ -737,6 +808,11 @@ impl WorkspaceIndex {
         self.closures.clear();
         self.cycle_classes.clear();
         self.resolved.retain(|&id, _| self.symbols.get(id).file != file);
+        // 引用倒排：摘除该文件的贡献（该文件的使用点名字集合）
+        for files in self.ref_index.values_mut() {
+            files.remove(&file);
+        }
+        self.ref_index.retain(|_, s| !s.is_empty());
         self.files.remove(&file);
         self.modules.remove(&file);
     }
@@ -1200,5 +1276,53 @@ mixin void NoParam() {}
         let hits = idx.mixin_index.get(&t).expect("重索引后 mixin 倒排应重建");
         assert_eq!(hits.len(), 1);
         assert_eq!(sym_str(idx.def(hits[0]).name), "M");
+    }
+
+    // -----------------------------------------------------------------------
+    // M4：引用倒排 / 声明面指纹
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn m4_ref_index_built_and_maintained() {
+        const SRC: &str = "\
+struct FVector {}
+void F(FVector V) {}
+";
+        let path = "unique://m4ref/a.as";
+        let mut idx = build(&[(path, SRC)], IndexConfig::default());
+        let file = intern_file(path, 0);
+        // FVector 声明名不计，使用点（F 形参）计 1 个文件
+        assert!(idx.ref_index.get(&intern_sym("FVector")).unwrap().contains(&file));
+        assert!(idx.ref_index.get(&intern_sym("F")).is_none(), "声明名不进倒排");
+
+        // 重索引后倒排不重复、不残留
+        idx.reindex_file(file, FileKind::Script, SRC.to_string());
+        let hits = idx.ref_index.get(&intern_sym("FVector")).unwrap();
+        assert_eq!(hits.len(), 1, "remove + re-add 后倒排无重复条目");
+
+        // 摘除后该文件贡献消失
+        idx.remove_file(file);
+        assert!(
+            idx.ref_index.get(&intern_sym("FVector")).map_or(true, |s| s.is_empty()),
+            "摘除后引用倒排清空"
+        );
+    }
+
+    #[test]
+    fn m4_decl_surface_fingerprint() {
+        const V1: &str = "class C { void M() { int X = 1; } }\n";
+        const V2: &str = "class C { void M() { int X = 2; } }\n";
+        const V3: &str = "class C { void M() { int X = 2; } void N() {} }\n";
+        let path = "unique://m4surf/s.as";
+        let mut idx = build(&[(path, V1)], IndexConfig::default());
+        let file = intern_file(path, 0);
+        assert!(
+            !idx.reindex_file(file, FileKind::Script, V2.to_string()),
+            "函数体改动不改变声明面"
+        );
+        assert!(
+            idx.reindex_file(file, FileKind::Script, V3.to_string()),
+            "新增方法改变声明面"
+        );
     }
 }

@@ -160,11 +160,31 @@ impl<'t> SemCtx<'t> {
                 "block" => {
                     collect_block_locals(node, src, byte, &mut ctx.locals);
                 }
-                "for_statement" | "range_for_statement" => {
-                    // for 的初始化声明在整条 for 语句内可见
+                "for_statement" => {
+                    // classic for 的初始化声明在整条 for 语句内可见
                     for (_f, child) in syntax::children_with_fields(node) {
                         if child.kind() == "variable_declaration" {
                             collect_declarators(&child, src, byte, &mut ctx.locals);
+                        }
+                    }
+                }
+                "for_each_statement" => {
+                    // range-for 迭代变量：整条语句内可见（range 表达式里不可见
+                    // ——声明点之后才入栈）。M4 修正：M3 写的 "range_for_statement"
+                    // 是不存在的节点 kind（死分支），正确 kind 是 for_each_statement
+                    if let Some(name_node) = node.child_by_field_name("name") {
+                        let span = syntax::span(name_node);
+                        if span.start <= byte {
+                            let ty = node
+                                .child_by_field_name("type")
+                                .and_then(|t| syntax::parse_syn_type(t, src));
+                            ctx.locals.push(LocalDecl {
+                                name: intern_sym(syntax::text(name_node, src)),
+                                kind: DefKind::LocalVar,
+                                name_span: span,
+                                full_span: syntax::span(node),
+                                ty,
+                            });
                         }
                     }
                 }
@@ -237,7 +257,7 @@ fn def_id_at(
 // 角色分派
 // ---------------------------------------------------------------------------
 
-enum Role<'t> {
+pub(crate) enum Role<'t> {
     /// 类型位置（type / template_type 的 name）
     TypeUse,
     /// `A::B` 的首段 A
@@ -252,7 +272,7 @@ enum Role<'t> {
     Plain,
 }
 
-fn role_of<'t>(ident: Node<'t>, parent: Node<'t>) -> Role<'t> {
+pub(crate) fn role_of<'t>(ident: Node<'t>, parent: Node<'t>) -> Role<'t> {
     let field = syntax::children_with_fields(parent)
         .into_iter()
         .find(|(_, c)| c.id() == ident.id())
@@ -303,7 +323,7 @@ pub fn resolve_at(idx: &WorkspaceIndex, file: FileId, byte: u32) -> Option<Resol
     }
 
     let parent = ident.parent()?;
-    match role_of(ident, parent) {
+    let mut res = match role_of(ident, parent) {
         Role::TypeUse => resolve_type_use(idx, &ctx, name),
         Role::ScopedFirst => {
             // `Super::` 首段 = 显式父类（§4.5 第 0 级）
@@ -329,7 +349,19 @@ pub fn resolve_at(idx: &WorkspaceIndex, file: FileId, byte: u32) -> Option<Resol
             resolve_callee(idx, &ctx, name, argc)
         }
         Role::Plain => resolve_plain(idx, &ctx, name),
+    };
+    // M4 消歧（架构设计 §4.6）：调用点上的重载组——arity + 可定型实参
+    // （字面量 / 标识符 / 链式成员）能唯一命中时收敛为单目标；不能则原样
+    // 保留（消歧失败报全部重载）。运算符 / f-string 插值 / range-for 的
+    // 实参定型留 M5（与 signatureHelp 同批）。
+    if let Some(r) = res.as_mut() {
+        if r.targets.len() > 1 {
+            if let Some(call) = enclosing_call(ident) {
+                disambiguate_in_call(idx, &ctx, src, call, r);
+            }
+        }
     }
+    res
 }
 
 /// 光标处的 identifier 叶子（byte ∈ [start, end)）。primitive 关键字
@@ -367,6 +399,162 @@ fn argument_count(call: Node<'_>) -> usize {
                 .count()
         })
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// 调用点重载消歧（M4，overload::disambiguate 的实参侧）
+// ---------------------------------------------------------------------------
+
+/// 标识符是某 call_expression 的 callee（裸 / `A.B(...)` / `NS::F(...)` /
+/// `A::B::C(...)` 尾段）。不是调用点（赋值 / 实参 / return）返回 None。
+fn enclosing_call<'t>(ident: Node<'t>) -> Option<Node<'t>> {
+    let parent = ident.parent()?;
+    let is_call_function = |call: Node<'t>, target: Node<'t>| {
+        syntax::children_with_fields(call)
+            .into_iter()
+            .any(|(f, c)| c.id() == target.id() && f.as_deref() == Some("function"))
+    };
+    match parent.kind() {
+        "call_expression" if is_call_function(parent, ident) => Some(parent),
+        "member_expression" | "qualified_identifier" | "scoped_name" => {
+            let call = parent.parent()?;
+            if call.kind() == "call_expression" && is_call_function(call, parent) {
+                Some(call)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// 调用点重载消歧：只在「全部候选是可调用 Def」时尝试；结果不能唯一确定
+/// 就不动（保留整组——「报全部重载」）。排序判定在 `overload::disambiguate`。
+fn disambiguate_in_call(
+    idx: &WorkspaceIndex,
+    ctx: &SemCtx<'_>,
+    src: &str,
+    call: Node<'_>,
+    r: &mut Resolution,
+) {
+    let defs: Option<Vec<DefId>> = r
+        .targets
+        .iter()
+        .map(|t| match t {
+            Target::Def(id) => Some(*id),
+            Target::Local(_) => None,
+        })
+        .collect();
+    let Some(defs) = defs else { return };
+    if !defs.iter().all(|&id| {
+        matches!(
+            idx.def(id).kind,
+            DefKind::Function
+                | DefKind::Method
+                | DefKind::Constructor
+                | DefKind::Destructor
+                | DefKind::Operator
+        )
+    }) {
+        return;
+    }
+    let arg_bases = arg_type_bases(idx, ctx, src, call);
+    if let Some(winner) = crate::overload::disambiguate(idx, &defs, &arg_bases) {
+        r.targets = vec![Target::Def(winner)];
+    }
+}
+
+fn arg_type_bases(
+    idx: &WorkspaceIndex,
+    ctx: &SemCtx<'_>,
+    src: &str,
+    call: Node<'_>,
+) -> Vec<Option<DefId>> {
+    call.child_by_field_name("arguments")
+        .map(|args| {
+            syntax::children_with_fields(args)
+                .into_iter()
+                .filter(|(_, c)| c.kind() == "argument")
+                .map(|(_, a)| arg_type_base(idx, ctx, src, a))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 单实参的类型基（M4 可定型子集：字面量 / 标识符 / this / 链式成员 /
+/// 调用返回 / Cast 表达式；其余——运算符、f-string、initializer_list——None，
+/// 宁缺毋假，D14）。实参经 `expr_type`（M3 子集）或字面量规则定型。
+fn arg_type_base(
+    idx: &WorkspaceIndex,
+    ctx: &SemCtx<'_>,
+    src: &str,
+    arg: Node<'_>,
+) -> Option<DefId> {
+    // `argument` 是包装节点（argument_list 的直接子节点）：取其第一个具名子节点
+    let expr = if arg.kind() == "argument" {
+        syntax::children_with_fields(arg)
+            .into_iter()
+            .find(|(_, c)| c.is_named())
+            .map(|(_, c)| c)?
+    } else {
+        arg
+    };
+    let expr = match expr.kind() {
+        "named_argument" => expr.child_by_field_name("value")?,
+        "void_argument" => return None,
+        _ => expr,
+    };
+    match expr.kind() {
+        "number" => named_def_of(
+            idx,
+            intern_sym(number_base_name(syntax::text(expr, src), idx.config.float_is_float64)),
+        ),
+        "string_literal" | "heredoc_string" => named_def_of(idx, intern_sym("FString")),
+        "name_literal" => named_def_of(idx, intern_sym("FName")),
+        "boolean_literal" => named_def_of(idx, intern_sym("bool")),
+        "cast_expression" => expr
+            .child_by_field_name("type")
+            .and_then(|t| t.child_by_field_name("name"))
+            .and_then(|n| named_def_of(idx, intern_sym(syntax::text(n, src)))),
+        "parenthesized_expression" => {
+            let inner = syntax::children_with_fields(expr)
+                .into_iter()
+                .find(|(_, c)| c.is_named())
+                .map(|(_, c)| c)?;
+            arg_type_base(idx, ctx, src, inner)
+        }
+        _ => expr_type(idx, ctx, src, expr),
+    }
+}
+
+/// 数字字面量的基类型名（引擎语义：无后缀整数 → int；`1.5f` → float32；
+/// 其余浮点 → 裸 float，宽度按 IndexConfig 归一化——与 D25 同规则）。
+/// 进制前缀（0x/0b/0o/0d）优先判定，避免 `0x1E` 里的 E 被当科学计数法。
+fn number_base_name(text: &str, float_is_f64: bool) -> &'static str {
+    if text.ends_with('f') || text.ends_with('F') {
+        return "float32";
+    }
+    let radix_prefixed = text
+        .get(..2)
+        .map_or(false, |p| matches!(p, "0x" | "0X" | "0b" | "0B" | "0o" | "0O" | "0d" | "0D"));
+    if radix_prefixed || !(text.contains('.') || text.contains('e') || text.contains('E')) {
+        return "int";
+    }
+    if float_is_f64 {
+        "float64"
+    } else {
+        "float32"
+    }
+}
+
+/// 名字 → 类型 DefId（**含内建合成**——bool/int/float64；与 `type_def_of`
+/// 的差别只在不排除 SYNTHETIC，供实参定型比对用）。
+fn named_def_of(idx: &WorkspaceIndex, name: Sym) -> Option<DefId> {
+    idx.main
+        .get(&name)?
+        .iter()
+        .copied()
+        .find(|&id| idx.def(id).kind.is_type_like())
 }
 
 // ---------------------------------------------------------------------------
@@ -1434,5 +1622,31 @@ void G() { int X = 1; int Y = X; }
         let r = resolve_at(&idx, file, off(SRC, "X;")).unwrap();
         assert_eq!(r.level, LEVEL_LOCAL);
         assert_eq!(first_name(&idx, &r), "X");
+    }
+
+    #[test]
+    fn for_each_loop_variable_resolves_to_local() {
+        // M4 修正：M3 的 "range_for_statement" 是不存在的节点 kind（死分支），
+        // range-for 迭代变量此前不入局部帧。正确 kind 是 for_each_statement。
+        const SRC: &str = "\
+int[] Items;
+void F()
+{
+    for (int Elem : Items) { int A = Elem; }
+}
+";
+        let idx = build(&[("unique://res/foreach.as", SRC)]);
+        let file = file_of("unique://res/foreach.as");
+        // 循环体内的 Elem（第 2 次出现）→ 局部
+        let r = resolve_at(&idx, file, nth(SRC, "Elem", 2)).unwrap();
+        assert_eq!(r.level, LEVEL_LOCAL);
+        assert_eq!(first_name(&idx, &r), "Elem");
+        // 迭代变量声明自身 → DECL_SELF
+        let r = resolve_at(&idx, file, off(SRC, "Elem :")).unwrap();
+        assert_eq!(r.level, LEVEL_DECL_SELF);
+        // range 表达式里的 Items（迭代变量声明点之前/之外）→ 全局
+        let r = resolve_at(&idx, file, nth(SRC, "Items", 2)).unwrap();
+        assert_eq!(r.level, LEVEL_GLOBAL);
+        assert_eq!(first_name(&idx, &r), "Items");
     }
 }

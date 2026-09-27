@@ -9,7 +9,7 @@ use crate::range::TextRange;
 use crate::types::SynType;
 
 /// 声明种类全集（对齐 grammar 声明节点 + `.d.as` 形态，规划 §3.2 全表）。
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum DefKind {
     // 类型
     Class,

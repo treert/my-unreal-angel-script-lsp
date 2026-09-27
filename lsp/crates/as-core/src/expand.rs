@@ -18,6 +18,8 @@
 //! 幂等：`expand_all` 在 finish / reindex 后都会调用，已展开的跳过
 //! （reindex 的 remove 已摘除旧合成 DefId，只补被摘除的）。
 
+use std::collections::HashSet;
+
 use crate::id::{DefId, Sym};
 use crate::index::WorkspaceIndex;
 use crate::intern::intern_sym;
@@ -25,10 +27,15 @@ use crate::range::TextRange;
 use crate::symbol::{DefData, DefExtra, DefFlags, DefKind, ParamDecl};
 use crate::types::{RefKind, SynType};
 
-/// 展开入口（finish / reindex_file 调用）。
+/// 展开入口（finish / reindex / remove 调用）。
+///
+/// `live` = 当前可达 DefId 集合（`WorkspaceIndex::live_def_ids`）：remove+re-add
+/// 后 arena 遗留旧 DefId（append-only），不过滤会让被替换的旧 class 生成
+/// **重复的**合成 namespace 进 main（幽灵符号，M3 遗留 bug，M4 修正）。
 pub fn expand_all(idx: &mut WorkspaceIndex) {
-    expand_delegates(idx);
-    expand_static_class(idx);
+    let live = idx.live_def_ids();
+    expand_delegates(idx, &live);
+    expand_static_class(idx, &live);
 }
 
 /// 推入一个合成 DefId。`in_main` = 同时进主索引（只有 StaticClass 的
@@ -228,11 +235,11 @@ fn push_multicast_set(
     );
 }
 
-pub fn expand_delegates(idx: &mut WorkspaceIndex) {
+pub fn expand_delegates(idx: &mut WorkspaceIndex, live: &HashSet<DefId>) {
     let decls: Vec<DefId> = idx
         .symbols
         .iter()
-        .filter(|(_, d)| matches!(d.kind, DefKind::Delegate | DefKind::Event))
+        .filter(|(id, d)| live.contains(id) && matches!(d.kind, DefKind::Delegate | DefKind::Event))
         .map(|(id, _)| id)
         .collect();
     for decl in decls {
@@ -269,11 +276,13 @@ pub fn expand_delegates(idx: &mut WorkspaceIndex) {
 /// 每个 class C：合成同名 namespace + `UClass StaticClass()`。
 /// 合成 namespace 进主索引（resolve 按 Sym 聚合同名 namespace 时命中）。
 /// struct 不合成（引擎只给 UClass 绑定，Bind_BlueprintType.cpp:661-680）。
-pub fn expand_static_class(idx: &mut WorkspaceIndex) {
+pub fn expand_static_class(idx: &mut WorkspaceIndex, live: &HashSet<DefId>) {
     let classes: Vec<DefId> = idx
         .symbols
         .iter()
-        .filter(|(_, d)| d.kind == DefKind::Class && !d.flags.contains(DefFlags::SYNTHETIC))
+        .filter(|(id, d)| {
+            live.contains(id) && d.kind == DefKind::Class && !d.flags.contains(DefFlags::SYNTHETIC)
+        })
         .map(|(id, _)| id)
         .collect();
     for class in classes {

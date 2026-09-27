@@ -293,12 +293,25 @@ class AActor
 
     #[test]
     fn hover_multiple_targets_in_one_fence() {
-        // 重载组：全部签名同 fence 逐行
-        const O: &str = "void Log(FString S) {}\nvoid Log(int N) {}\nvoid F() { Log(1); }\n";
+        // 重载组：全部签名同 fence 逐行。M4 起调用点先消歧（§7.2 消费方表：
+        // hover 渲染选中候选）——`Log(1)` 唯一命中 int 重载；不可定型实参
+        // （未解析符号）保留整组。
+        const O: &str =
+            "void Log(FString S) {}\nvoid Log(int N) {}\nvoid F() { Log(1); Log(Unresolved()); }\n";
         let idx = build(&[("unique://hov/ovl.as", O)]);
         let file = intern_file("unique://hov/ovl.as", 0);
+
+        // 消歧成功：hover 显示选中的重载
         let byte = O.find("Log(1)").unwrap() as u32;
         let r = resolve_at(&idx, file, byte).unwrap();
+        let md = hover_markdown(&idx, &r.targets).unwrap();
+        assert!(md.contains("void Log(int N)"), "选中重载: {md}");
+        assert!(!md.contains("void Log(FString S)"), "消歧后不显示另一重载: {md}");
+
+        // 消歧失败：整组同 fence
+        let byte = O.find("Log(Unresolved())").unwrap() as u32;
+        let r = resolve_at(&idx, file, byte).unwrap();
+        assert_eq!(r.targets.len(), 2, "不可定型实参 ⇒ 保留全部重载");
         let md = hover_markdown(&idx, &r.targets).unwrap();
         assert!(md.contains("void Log(FString S)"), "重载1: {md}");
         assert!(md.contains("void Log(int N)"), "重载2: {md}");

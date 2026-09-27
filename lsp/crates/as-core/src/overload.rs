@@ -8,8 +8,9 @@
 //! 消费方：signatureHelp（排序 + 激活项）、completion（后缀过滤 + 排序）、
 //! references（重载消歧）、hover（选中候选）。M3 仅 hover 接入。
 
-use crate::id::{DefId, TypeId};
+use crate::id::{DefId, Sym, TypeId};
 use crate::index::WorkspaceIndex;
+use crate::intern::{intern_sym, sym_str};
 use crate::symbol::DefExtra;
 use crate::types::SynType;
 
@@ -65,6 +66,70 @@ pub fn resolve_overload(
         .collect();
     out.sort_by(|a, b| b.score.cmp(&a.score));
     out
+}
+
+/// 形参的基名（消歧比对用）：剥 Ref/Const/UnresolvedObject/Array 包装；
+/// Primitive 按 IndexConfig 归一化（裸 float → float64/float32，D25）；
+/// `T[]` → TArray（与 resolve 侧「数组类型落模板本体」同族约定）。
+fn param_base_name(idx: &WorkspaceIndex, ty: &SynType) -> Option<Sym> {
+    match ty {
+        SynType::Primitive(name, _) => Some(if sym_str(*name) == "float" {
+            intern_sym(if idx.config.float_is_float64 { "float64" } else { "float32" })
+        } else {
+            *name
+        }),
+        SynType::Named(name, _) | SynType::Template { name, .. } => Some(*name),
+        SynType::Const(inner) | SynType::Ref(inner, _) | SynType::UnresolvedObject(inner) => {
+            param_base_name(idx, inner)
+        }
+        SynType::Array(_) => Some(intern_sym("TArray")),
+        SynType::Qualified(_) | SynType::Auto | SynType::Wildcard => None,
+    }
+}
+
+/// 调用点消歧（M4 / 架构设计 §4.6）：候选集中 arity 一致、不含 `?` 通配
+/// 形参、且全部**可定型实参**与形参基名一致的候选。恰好一个 ⇒ 唯一命中；
+/// 否则 None（消歧失败——保留全部重载，消费方「报全部重载」）。
+///
+/// 实参侧的定型子集见 `resolve::arg_type_base`（字面量 / 标识符 / 链式成员；
+/// 运算符 / f-string / range-for 留 M5 与 signatureHelp 同批）。
+/// 不可定型实参（None）不排除也不确认候选——两个候选都过 ⇒ 仍 None。
+pub fn disambiguate(
+    idx: &WorkspaceIndex,
+    cands: &[DefId],
+    arg_bases: &[Option<DefId>],
+) -> Option<DefId> {
+    let mut winner: Option<DefId> = None;
+    let mut winners = 0;
+    for &def in cands {
+        let DefExtra::Callable { params, .. } = &idx.def(def).extra else { continue };
+        if params.len() != arg_bases.len() {
+            continue;
+        }
+        if params.iter().any(|p| matches!(p.ty, Some(SynType::Wildcard))) {
+            continue; // ? 通配形参不参与精确判定（引擎内部语法 §1.4）
+        }
+        let mut matched = true;
+        for (p, a) in params.iter().zip(arg_bases.iter()) {
+            let Some(arg_base) = *a else { continue }; // 不可定型：不排除也不确认
+            let Some(pname) = p.ty.as_ref().and_then(|t| param_base_name(idx, t)) else {
+                matched = false;
+                break;
+            };
+            if pname != idx.def(arg_base).name {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            winners += 1;
+            if winners > 1 {
+                return None;
+            }
+            winner = Some(def);
+        }
+    }
+    (winners == 1).then_some(winner?)
 }
 
 #[cfg(test)]

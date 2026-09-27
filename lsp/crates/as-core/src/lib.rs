@@ -20,11 +20,13 @@ pub mod intern;
 pub mod outline;
 pub mod overload;
 pub mod range;
+pub mod references;
 pub mod resolve;
 pub mod symbol;
 pub mod syntax;
 pub mod tokens;
 pub mod types;
+pub mod uses;
 
 pub use as_syntax;
 
@@ -33,8 +35,11 @@ pub use hover::{hover_markdown, render_doc, render_syn, signature};
 pub use id::{DefId, FileId, Sym, TypeId};
 pub use index::{filename_to_module_name, FileInput, FileKind, IndexConfig, WorkspaceIndex};
 pub use outline::{document_symbols, folding_ranges, Fold, FoldKind, OutlineKind, OutlineSymbol};
-pub use overload::{OverloadScore, Ranked};
+pub use overload::{disambiguate, OverloadScore, Ranked};
 pub use range::{LineIndex, TextRange};
+pub use references::{
+    candidate_files, find_references, match_uses, resolve_file_uses, RefTarget, UseResolution,
+};
 pub use resolve::{
     resolve_at, LocalDecl, Resolution, Target, LEVEL_ACCESSOR, LEVEL_DECL_SELF, LEVEL_GLOBAL,
     LEVEL_LOCAL, LEVEL_MEMBER, LEVEL_MIXIN, LEVEL_NAMESPACE, LEVEL_THIS_SUPER,
@@ -42,3 +47,4 @@ pub use resolve::{
 pub use symbol::{BaseRef, DefData, DefExtra, DefFlags, DefKind, ParamDecl, SymbolTable};
 pub use tokens::{semantic_tokens, SemanticToken, LEGEND};
 pub use types::{RefKind, SynType, TypeKind, TypeTable};
+pub use uses::{UseRole, UseSite};
