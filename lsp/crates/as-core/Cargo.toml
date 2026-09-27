@@ -7,4 +7,5 @@ license.workspace = true
 
 [dependencies]
 lasso = { version = "0.7", features = ["multi-threaded"] }
+rayon = "1"
 as-syntax = { path = "../as-syntax" }

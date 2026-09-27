@@ -1,10 +1,12 @@
 //! as-cli：调试与验收工具（LSP实现规划 §2 / §9）。
 //!
-//! M0 仅 `dump-tree`：解析 `.as` / `.d.as` 并输出 CST，任一 ERROR/MISSING
-//! 节点 ⇒ 退出码非 0。这是 M0 的验收判据——与 grammar P2 验收（tree-sitter
-//! cli 对同语料零 ERROR）同口径，证明 Rust 包装层无损。
-//! M1 追加 `dump-index`。
+//! - `dump-tree`（M0）：解析 `.as` / `.d.as` 并输出 CST，任一 ERROR/MISSING
+//!   节点 ⇒ 退出码非 0（与 grammar P2 验收同口径，证明包装层无损）。
+//! - `dump-index`（M1）：构建 WorkspaceIndex 并输出声明统计——与
+//!   `_manifest.dctx` 的 `type_count` / `member_count` **人工对账**的开发期
+//!   动作（运行时不读 manifest——D20，该文件仅作参照）。
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs;
@@ -13,8 +15,11 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use as_core::as_syntax::{self, SyntaxErrorKind};
 use as_core::as_syntax::tree_sitter::{Node, Tree};
+use as_core::as_syntax::{self, SyntaxErrorKind};
+use as_core::id::DefId;
+use as_core::intern::{file_path, intern_file};
+use as_core::{DefFlags, DefKind, FileInput, FileKind, IndexConfig, WorkspaceIndex};
 
 #[derive(Parser)]
 #[command(
@@ -37,20 +42,41 @@ enum Command {
         #[arg(long)]
         trees: bool,
     },
-}
 
-struct BatchStats {
-    files: usize,
-    failed_files: usize,
-    errors: usize,
-    bad_utf8: usize,
+    /// 构建 WorkspaceIndex 并输出声明统计（M1 验收：与 manifest 人工对账）
+    DumpIndex {
+        /// 文件或目录；目录递归收集 *.as / *.d.as
+        paths: Vec<PathBuf>,
+
+        /// 裸 float 归一化为 float32（默认 float64，对齐引擎 bScriptFloatIsFloat64）
+        #[arg(long)]
+        float_is_float32: bool,
+
+        /// 只列出指定名字的符号（kind + 位置 + tags + doc 首行）
+        #[arg(long)]
+        sym: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::DumpTree { paths, trees } => dump_tree(&paths, trees),
+        Command::DumpIndex { paths, float_is_float32, sym } => {
+            dump_index(&paths, !float_is_float32, sym)
+        }
     }
+}
+
+// ===========================================================================
+// dump-tree（M0）
+// ===========================================================================
+
+struct BatchStats {
+    files: usize,
+    failed_files: usize,
+    errors: usize,
+    bad_utf8: usize,
 }
 
 fn dump_tree(paths: &[PathBuf], force_trees: bool) -> ExitCode {
@@ -149,10 +175,6 @@ fn process_file(path: &Path, print_tree: bool, stats: &mut BatchStats) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// CST 渲染（对齐 tree-sitter corpus 风格）
-// ---------------------------------------------------------------------------
-
 fn render_tree(tree: &Tree, src: &str) -> String {
     let mut out = String::new();
     render_node(tree.root_node(), src, 0, "", &mut out);
@@ -198,9 +220,219 @@ fn render_node(node: Node<'_>, src: &str, indent: usize, prefix: &str, out: &mut
     out.push_str(")\n");
 }
 
-// ---------------------------------------------------------------------------
-// 文件收集与行号
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// dump-index（M1）
+// ===========================================================================
+
+fn dump_index(paths: &[PathBuf], float_is_float64: bool, sym_filter: Option<String>) -> ExitCode {
+    let files = match collect_inputs(paths) {
+        Ok(files) => files,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if files.is_empty() {
+        eprintln!("error: no .as / .d.as files found");
+        return ExitCode::FAILURE;
+    }
+
+    let mut read_failures = 0usize;
+    let mut bad_utf8 = 0usize;
+    let mut inputs = Vec::new();
+    for path in &files {
+        let Ok(bytes) = fs::read(path) else {
+            eprintln!("ERR   {}: read failed", path.display());
+            read_failures += 1;
+            continue;
+        };
+        let Ok(source) = String::from_utf8(bytes) else {
+            eprintln!("ERR   {}: not valid UTF-8", path.display());
+            bad_utf8 += 1;
+            continue;
+        };
+        let path_str = path.to_string_lossy().into_owned();
+        let file = intern_file(&path_str, 0);
+        inputs.push(FileInput { file, kind: file_kind_of(path), source });
+    }
+
+    let config = IndexConfig { float_is_float64 };
+    println!("config: float_is_float64={float_is_float64}");
+    let idx = WorkspaceIndex::build(config, inputs);
+
+    // 文件统计
+    let (mut n_script, mut n_decl, mut n_err) = (0usize, 0usize, 0usize);
+    for snap in idx.files.values() {
+        match snap.kind {
+            FileKind::Script => n_script += 1,
+            FileKind::Decl => n_decl += 1,
+        }
+        if !snap.errors.is_empty() {
+            n_err += 1;
+        }
+    }
+    println!("files: {} (script {n_script}, decl {n_decl}, parse-error {n_err})", idx.files.len());
+    if n_err > 0 {
+        for (file, snap) in &idx.files {
+            if !snap.errors.is_empty() {
+                let path = file_path(*file).unwrap_or("?");
+                println!("  ERR {path}: {} error node(s)", snap.errors.len());
+            }
+        }
+    }
+
+    // 声明统计（SYNTHETIC 内建不计入；按文件类别分列——manifest 只数 .d.as）
+    let mut by_kind: BTreeMap<(&'static str, &'static str), usize> = BTreeMap::new();
+    let mut synthetic = 0usize;
+    for (_id, def) in idx.symbols.iter() {
+        if def.flags.contains(DefFlags::SYNTHETIC) {
+            synthetic += 1;
+            continue;
+        }
+        let kind = idx.files.get(&def.file).map(|s| s.kind).unwrap_or(FileKind::Script);
+        *by_kind.entry((kind.label(), def.kind.label())).or_insert(0) += 1;
+    }
+    println!("symbols: {} (builtins {synthetic})", idx.symbols.len());
+    for kind_label in ["decl", "script"] {
+        let rows: Vec<String> = by_kind
+            .iter()
+            .filter(|((k, _), _)| *k == kind_label)
+            .map(|((_, dk), n)| format!("{dk} {n}"))
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        println!("--- {kind_label}-file symbols ---");
+        println!("  {}", rows.join("  "));
+    }
+    // 对账口径提示（manifest 只统计 .d.as 侧）
+    let decl = |k: &'static str| by_kind.get(&("decl", k)).copied().unwrap_or(0);
+    println!(
+        "--- reconcile (decl-only) ---\n  type_count~ {} (class {} + struct {} + enum {})\n  member_count~ {} (field {} + method {} + ctor {} + dtor {} + operator {} + vprop {})",
+        decl("class") + decl("struct") + decl("enum"),
+        decl("class"),
+        decl("struct"),
+        decl("enum"),
+        decl("field") + decl("method") + decl("constructor") + decl("destructor") + decl("operator") + decl("virtual_property"),
+        decl("field"),
+        decl("method"),
+        decl("constructor"),
+        decl("destructor"),
+        decl("operator"),
+        decl("virtual_property"),
+    );
+
+    // 继承与类型解析健康度
+    let mut unresolved_bases = 0usize;
+    let mut classes_with_base = 0usize;
+    for (id, def) in idx.symbols.iter() {
+        if def.kind != DefKind::Class || def.flags.contains(DefFlags::SYNTHETIC) {
+            continue;
+        }
+        if let as_core::DefExtra::TypeDecl { bases, .. } = &def.extra {
+            if bases.iter().any(|b| b.simple) {
+                classes_with_base += 1;
+                if idx.resolve_base_class(id).is_none() {
+                    unresolved_bases += 1;
+                }
+            }
+        }
+    }
+    let type_jobs: Vec<DefId> = idx
+        .symbols
+        .iter()
+        .filter(|(_, d)| {
+            !d.flags.contains(DefFlags::SYNTHETIC)
+                && matches!(
+                    d.kind,
+                    DefKind::Field | DefKind::GlobalVar | DefKind::AssetDecl | DefKind::VirtualProperty
+                )
+        })
+        .map(|(id, _)| id)
+        .collect();
+    println!(
+        "inheritance: class closures {}, cycles {}, classes-with-base {classes_with_base} (unresolved base {unresolved_bases})",
+        idx.closures.len(),
+        idx.cycle_classes.len()
+    );
+    println!(
+        "types: interned {}, variable decl types resolved {}/{}",
+        idx.types.len(),
+        idx.resolved.len(),
+        type_jobs.len()
+    );
+
+    // --sym：查符号明细
+    if let Some(name) = sym_filter {
+        let sym = as_core::intern::intern_sym(&name);
+        let hits = idx.main.get(&sym).map(Vec::as_slice).unwrap_or(&[]);
+        println!("--- sym '{name}': {} hit(s) ---", hits.len());
+        for &def in hits {
+            let d = idx.def(def);
+            let path = file_path(d.file).unwrap_or("?");
+            let (line, col) = idx
+                .files
+                .get(&d.file)
+                .map(|s| s.lines.line_col_debug(d.name_span.start))
+                .unwrap_or((0, 0));
+            let mut tags = String::new();
+            for t in &d.tags {
+                let _ = write!(tags, " {}", t.kind.name());
+            }
+            let doc_first = d
+                .doc
+                .as_deref()
+                .and_then(|doc| doc.lines().next())
+                .unwrap_or("")
+                .chars()
+                .take(60)
+                .collect::<String>();
+            println!(
+                "  {} {} {path}:{line}:{col}{tags}  // {doc_first}",
+                d.kind.label(),
+                name,
+            );
+        }
+    }
+
+    if n_err > 0 || read_failures > 0 || bad_utf8 > 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// `.as` 与 `.d.as` 都以 `.as` 结尾；`.d.as` → Decl（Phase 0 文件类别标签）。
+fn file_kind_of(path: &Path) -> FileKind {
+    let name = path.file_name().and_then(OsStr::to_str).unwrap_or("");
+    if name.to_ascii_lowercase().ends_with(".d.as") {
+        FileKind::Decl
+    } else {
+        FileKind::Script
+    }
+}
+
+fn collect_inputs(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    let mut out = Vec::new();
+    for path in paths {
+        if path.is_file() {
+            if !is_as_path(path) {
+                return Err(format!("not a .as / .d.as file: {}", path.display()));
+            }
+            out.push(path.clone());
+        } else if path.is_dir() {
+            collect_as_files(path, &mut out);
+        } else {
+            return Err(format!("path not found: {}", path.display()));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+// ===========================================================================
+// 共用
+// ===========================================================================
 
 /// `.as` 与 `.d.as` 都以 `.as` 结尾（`_manifest.dctx` 天然不匹配）。
 fn is_as_path(path: &Path) -> bool {

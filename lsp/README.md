@@ -58,6 +58,24 @@ cargo run -p as-cli -- dump-tree --trees <dir>
 退出码：任一文件含 ERROR/MISSING 节点、读取失败或非 UTF-8 ⇒ **非 0**（脚本化验收判据）。
 `_manifest.dctx` 不匹配 `*.as` 后缀，无需排除。
 
+## as-cli：dump-index（M1）
+
+```powershell
+# 构建全工作区索引并输出声明统计（与 manifest 人工对账用——运行时不读 manifest，D20）
+cargo run -p as-cli -- dump-index <dir>...
+
+# 裸 float 归一化为 float32（默认 float64，对应引擎 bScriptFloatIsFloat64）
+cargo run -p as-cli -- dump-index --float-is-float32 <dir>
+
+# 抽查指定符号（kind + 文件:行:列 + tags + doc 首行）
+cargo run -p as-cli -- dump-index --sym FVector <dir>
+```
+
+输出含：文件数（script/decl 分列）、按文件类别分列的声明统计、
+decl-only 对账口径（type_count~ / member_count~）、继承健康度（闭包数/环数/
+未解析基类）、类型归一化统计（interned 数 / 变量声明类型解析率）。
+退出码：任一文件 parse 出 ERROR/MISSING 或读取失败 ⇒ 非 0。
+
 ## M0 验收（已完成，可随时复跑）
 
 ```powershell
@@ -70,6 +88,24 @@ cargo run -p as-cli --release -- dump-tree d:\WorkGit\UEProjs\Demo_AS\Saved\AS-C
 
 与 grammar P2 验收（`npx tree-sitter parse` 对同语料零 ERROR）同口径同判据，
 用于证明 Rust 包装层无损。
+
+## M1 验收（已完成，可随时复跑）
+
+```powershell
+cargo run -p as-cli --release -- dump-index `
+    d:\WorkGit\UEProjs\Demo_AS\Script d:\WorkGit\UEProjs\Demo_AS\Saved\AS-Cache
+```
+
+对账（manifest：`type_count=14864` / `member_count=69337`，仅作开发期人工参照）：
+
+| 口径（decl-only） | dump-index | manifest | 差额解释 |
+|---|---|---|---|
+| 类型数（class+struct+enum） | 13814 | 14864 | -1050 ≈ 20 个被覆盖 group 的类型（架构设计 §8 风险 7，LSP 不可见） |
+| 成员数（field+method+ctor+dtor+op+vprop） | 63338 | 69337 | -5999，与类型差额比例一致（≈5.7 成员/类型） |
+
+旁证：class 闭包解析中「未解析基类」恰好 20 个——与 20 个丢失 group 闭环对应。
+`--sym FVector` 抽查：`struct FVector` 落点 `Core.d.as:10103`，与架构设计
+§2.2.1 的源码行号引用一致。
 
 ## 约定提醒
 
