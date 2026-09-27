@@ -574,6 +574,7 @@ impl WorkspaceIndex {
     // -----------------------------------------------------------------------
 
     fn finish(&mut self) {
+        crate::expand::expand_all(self);
         self.build_closures();
         self.resolve_decl_types();
         self.build_mixin_index();
@@ -714,6 +715,7 @@ impl WorkspaceIndex {
             errors,
             lines,
         );
+        crate::expand::expand_all(self);
         self.build_closures();
         self.resolve_decl_types_in(Some(file));
         self.build_mixin_index();

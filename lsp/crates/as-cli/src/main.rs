@@ -296,7 +296,7 @@ fn dump_index(paths: &[PathBuf], float_is_float64: bool, sym_filter: Option<Stri
         let kind = idx.files.get(&def.file).map(|s| s.kind).unwrap_or(FileKind::Script);
         *by_kind.entry((kind.label(), def.kind.label())).or_insert(0) += 1;
     }
-    println!("symbols: {} (builtins {synthetic})", idx.symbols.len());
+    println!("symbols: {} (synthetic {synthetic} = builtins + delegate/event expansion + StaticClass)", idx.symbols.len());
     for kind_label in ["decl", "script"] {
         let rows: Vec<String> = by_kind
             .iter()

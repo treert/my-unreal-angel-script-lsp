@@ -12,10 +12,12 @@
 //! `pub use as_syntax` 取语法能力，不直连 as-syntax。
 
 pub mod decl_tags;
+pub mod expand;
 pub mod id;
 pub mod index;
 pub mod intern;
 pub mod outline;
+pub mod overload;
 pub mod range;
 pub mod symbol;
 pub mod syntax;
@@ -28,6 +30,7 @@ pub use decl_tags::{DocBlock, SemanticTag, TagKind, TagValue};
 pub use id::{DefId, FileId, Sym, TypeId};
 pub use index::{filename_to_module_name, FileInput, FileKind, IndexConfig, WorkspaceIndex};
 pub use outline::{document_symbols, folding_ranges, Fold, FoldKind, OutlineKind, OutlineSymbol};
+pub use overload::{OverloadScore, Ranked};
 pub use range::{LineIndex, TextRange};
 pub use symbol::{BaseRef, DefData, DefExtra, DefFlags, DefKind, ParamDecl, SymbolTable};
 pub use tokens::{semantic_tokens, SemanticToken, LEGEND};
