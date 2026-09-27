@@ -96,6 +96,7 @@ fn push_common_set(idx: &mut WorkspaceIndex, decl: DefId, name: Sym, span: TextR
             return_type: None,
             params: vec![ParamDecl {
                 name: intern_sym("Other"),
+                span,
                 ty: Some(t_const_ref_in(SynType::Named(name, span))),
                 flags: DefFlags::NONE,
             }],
@@ -114,6 +115,7 @@ fn push_common_set(idx: &mut WorkspaceIndex, decl: DefId, name: Sym, span: TextR
             return_type: Some(SynType::Ref(Box::new(SynType::Named(name, span)), RefKind::Plain)),
             params: vec![ParamDecl {
                 name: intern_sym("Other"),
+                span,
                 ty: Some(t_const_ref_in(SynType::Named(name, span))),
                 flags: DefFlags::NONE,
             }],
@@ -163,8 +165,8 @@ fn push_unicast_set(
         DefExtra::Callable {
             return_type: None,
             params: vec![
-                ParamDecl { name: intern_sym("Object"), ty: Some(SynType::Named(uobject(), span)), flags: DefFlags::NONE },
-                ParamDecl { name: intern_sym("BindFunctionName"), ty: Some(t_const_ref_in(SynType::Named(fname(), span))), flags: DefFlags::NONE },
+                ParamDecl { name: intern_sym("Object"), span, ty: Some(SynType::Named(uobject(), span)), flags: DefFlags::NONE },
+                ParamDecl { name: intern_sym("BindFunctionName"), span, ty: Some(t_const_ref_in(SynType::Named(fname(), span))), flags: DefFlags::NONE },
             ],
         },
         false,
@@ -180,8 +182,8 @@ fn push_unicast_set(
         DefExtra::Callable {
             return_type: None,
             params: vec![
-                ParamDecl { name: intern_sym("Object"), ty: Some(SynType::Named(uobject(), span)), flags: DefFlags::NONE },
-                ParamDecl { name: intern_sym("BindFunctionName"), ty: Some(t_const_ref_in(SynType::Named(fname(), span))), flags: DefFlags::NONE },
+                ParamDecl { name: intern_sym("Object"), span, ty: Some(SynType::Named(uobject(), span)), flags: DefFlags::NONE },
+                ParamDecl { name: intern_sym("BindFunctionName"), span, ty: Some(t_const_ref_in(SynType::Named(fname(), span))), flags: DefFlags::NONE },
             ],
         },
         false,
@@ -218,8 +220,8 @@ fn push_multicast_set(
         DefExtra::Callable {
             return_type: None,
             params: vec![
-                ParamDecl { name: intern_sym("Object"), ty: Some(SynType::Const(Box::new(SynType::Named(uobject(), span)))), flags: DefFlags::NONE },
-                ParamDecl { name: intern_sym("FunctionName"), ty: Some(t_const_ref_in(SynType::Named(fname(), span))), flags: DefFlags::NONE },
+                ParamDecl { name: intern_sym("Object"), span, ty: Some(SynType::Const(Box::new(SynType::Named(uobject(), span)))), flags: DefFlags::NONE },
+                ParamDecl { name: intern_sym("FunctionName"), span, ty: Some(t_const_ref_in(SynType::Named(fname(), span))), flags: DefFlags::NONE },
             ],
         },
         false,
