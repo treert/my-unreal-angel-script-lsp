@@ -21,7 +21,7 @@ as-lsp ──► as-core ──► as-syntax
 as-cli ──► as-core
 ```
 
-as-lsp 现有能力（M5）：`documentSymbol` / `foldingRange` / `semanticTokens(full)`
+as-lsp 现有能力（M6）：`documentSymbol` / `foldingRange` / `semanticTokens(full)`
 （legend 19 类，wire 名与 Hazelight 对齐——`as_typename` 等）+ `hover` /
 `definition`（查找链 0-6 级，架构设计 §4.5）+ `references` / `rename`（+
 `prepareRename`）/ `workspaceSymbol`（M4：重载消歧——失败报全部重载；
@@ -31,6 +31,11 @@ rename 只改消歧成功唯一指向目标的站点；`$/progress` 长任务通
 `AddUFunction(this, n"|")` UFUNCTION 名单；触发符 `. : ( ,`）+
 **signatureHelp**（M5：槽位排序 + 实参定型消歧 + 命名实参按名定位）+
 **inlayHint**（M5：auto 局部变量与 range-for 迭代变量的推导类型展示）+
+**publishDiagnostics**（M6，D36：`AS0903` 解析错误——tree-sitter
+`ERROR`/`MISSING` 节点，Error；`AS0902` decl 缺失——索引内 `.d.as` 数为 0，
+对打开的 Script 文档报 Warning@(0,0)；`// as-ignore:` / `as-ignore-next-line`
+行级抑制；didOpen/didChange 后 Ready 时同步推、didClose 清空、Loading 不推 +
+快照发布后补推全部已打开文档）+
 textDocumentSync Incremental + `myAngelScriptLsp.*` 配置读取 + 冷启动后台索引
 （Loading/Ready 状态机）+ **DidChangeWatchedFiles**（动态注册 `**/*.as`；
 `.as` 增删改名入索引；`.d.as` 任一变化防抖 500ms/5s 后全量重建，D24）。
@@ -193,6 +198,30 @@ cargo run -p as-cli --release -- dump-index --resolve-stats `
 # ⑤ VSCode 体感验收（人工）：EDH 里 `X.` 成员补全 / `A::` 命名空间 /
 #    `UCLASS(` 说明符 / `f(Du` 命名实参（InArgN 不出现）四类截图 +
 #    `auto` 变量 inlay 类型展示（规划 §9 M5 硬性项）
+```
+
+## M6 验收（已完成，可随时复跑）
+
+```powershell
+# ① 内置单测（151 条：as-core diag 12 + as-lsp 发布管道 2 + 既有全量）
+cargo test --workspace
+
+# ② 冒烟（publishDiagnostics 三段断言：didOpen 推 AS0902+AS0903 →
+#    didChange 修复语法错误 → 抑制注释后空数组）
+node ..\tests\lsp-smoke.mjs
+# 预期：SMOKE OK: ... diagnostics pubs=3 (AS0902+AS0903→fix→suppress)
+
+# ③ 真实工作区 + watched-files 回归（诊断管道不影响既有请求）
+node ..\tests\lsp-e2e-workspace.mjs
+node ..\tests\lsp-e2e-m4.mjs
+
+# ④ 语料批量对账（13814/63338 不回归）
+cargo run -p as-cli --release -- dump-index `
+    d:\WorkGit\UEProjs\Demo_AS\Script d:\WorkGit\UEProjs\Demo_AS\Saved\AS-Cache
+
+# ⑤ VSCode 体感验收（人工）：EDH 打开含语法错误的 .as → 红波浪线 +
+#    Problems 面板（code=AS0903、source=my-as-lsp）；typeDeclarationDirs
+#    指向空目录的工作区 → AS0902 Warning；`// as-ignore: AS0903` 后诊断消失
 ```
 
 ## M4 验收（已完成，可随时复跑）
