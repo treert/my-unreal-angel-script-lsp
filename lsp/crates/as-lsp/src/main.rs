@@ -13,6 +13,8 @@
 mod docs;
 mod workspace;
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tower_lsp_server::jsonrpc::Result as RpcResult;
@@ -131,6 +133,94 @@ impl Backend {
             ws.publish_and_replay(idx, &docs);
         });
     }
+
+    /// 光标处的引用查询目标（M4）：重载组**原样保留**——消歧失败由消费方按
+    /// 「报全部重载」处理（架构设计 §4.6）；class 合成 namespace 归一到类
+    /// （`AActor::` 限定段计入类引用）。None = 光标处不可解析。
+    fn resolve_query_targets(&self, file: FileId, byte: u32) -> Option<Vec<as_core::RefTarget>> {
+        self.ws
+            .with(|idx| {
+                let r = as_core::resolve::resolve_at(idx, file, byte)?;
+                let mut targets: Vec<as_core::RefTarget> = r
+                    .targets
+                    .iter()
+                    .filter_map(|t| match t {
+                        Target::Def(id) => Some(as_core::RefTarget::Def(
+                            as_core::references::origin_fallback(idx, *id),
+                        )),
+                        Target::Local(l) => {
+                            Some(as_core::RefTarget::Local { file, span: l.name_span })
+                        }
+                    })
+                    .collect();
+                targets.dedup();
+                (!targets.is_empty()).then_some(targets)
+            })
+            .flatten()
+    }
+
+    /// references / rename 共用：引用倒排给候选文件集 → 分批解析 UseSite
+    /// （按文件缓存）→ 匹配。批间释放索引读锁、上报 $/progress（规划 §9 M4
+    /// 长任务；客户端不支持时静默跳过——进度是咨询性增强）。
+    /// `strict`：rename 只取「唯一指向目标」的站点（歧义站点可能属于其它
+    /// 重载，改写会误伤——宁缺毋假）。
+    async fn collect_use_matches(
+        &self,
+        targets: &[as_core::RefTarget],
+        strict: bool,
+        title: &str,
+    ) -> Vec<(FileId, TextRange)> {
+        let files: Vec<FileId> = self
+            .ws
+            .with(|idx| as_core::references::candidate_files(idx, targets))
+            .unwrap_or_default();
+        if files.is_empty() {
+            return Vec::new();
+        }
+        let token = ls::NumberOrString::Number(PROGRESS_SEQ.fetch_add(1, Ordering::Relaxed) as i32);
+        let ongoing = match self.client.create_work_done_progress(token.clone()).await {
+            Ok(()) => Some(
+                self.client
+                    .progress(token, title)
+                    .with_percentage(0)
+                    .begin()
+                    .await,
+            ),
+            Err(_) => None, // 客户端不支持 workDoneProgress：跳过进度
+        };
+        const BATCH: usize = 32;
+        let total = files.len();
+        let mut out = Vec::new();
+        for (i, chunk) in files.chunks(BATCH).enumerate() {
+            let hits: Vec<(FileId, TextRange)> = self
+                .ws
+                .with(|idx| {
+                    let mut out = Vec::new();
+                    for &f in chunk {
+                        let resolved = self.ws.cached_uses(idx, f);
+                        let matched = if strict {
+                            as_core::references::match_uses_strict(targets, &resolved)
+                        } else {
+                            as_core::references::match_uses(targets, &resolved)
+                        };
+                        for s in matched {
+                            out.push((f, s));
+                        }
+                    }
+                    out
+                })
+                .unwrap_or_default();
+            out.extend(hits);
+            if let Some(p) = &ongoing {
+                let done = ((i + 1) * BATCH).min(total);
+                p.report((done as u64 * 100 / total as u64) as u32).await;
+            }
+        }
+        if let Some(p) = ongoing {
+            p.finish().await;
+        }
+        out
+    }
 }
 
 impl LanguageServer for Backend {
@@ -152,6 +242,12 @@ impl LanguageServer for Backend {
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
+                })),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
                         legend: SemanticTokensLegend {
@@ -461,6 +557,230 @@ impl LanguageServer for Backend {
             .unwrap_or_default();
         Ok((!locations.is_empty()).then(|| GotoDefinitionResponse::Array(locations)))
     }
+
+    async fn references(&self, params: ReferenceParams) -> RpcResult<Option<Vec<ls::Location>>> {
+        let Some((file, byte)) = self.doc_position(&params.text_document_position) else {
+            return Ok(None);
+        };
+        if !self.ws.is_ready() {
+            return Ok(None); // Loading：语义请求返回空（§6.1 默认）
+        }
+        self.ws.ensure_file_fresh(file, &self.docs);
+        let Some(targets) = self.resolve_query_targets(file, byte) else {
+            return Ok(None);
+        };
+
+        let mut spans = self.collect_use_matches(&targets, false, "Finding references").await;
+
+        // includeDeclaration：声明位置（Def 走 name_span——合成成员即源头声明
+        // 的锚点，D10；Local 即声明 span）
+        if params.context.include_declaration {
+            let decls: Vec<(FileId, TextRange)> = self
+                .ws
+                .with(|idx| {
+                    targets
+                        .iter()
+                        .filter_map(|t| match t {
+                            as_core::RefTarget::Def(id) => {
+                                let d = idx.def(*id);
+                                Some((d.file, d.name_span))
+                            }
+                            as_core::RefTarget::Local { file, span } => Some((*file, *span)),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            spans.extend(decls);
+        }
+
+        let locations: Vec<ls::Location> = self
+            .ws
+            .with(|idx| {
+                spans
+                    .iter()
+                    .filter_map(|(f, s)| file_range_location(idx, *f, *s))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok((!locations.is_empty()).then_some(locations))
+    }
+
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> RpcResult<Option<PrepareRenameResponse>> {
+        let Some((file, byte)) = self.doc_position(&params) else {
+            return Ok(None);
+        };
+        if !self.ws.is_ready() {
+            return Ok(None);
+        }
+        self.ws.ensure_file_fresh(file, &self.docs);
+        // 单一目标才可 rename（重载组 / 歧义组拒绝——一次只能改一个名字）
+        let Some(targets) = self.resolve_query_targets(file, byte) else {
+            return Ok(None);
+        };
+        if targets.len() != 1 {
+            return Ok(None);
+        }
+        let resp = self
+            .ws
+            .with(|idx| {
+                let (tf, span, placeholder) = match &targets[0] {
+                    as_core::RefTarget::Def(id) => {
+                        let d = idx.def(*id);
+                        // 合成成员（Execute / StaticClass 等，origin 名 ≠ 自名）：
+                        // 无独立源码声明，不可 rename（改名语义落到源头声明上，
+                        // 用户应在那儿发起）。合成 namespace 已归一到类（同名）。
+                        if let Some(o) = d.origin {
+                            if idx.def(o).name != d.name {
+                                return None;
+                            }
+                        }
+                        if idx.files.get(&d.file).is_none() {
+                            return None; // 内建 primitive：无源码声明
+                        }
+                        (d.file, d.name_span, as_core::intern::sym_str(d.name).to_string())
+                    }
+                    as_core::RefTarget::Local { file: lf, span } => {
+                        let snap = idx.files.get(lf)?;
+                        let name = snap
+                            .source
+                            .get(span.start as usize..span.end as usize)?
+                            .to_string();
+                        (*lf, *span, name)
+                    }
+                };
+                let loc = file_range_location(idx, tf, span)?;
+                Some(PrepareRenameResponse::RangeWithPlaceholder {
+                    range: loc.range,
+                    placeholder,
+                })
+            })
+            .flatten();
+        Ok(resp)
+    }
+
+    async fn rename(&self, params: RenameParams) -> RpcResult<Option<WorkspaceEdit>> {
+        let new_name = params.new_name;
+        if !is_valid_identifier(&new_name) {
+            return Err(tower_lsp_server::jsonrpc::Error::invalid_params(format!(
+                "'{new_name}' 不是合法的 Angelscript 标识符（或与保留字冲突）"
+            )));
+        }
+        let Some((file, byte)) = self.doc_position(&params.text_document_position) else {
+            return Ok(None);
+        };
+        if !self.ws.is_ready() {
+            return Ok(None);
+        }
+        self.ws.ensure_file_fresh(file, &self.docs);
+
+        // 与 prepare_rename 同规则：单一目标 + 非合成成员 + 非内建
+        let Some(targets) = self.resolve_query_targets(file, byte) else {
+            return Ok(None);
+        };
+        if targets.len() != 1 {
+            return Ok(None);
+        }
+        let Some(target) = self
+            .ws
+            .with(|idx| {
+                match &targets[0] {
+                    as_core::RefTarget::Def(id) => {
+                        let d = idx.def(*id);
+                        // 合成成员（origin 名 ≠ 自名）无独立源码声明，不可 rename；
+                        // 内建 primitive 同理
+                        if let Some(o) = d.origin {
+                            if idx.def(o).name != d.name {
+                                return None;
+                            }
+                        }
+                        if idx.files.get(&d.file).is_none() {
+                            return None;
+                        }
+                    }
+                    as_core::RefTarget::Local { .. } => {}
+                }
+                Some(targets[0].clone())
+            })
+            .flatten()
+        else {
+            return Ok(None);
+        };
+
+        // 严格匹配（歧义站点不改）+ 声明名 span
+        let mut spans = self.collect_use_matches(&[target.clone()], true, "Renaming").await;
+        let decl = self
+            .ws
+            .with(|idx| match &target {
+                as_core::RefTarget::Def(id) => {
+                    let d = idx.def(*id);
+                    Some((d.file, d.name_span))
+                }
+                as_core::RefTarget::Local { file: lf, span } => Some((*lf, *span)),
+            })
+            .flatten();
+        if let Some(d) = decl {
+            spans.push(d);
+        }
+        if spans.is_empty() {
+            return Ok(None);
+        }
+
+        let changes: HashMap<ls::Uri, Vec<TextEdit>> = self
+            .ws
+            .with(|idx| {
+                let mut map: HashMap<ls::Uri, Vec<TextEdit>> = HashMap::new();
+                for (f, s) in &spans {
+                    if let Some(loc) = file_range_location(idx, *f, *s) {
+                        map.entry(loc.uri).or_default().push(TextEdit {
+                            range: loc.range,
+                            new_text: new_name.clone(),
+                        });
+                    }
+                }
+                map
+            })
+            .unwrap_or_default();
+        Ok((!changes.is_empty()).then(|| WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }))
+    }
+
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> RpcResult<Option<WorkspaceSymbolResponse>> {
+        if !self.ws.is_ready() {
+            return Ok(None);
+        }
+        let out: Vec<ls::SymbolInformation> = self
+            .ws
+            .with(|idx| {
+                as_core::search::query_symbols(idx, &params.query)
+                    .into_iter()
+                    .filter_map(|id| {
+                        let d = idx.def(id);
+                        let location = target_location(idx, id)?;
+                        Some(ls::SymbolInformation {
+                            name: as_core::intern::sym_str(d.name).to_string(),
+                            kind: def_kind_to_symbol_kind(d.kind),
+                            tags: None,
+                            #[allow(deprecated)]
+                            deprecated: None,
+                            location,
+                            container_name: d
+                                .parent
+                                .map(|p| as_core::intern::sym_str(idx.def(p).name).to_string()),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok((!out.is_empty()).then_some(WorkspaceSymbolResponse::Flat(out)))
+    }
 }
 
 /// Def 落点 → LSP Location（origin 回落 D10：合成符号跳转源头声明；
@@ -483,6 +803,85 @@ fn target_location(idx: &as_core::WorkspaceIndex, id: as_core::DefId) -> Option<
         uri,
         range: Range::new(Position::new(sl, sc), Position::new(el, ec)),
     })
+}
+
+/// (FileId, TextRange) → LSP Location（引用/重命名站点；UTF-16 换算只在本层，§3.2.1）。
+fn file_range_location(
+    idx: &as_core::WorkspaceIndex,
+    file: FileId,
+    range: TextRange,
+) -> Option<ls::Location> {
+    let snap = idx.files.get(&file)?;
+    let path = as_core::intern::file_path(file)?;
+    let uri = ls::Uri::from_file_path(path)?;
+    let (sl, sc) = snap.lines.line_col_utf16(&snap.source, range.start);
+    let (el, ec) = snap.lines.line_col_utf16(&snap.source, range.end);
+    Some(ls::Location {
+        uri,
+        range: Range::new(Position::new(sl, sc), Position::new(el, ec)),
+    })
+}
+
+/// DefKind → LSP SymbolKind（workspaceSymbol；与 documentSymbol 的
+/// `to_symbol_kind` 同口径）。
+fn def_kind_to_symbol_kind(kind: as_core::DefKind) -> SymbolKind {
+    use as_core::DefKind as D;
+    match kind {
+        D::Class => SymbolKind::CLASS,
+        D::Struct => SymbolKind::STRUCT,
+        D::Enum => SymbolKind::ENUM,
+        D::EnumValue => SymbolKind::ENUM_MEMBER,
+        D::Namespace => SymbolKind::NAMESPACE,
+        D::Module => SymbolKind::MODULE,
+        D::Delegate => SymbolKind::INTERFACE,
+        D::Event => SymbolKind::EVENT,
+        D::Function => SymbolKind::FUNCTION,
+        D::Method => SymbolKind::METHOD,
+        D::Constructor => SymbolKind::CONSTRUCTOR,
+        D::Destructor => SymbolKind::METHOD,
+        D::Operator => SymbolKind::OPERATOR,
+        D::GlobalVar => SymbolKind::VARIABLE,
+        D::Field => SymbolKind::FIELD,
+        D::Param | D::LocalVar | D::AssetDecl => SymbolKind::VARIABLE,
+        D::TypeParam => SymbolKind::TYPE_PARAMETER,
+        D::VirtualProperty => SymbolKind::PROPERTY,
+    }
+}
+
+/// $/progress token 发号器（server 侧自增即可，客户端只按 token 关联流）。
+static PROGRESS_SEQ: AtomicU32 = AtomicU32::new(1);
+
+/// 保留字（grammar token 集的实用子集：类型/语句/声明/访问/宏关键字）。
+const KEYWORDS: &[&str] = &[
+    // primitive_type 全集 + auto
+    "void", "bool", "int8", "int16", "int", "int32", "int64", "uint8", "uint16", "uint",
+    "uint32", "uint64", "float", "float32", "float64", "double", "auto",
+    // 字面量 / 空值
+    "true", "false", "null", "nullptr",
+    // 语句
+    "if", "else", "while", "do", "for", "switch", "case", "default", "break", "continue",
+    "fallthrough", "return",
+    // 声明
+    "class", "struct", "enum", "namespace", "delegate", "event", "asset", "mixin", "local",
+    "const", "private", "protected", "final", "override", "property", "access",
+    // 表达式 / 语境关键字
+    "this", "Super", "super", "Cast", "get", "set", "of",
+    // UE 反射宏
+    "UCLASS", "USTRUCT", "UENUM", "UFUNCTION", "UPROPERTY", "UMETA",
+];
+
+/// 新名合法性：identifier 模式（grammar `identifier: /[A-Za-z_][A-Za-z0-9_]*/`）
+/// 且非保留字。
+fn is_valid_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else { return false };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    !KEYWORDS.contains(&s)
 }
 
 // ---------------------------------------------------------------------------

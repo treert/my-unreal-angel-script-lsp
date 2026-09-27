@@ -91,7 +91,20 @@ struct SemCtx<'t> {
 }
 
 impl<'t> SemCtx<'t> {
-    fn build(root: Node<'t>, src: &str, idx: &WorkspaceIndex, file: FileId, byte: u32) -> SemCtx<'t> {
+    /// 从 identifier 节点沿 parent 链上溯建语境。
+    ///
+    /// M4 性能修正：原实现从 root 下潜逐层物化兄弟节点（`children_with_fields`
+    /// 每具名孩子一次 String 分配）——巨型文件（Core.d.as 的 class_body 数百
+    /// 成员、source_file 数百顶层声明）里每站点要重做数千次分配，首次
+    /// references 全语料 163s。parent 链上溯是 O(深度)，与下潜语义等价：
+    /// 祖先集合相同，处理序（outermost → innermost）由反转保证，局部入栈序
+    /// （参数 → 外块 → 内块）不变。
+    fn from_ancestors(
+        ident: Node<'t>,
+        src: &str,
+        idx: &WorkspaceIndex,
+        file: FileId,
+    ) -> SemCtx<'t> {
         let mut ctx = SemCtx {
             ns_defs: Vec::new(),
             ns_syms: Vec::new(),
@@ -101,8 +114,14 @@ impl<'t> SemCtx<'t> {
             file,
             _tree: std::marker::PhantomData,
         };
-        let mut node = root;
-        loop {
+        let byte = ident.start_byte() as u32;
+        let mut chain: Vec<Node<'t>> = Vec::new();
+        let mut cur = ident.parent();
+        while let Some(n) = cur {
+            chain.push(n);
+            cur = n.parent();
+        }
+        for node in chain.into_iter().rev() {
             match node.kind() {
                 "namespace_declaration" => {
                     // name 是 scoped_name，取最后一段标识符（decl_name_node 同规则）
@@ -189,14 +208,6 @@ impl<'t> SemCtx<'t> {
                     }
                 }
                 _ => {}
-            }
-            // 下降到包含 byte 的子节点
-            let next = syntax::children_with_fields(node)
-                .into_iter()
-                .find(|(_, c)| c.start_byte() as u32 <= byte && byte < c.end_byte() as u32);
-            match next {
-                Some((_, c)) => node = c,
-                None => break,
             }
         }
         ctx
@@ -303,8 +314,21 @@ pub fn resolve_at(idx: &WorkspaceIndex, file: FileId, byte: u32) -> Option<Resol
     if byte < root.start_byte() as u32 || byte >= root.end_byte() as u32 {
         return None;
     }
-
     let ident = identifier_at(root, byte)?;
+    resolve_at_node(idx, file, src, ident)
+}
+
+/// 在**已知** identifier 节点处解析（批量 UseSite 解析入口——节点已知，
+/// 免从根下潜的 O(路径兄弟节点数) 重遍历，见 `SemCtx::from_ancestors`）。
+pub fn resolve_at_node(
+    idx: &WorkspaceIndex,
+    file: FileId,
+    src: &str,
+    ident: Node<'_>,
+) -> Option<Resolution> {
+    if ident.kind() != "identifier" && ident.kind() != "primitive_type" {
+        return None;
+    }
     // specifier 语境的标识符（UPROPERTY(...) 宏参数 / 方法属性 / 类宏说明符）
     // 不是符号使用点——不解析（语法接受 ≠ 语义合法清单同族）
     if syntax::in_specifier_context(ident) {
@@ -312,7 +336,7 @@ pub fn resolve_at(idx: &WorkspaceIndex, file: FileId, byte: u32) -> Option<Resol
     }
     let name = intern_sym(syntax::text(ident, src));
     let ident_span = syntax::span(ident);
-    let ctx = SemCtx::build(root, src, idx, file, byte);
+    let ctx = SemCtx::from_ancestors(ident, src, idx, file);
 
     // 声明自身（名字即锚点）：类/函数/字段声明名、局部/形参声明名
     if let Some(def) = def_id_at_decl(idx, file, ident_span, name) {

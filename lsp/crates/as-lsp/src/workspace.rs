@@ -14,10 +14,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use as_core::id::FileId;
 use as_core::intern::{file_id_of_path, file_path, intern_file};
+use as_core::references::{resolve_file_uses, UseResolution};
 use as_core::{filename_to_module_name, FileInput, FileKind, IndexConfig, WorkspaceIndex};
 
 use crate::docs::DocStore;
@@ -41,7 +42,7 @@ impl Default for WorkspaceConfig {
     }
 }
 
-/// 工作区状态：Loading/Ready 状态机 + 发布后的索引（§6.1）。
+/// 工作区状态：Loading/Ready 状态机 + 发布后的索引（§6.1）+ UseSite 解析缓存。
 pub struct WorkspaceState {
     /// None = Loading；Some = Ready。后台线程建好后整体替换（快照语义）
     index: RwLock<Option<WorkspaceIndex>>,
@@ -51,6 +52,9 @@ pub struct WorkspaceState {
     dirty: Mutex<HashSet<FileId>>,
     /// didClose 后待回落磁盘的文件（§5.1）
     stale: Mutex<HashSet<FileId>>,
+    /// UseSite 解析缓存（D5：Phase 3 惰性 + 按文件缓存；编辑失效粒度 =
+    /// 文件，联动失效见 [`WorkspaceState::reindex`] 的声明面指纹判定）
+    use_cache: Mutex<HashMap<FileId, Arc<Vec<UseResolution>>>>,
 }
 
 impl WorkspaceState {
@@ -60,6 +64,7 @@ impl WorkspaceState {
             indexed_versions: Mutex::new(HashMap::new()),
             dirty: Mutex::new(HashSet::new()),
             stale: Mutex::new(HashSet::new()),
+            use_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -82,6 +87,7 @@ impl WorkspaceState {
     }
 
     /// 发布快照 + 重放 pending_dirty（§6.1：发布瞬间原子完成）。
+    /// 全量换根 ⇒ UseSite 解析缓存整表失效。
     pub fn publish_and_replay(&self, idx: WorkspaceIndex, docs: &Mutex<DocStore>) {
         let versions: HashMap<FileId, i32> = {
             let store = docs.lock().unwrap();
@@ -89,10 +95,22 @@ impl WorkspaceState {
         };
         *self.index.write().unwrap() = Some(idx);
         *self.indexed_versions.lock().unwrap() = versions;
+        self.use_cache.lock().unwrap().clear();
         let dirty: Vec<FileId> = self.dirty.lock().unwrap().drain().collect();
         for file in dirty {
             self.ensure_file_fresh(file, docs);
         }
+    }
+
+    /// 单文件的 UseSite 解析缓存（命中返回克隆的 Arc；未命中解析并填入）。
+    /// 调用约定：必须在**持有索引读锁的闭包内**同步调用（`with`），不跨 await。
+    pub fn cached_uses(&self, idx: &WorkspaceIndex, file: FileId) -> Arc<Vec<UseResolution>> {
+        if let Some(hit) = self.use_cache.lock().unwrap().get(&file) {
+            return Arc::clone(hit);
+        }
+        let resolved = Arc::new(resolve_file_uses(idx, file));
+        self.use_cache.lock().unwrap().insert(file, Arc::clone(&resolved));
+        resolved
     }
 
     /// 单文件保鲜（语义请求前）：
@@ -125,9 +143,21 @@ impl WorkspaceState {
     }
 
     fn reindex(&self, file: FileId, kind: FileKind, text: String) {
-        let mut idx = self.index.write().unwrap();
-        if let Some(i) = idx.as_mut() {
-            i.reindex_file(file, kind, text);
+        // 声明面指纹（D29）：函数体/局部改动 ⇒ 只失效该文件的解析缓存；
+        // 对外可见声明增删改（含重载增删）⇒ 跨文件可见性变化，整表失效
+        // （先正确后优化——精确「依赖该声明的文件集」失效 M5+ 按需）
+        let surface_changed = {
+            let mut idx = self.index.write().unwrap();
+            match idx.as_mut() {
+                Some(i) => i.reindex_file(file, kind, text),
+                None => false,
+            }
+        };
+        let mut cache = self.use_cache.lock().unwrap();
+        if surface_changed {
+            cache.clear();
+        } else {
+            cache.remove(&file);
         }
     }
 }

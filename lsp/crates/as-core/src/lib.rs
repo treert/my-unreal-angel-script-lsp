@@ -22,6 +22,7 @@ pub mod overload;
 pub mod range;
 pub mod references;
 pub mod resolve;
+pub mod search;
 pub mod symbol;
 pub mod syntax;
 pub mod tokens;
@@ -38,8 +39,10 @@ pub use outline::{document_symbols, folding_ranges, Fold, FoldKind, OutlineKind,
 pub use overload::{disambiguate, OverloadScore, Ranked};
 pub use range::{LineIndex, TextRange};
 pub use references::{
-    candidate_files, find_references, match_uses, resolve_file_uses, RefTarget, UseResolution,
+    candidate_files, find_references, match_uses, match_uses_strict, resolve_file_uses, RefTarget,
+    UseResolution,
 };
+pub use search::{query_symbols, MAX_RESULTS};
 pub use resolve::{
     resolve_at, LocalDecl, Resolution, Target, LEVEL_ACCESSOR, LEVEL_DECL_SELF, LEVEL_GLOBAL,
     LEVEL_LOCAL, LEVEL_MEMBER, LEVEL_MIXIN, LEVEL_NAMESPACE, LEVEL_THIS_SUPER,

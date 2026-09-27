@@ -55,11 +55,23 @@ pub fn origin_fallback(idx: &WorkspaceIndex, id: DefId) -> DefId {
 }
 
 /// 单文件全部 UseSite 的解析（纯函数；as-lsp 侧有按文件缓存，D5）。
+/// 节点定位走 tree-sitter 原生 `descendant_for_byte_range`（O(log n)）+
+/// `resolve_at_node`（parent 链上溯）——不做从根下潜的重遍历。
 pub fn resolve_file_uses(idx: &WorkspaceIndex, file: FileId) -> Vec<UseResolution> {
     let Some(snap) = idx.files.get(&file) else { return Vec::new() };
+    let root = snap.tree.root_node();
     let mut out = Vec::with_capacity(snap.uses.len());
     for site in &snap.uses {
-        let Some(res) = resolve::resolve_at(idx, file, site.span.start) else { continue };
+        let ident = root.descendant_for_byte_range(
+            site.span.start as usize,
+            site.span.end as usize,
+        );
+        let res = match ident {
+            Some(n) => resolve::resolve_at_node(idx, file, &snap.source, n),
+            // 防御：提取与解析同树，正常必然命中；未命中按字节偏移重试
+            None => resolve::resolve_at(idx, file, site.span.start),
+        };
+        let Some(res) = res else { continue };
         let mut targets = Vec::with_capacity(res.targets.len());
         for t in res.targets {
             match t {
@@ -111,6 +123,17 @@ pub fn match_uses(targets: &[RefTarget], resolved: &[UseResolution]) -> Vec<Text
     resolved
         .iter()
         .filter(|u| u.targets.iter().any(|t| targets.contains(t)))
+        .map(|u| u.span)
+        .collect()
+}
+
+/// rename 的**严格匹配**（比 references 严）：只有「解析结果唯一且等于目标」
+/// 的站点才可改写——歧义站点（重载组）可能属于其它重载，改写会误伤
+/// （宁缺毋假，D14 同族；M4 定案）。
+pub fn match_uses_strict(targets: &[RefTarget], resolved: &[UseResolution]) -> Vec<TextRange> {
+    resolved
+        .iter()
+        .filter(|u| u.targets.len() == 1 && targets.contains(&u.targets[0]))
         .map(|u| u.span)
         .collect()
 }

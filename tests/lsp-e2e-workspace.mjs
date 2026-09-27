@@ -16,24 +16,31 @@ const uri = 'file:///' + target.replace(/:/g, '%3A').replace(/\\/g, '/');
 const p = spawn(exe, [], { stdio: ['pipe', 'pipe', 'pipe'] });
 p.stderr.on('data', (c) => console.error('[server-stderr]', c.toString()));
 p.on('exit', (c) => console.error('[server-exit]', c));
-let buf = '';
+// framing 按字节切分（Content-Length 是字节数；字符串索引在多字节 UTF-8
+// 响应下会错位——M4 踩过，见 lsp-smoke.mjs 同注）
+let buf = Buffer.alloc(0);
 const responses = new Map();
+const notifications = [];
 function send(body) {
   const bytes = Buffer.from(JSON.stringify(body));
   p.stdin.write(`Content-Length: ${bytes.length}\r\n\r\n`);
   p.stdin.write(bytes);
 }
 p.stdout.on('data', (chunk) => {
-  buf += chunk.toString('utf8');
+  buf = Buffer.concat([buf, chunk]);
   for (;;) {
     const h = buf.indexOf('\r\n\r\n');
     if (h < 0) break;
-    const len = parseInt(/Content-Length: (\d+)/.exec(buf.slice(0, h))[1], 10);
+    const len = parseInt(/Content-Length: (\d+)/.exec(buf.slice(0, h).toString('utf8'))[1], 10);
     if (buf.length < h + 4 + len) break;
-    const msg = JSON.parse(buf.slice(h + 4, h + 4 + len));
+    const msg = JSON.parse(buf.slice(h + 4, h + 4 + len).toString('utf8'));
     buf = buf.slice(h + 4 + len);
     if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) responses.set(msg.id, msg);
-    else if (msg.id !== undefined) send({ jsonrpc: '2.0', id: msg.id, result: [] });
+    else if (msg.id !== undefined) {
+      notifications.push(msg);
+      const isProgressCreate = msg.method === 'window/workDoneProgress/create';
+      send({ jsonrpc: '2.0', id: msg.id, result: isProgressCreate ? null : [] });
+    } else if (msg.method) notifications.push(msg);
   }
 });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -90,6 +97,33 @@ const d = responses.get(201);
 const locs = Array.isArray(d?.result) ? d.result : d?.result ? [d.result] : [];
 if (!locs.length) fail('definition no locations');
 if (!locs[0].uri.includes('.d.as')) fail(`definition not in .d.as: ${locs[0].uri}`);
-console.log(`E2E OK: hover=struct FVector; definition -> ${decodeURIComponent(locs[0].uri).split('/').pop()}:${locs[0].range.start.line + 1}`);
+console.log(`definition -> ${decodeURIComponent(locs[0].uri).split('/').pop()}:${locs[0].range.start.line + 1}`);
+
+// M4：references（FVector——.d.as + 脚本两侧全工作区引用）+ $/progress。
+// 首次 references 需解析全部候选文件的 UseSite（后续命中缓存），轮询等待
+let r = null;
+for (let i = 0; i < 60; i++) {
+  if (!r) {
+    send({ jsonrpc: '2.0', id: 202, method: 'textDocument/references',
+      params: { textDocument: { uri }, position: fv, context: { includeDeclaration: false } } });
+  }
+  await sleep(1000);
+  r = responses.get(202);
+  if (r) break;
+}
+if (!r) fail('references: no response within 60s');
+const refs = Array.isArray(r?.result) ? r.result : [];
+if (refs.length < 100) fail(`references of FVector too few: ${refs.length}`);
+const declFiles = new Set(refs.map((l) => decodeURIComponent(l.uri).split('/').pop()));
+if (refs.some((l) => !decodeURIComponent(l.uri).endsWith('.d.as') && !decodeURIComponent(l.uri).endsWith('.as'))) {
+  fail('references uri not .as');
+}
+const progressMsgs = notifications.filter((n) => n.method === '$/progress');
+const beginOk = progressMsgs.some((n) => n.params?.value?.kind === 'begin');
+const endOk = progressMsgs.some((n) => n.params?.value?.kind === 'end');
+if (!beginOk || !endOk) fail(`$/progress begin/end missing (${progressMsgs.length} msgs)`);
+console.log(`references -> ${refs.length} sites across ${declFiles.size} files; $/progress msgs=${progressMsgs.length}`);
+
+console.log(`E2E OK: hover=struct FVector; definition -> ${decodeURIComponent(locs[0].uri).split('/').pop()}:${locs[0].range.start.line + 1}; references=${refs.length}`);
 p.kill();
 process.exit(0);

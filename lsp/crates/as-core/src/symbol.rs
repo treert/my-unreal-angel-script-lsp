@@ -125,6 +125,11 @@ impl DefFlags {
     }
 
     #[inline]
+    pub fn intersects(self, other: DefFlags) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    #[inline]
     pub fn insert(&mut self, other: DefFlags) {
         self.0 |= other.0;
     }

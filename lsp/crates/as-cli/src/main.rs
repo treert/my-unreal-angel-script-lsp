@@ -59,6 +59,10 @@ enum Command {
         /// 对全部 .as 脚本的标识符使用点跑查找链（M3 验收：命中率 + 未命中样本）
         #[arg(long)]
         resolve_stats: bool,
+
+        /// 对全部文件的 UseSite 跑引用解析内核并计时（M4 验收：站点数 / 解析率 / 耗时）
+        #[arg(long)]
+        ref_stats: bool,
     },
 }
 
@@ -66,8 +70,8 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::DumpTree { paths, trees } => dump_tree(&paths, trees),
-        Command::DumpIndex { paths, float_is_float32, sym, resolve_stats } => {
-            dump_index(&paths, !float_is_float32, sym, resolve_stats)
+        Command::DumpIndex { paths, float_is_float32, sym, resolve_stats, ref_stats } => {
+            dump_index(&paths, !float_is_float32, sym, resolve_stats, ref_stats)
         }
     }
 }
@@ -233,6 +237,7 @@ fn dump_index(
     float_is_float64: bool,
     sym_filter: Option<String>,
     resolve_stats: bool,
+    ref_stats: bool,
 ) -> ExitCode {    let files = match collect_inputs(paths) {
         Ok(files) => files,
         Err(msg) => {
@@ -464,6 +469,36 @@ fn dump_index(
                 println!("{m}");
             }
         }
+    }
+
+    // --ref-stats：对全部文件的 UseSite 跑引用解析内核（M4 验收体检——
+    // 站点数 / 解析率 / 耗时）。references 首次请求的成本即此（后续命中缓存）。
+    if ref_stats {
+        let start = std::time::Instant::now();
+        let sites: usize = idx.files.values().map(|s| s.uses.len()).sum();
+        let mut resolved = 0usize;
+        let mut targets_total = 0usize;
+        let mut per_file: Vec<(std::time::Duration, usize, as_core::id::FileId)> = Vec::new();
+        let all_files: Vec<_> = idx.files.keys().copied().collect();
+        for file in all_files {
+            let fstart = std::time::Instant::now();
+            let fsites = idx.files.get(&file).map(|s| s.uses.len()).unwrap_or(0);
+            for u in as_core::references::resolve_file_uses(&idx, file) {
+                resolved += 1;
+                targets_total += u.targets.len();
+            }
+            per_file.push((fstart.elapsed(), fsites, file));
+        }
+        per_file.sort_by(|a, b| b.0.cmp(&a.0));
+        println!("  slowest files:");
+        for (dur, n, file) in per_file.iter().take(5) {
+            println!("    {:>10.?}  {n:>5} sites  {}", dur, file_path(*file).unwrap_or("?"));
+        }
+        println!(
+            "--- ref-stats (all use sites) ---\n  sites {sites}, resolved {resolved} ({:.1}%), targets {targets_total}, elapsed {:?}",
+            if sites == 0 { 0.0 } else { resolved as f64 / sites as f64 * 100.0 },
+            start.elapsed()
+        );
     }
 
     if n_err > 0 || read_failures > 0 || bad_utf8 > 0 {
