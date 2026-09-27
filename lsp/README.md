@@ -21,15 +21,19 @@ as-lsp ──► as-core ──► as-syntax
 as-cli ──► as-core
 ```
 
-as-lsp 现有能力（M4）：`documentSymbol` / `foldingRange` / `semanticTokens(full)`
+as-lsp 现有能力（M5）：`documentSymbol` / `foldingRange` / `semanticTokens(full)`
 （legend 19 类，wire 名与 Hazelight 对齐——`as_typename` 等）+ `hover` /
 `definition`（查找链 0-6 级，架构设计 §4.5）+ `references` / `rename`（+
 `prepareRename`）/ `workspaceSymbol`（M4：重载消歧——失败报全部重载；
 rename 只改消歧成功唯一指向目标的站点；`$/progress` 长任务通知）+
+**completion**（M5：`X.` 成员 / `A::` 命名空间与 enum / 命名实参（跳过
+`InArgN` 占位）/ 关键字与查找链上下文 / `UCLASS(` 等说明符（引擎取证表）/
+`AddUFunction(this, n"|")` UFUNCTION 名单；触发符 `. : ( ,`）+
+**signatureHelp**（M5：槽位排序 + 实参定型消歧 + 命名实参按名定位）+
+**inlayHint**（M5：auto 局部变量与 range-for 迭代变量的推导类型展示）+
 textDocumentSync Incremental + `myAngelScriptLsp.*` 配置读取 + 冷启动后台索引
 （Loading/Ready 状态机）+ **DidChangeWatchedFiles**（动态注册 `**/*.as`；
 `.as` 增删改名入索引；`.d.as` 任一变化防抖 500ms/5s 后全量重建，D24）。
-completion / signatureHelp / inlayHint 随 M5。
 
 ## 前置：先生成 grammar
 
@@ -162,6 +166,33 @@ cargo run -p as-cli --release -- dump-index --resolve-stats `
 
 # ⑤ VSCode 体感验收（人工）：EDH + tools\test-extension.ps1 打开
 #    test-as-lsp.code-workspace，hover/F12 跳 .d.as
+```
+
+## M5 验收（已完成，可随时复跑）
+
+```powershell
+# ① 内置单测（136 条：expr 定型 9 + completion 15 + specifiers 3 +
+#    signature 5 + inlay 6 + 既有全量）
+cargo test --workspace
+
+# ② 冒烟（八请求：含 completion Plain/前缀/说明符 + signatureHelp 槽位 +
+#    inlayHint auto 断言）
+node ..\tests\lsp-smoke.mjs
+# 预期：SMOKE OK: ... completion(+specifier)/signatureHelp/inlayHint OK
+
+# ③ 真实工作区端到端：references + Scoped/Member 补全（FVector 87 项）
+node ..\tests\lsp-e2e-workspace.mjs
+# 预期：E2E OK: ... references=2842; completion scoped/member ok
+
+# ④ 语料批量 + 查找链体检（定型扩展的命中率红利）
+cargo run -p as-cli --release -- dump-index --resolve-stats `
+    d:\WorkGit\UEProjs\Demo_AS\Script d:\WorkGit\UEProjs\Demo_AS\Saved\AS-Cache
+# 预期：对账数字不回归（13814/63338）；resolve-stats hit ≈ 94.9%
+#（M4 基线 94.3%——M5a 定型扩展新增命中）
+
+# ⑤ VSCode 体感验收（人工）：EDH 里 `X.` 成员补全 / `A::` 命名空间 /
+#    `UCLASS(` 说明符 / `f(Du` 命名实参（InArgN 不出现）四类截图 +
+#    `auto` 变量 inlay 类型展示（规划 §9 M5 硬性项）
 ```
 
 ## M4 验收（已完成，可随时复跑）

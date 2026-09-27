@@ -1,6 +1,6 @@
 # LSP 实现规划（模块三/四 落地设计）
 
-> 版本：v1.3（Q1-Q4 已裁决，D1-D30 定案；`FileId`/`Sym` 的 intern 实现见 [`实现优化.md`](实现优化.md)）
+> 版本：v1.4（Q1-Q4 已裁决，D1-D35 定案；`FileId`/`Sym` 的 intern 实现见 [`实现优化.md`](实现优化.md)）
 > 定位：把 [`架构设计.md`](架构设计.md) §4/§5/§6 的骨架细化到**可开工**粒度——crate 内部结构、
 > 数据模型、流水线时序、里程碑与验收。实现前的最后一份设计文档，开工后转为进度跟踪。
 >
@@ -78,10 +78,16 @@ as-core/src/
 ├── types.rs       # TypeKind / 类型表 / 模板实例化
 ├── expand.rs      # 声明展开：delegate/event 成员集、类隐含成员
 ├── index.rs       # WorkspaceIndex：三阶段流水线的数据产物与构建入口
+├── expr.rs        # 表达式定型管线（M5a：字面量/运算符/f-string/range-for
+│                  #   双跳/模板实参替换/auto 惰性定型——§4.2 的单一原语）
 ├── resolve.rs     # 查找链（架构设计 §4.5 的 0-6 级，见 §7.1）+ 调用点消歧
 ├── uses.rs        # UseSite 提取（M4：Phase 2 产物，只记 (name,span,role) 不解析）
 ├── references.rs  # references 内核：候选集 / 逐文件解析 / 匹配（M4，见 §4.1）
 ├── search.rs      # workspaceSymbol 主索引遍历（M4）
+├── completion.rs  # 补全内核（M5b/M5c：语境判定 + 四类语境候选 + InArgN 跳过）
+├── signature.rs   # signatureHelp 内核（M5d：槽位排序 + 消歧 + 命名实参定位）
+├── inlay.rs       # inlayHint 内核（M5d：auto 局部 + range-for 迭代变量）
+├── specifiers.rs  # 说明符静态表（M5c：引擎 PP_NAME 消费区间取证 + 官方 doc）
 ├── hover.rs       # hover 渲染：angelscript_snippet 签名 + doxygen markdown（M3 落地）
 ├── overload.rs    # 重载解析与排序（一等模块；含 M4 调用点消歧判定）
 ├── decl_tags.rs   # .d.as 注解标签解析与 tag/doc 分流（架构设计 §2.4.3/§2.4.4）
@@ -350,6 +356,23 @@ auto 只是**占位记录**（`TypeKind::Auto`），不存在阻塞索引构建�
 第二个红利：auto 推导是**函数体局部的自包含分析**——初始化表达式就在声明处，
 无需流敏感 / 跨函数传播，只读已建好的成员表。
 
+**M5 落地形态**（`expr.rs`，D28 欠账清偿 + D31-D33）：
+- 返回 `ExprTy { base, syn }`（成员查找基 + 声明侧 SynType——模板实参 /
+  数组 / 引用性保真，inlay 与签名渲染直接消费）；
+- 运算符重载：opXxx 经 `overload::disambiguate` 按右操作数基名消歧，
+  唯一命中取返回；消歧失败时全部候选返回基一致才取；比较/逻辑恒 bool；
+- primitive 算术**最小提升近似**（D32）：数值域取较高档、位运算不跨域、
+  有符号/无符号混合不追引擎精确矩阵（完整隐式转换表仍留 P5）；
+- 字面量全量（数字后缀/进制与 D25 同规则；f-string → FString、n"" →
+  FName——**引擎类型非内建**（D31）：索引缺失该类型声明时返回 None）；
+- range-for 双跳（引擎真值同上）：Iterator() 0 参 + 返回对象 + constness
+  匹配回退；Iterate() 0 参；元素类型保留引用性；
+- **模板实参替换最小子集**（D33）：`TArray<FVector>` / `FVector[]` 的
+  `T&` / `T` 在使用点做 SynType 级符号替换（完整实例化仍 Phase 3 惰性）；
+- auto 惰性定型（D14 请求驱动不变）：SemCtx 构建期对 auto 局部与 range-for
+  迭代变量取定型结果；**块内局部边收集边入栈**（先行声明在后续 auto 定型
+  瞬间可见）；查询点在自身初始化式内时跳过（自引用防抖）。
+
 ## 5. 文本来源、增量更新与文件生命周期
 
 ### 5.1 overlay：文本的唯一真值来源
@@ -593,6 +616,7 @@ pub fn resolve_overload(cands: &[DefId], args: &[TypeId]) -> Vec<Ranked>;
 
 | 版本 | 内容 |
 |---|
+| v1.4 | **M5 落地登记**：§2.2 补 `expr.rs` / `completion.rs` / `signature.rs` / `inlay.rs` / `specifiers.rs`；§4.2 补 M5 落地形态（ExprTy、运算符重载消歧、最小提升近似 D32、引擎类型非内建 D31、模板实参替换 D33、auto 边收集边入栈）。实现期定案 D31-D35（见决策记录）；**顺带修 M3 潜伏 bug**：`publish_and_replay` 把 overlay 版本预填进 `indexed_versions` ⇒ 冷启动发布后 pending_dirty 重放被「版本相等」短路成空操作——didOpen 文本 ≠ 磁盘内容时索引里一直是磁盘旧文本（hover 恒 null）；M4 未暴露是因为 e2e 的 didOpen 文本恰等于磁盘内容；修为发布后清空、重放对每个 dirty 文件真正 reindex。验收：136 单测全绿；resolve-stats 94.3% → **94.9%**（命中 1009 → 1027）；ref-stats 68763 / 99.4% / 0.6s 与对账 13814/63338 不回归；e2e 补 Scoped（FVector::Zero 前缀 → 唯一 ZeroVector）与 Member（FVector 87 项含 X/Y/Z/DotProduct）断言；smoke 增 completion（Plain/前缀/说明符）+ signatureHelp（槽位/命名实参）+ inlayHint（auto Total → `: int`）断言 |---|
 | v1.3 | **M4 落地登记**：§2.2 补 `uses.rs` / `references.rs` / `search.rs`（as-core）与 as-lsp `watch.rs` + 解析缓存；§4.1 补 M4 落地形态（UseSite 数据结构、节点上溯解析、声明面指纹联动失效、匹配语义）。实现期修正：① **expand/mixin 幽灵符号**（M3 遗留）——remove+re-add 后 arena 遗留旧 DefId，`expand_all` / `build_mixin_index` 未按可达性过滤 ⇒ 被替换的类生成重复合成 namespace 进 main、旧 mixin 重入倒排；修为按 main 可达性（`live_def_ids`）过滤。② **range-for 迭代变量死分支**——M3 写的 `"range_for_statement"` 节点 kind 不存在（正确为 `for_each_statement`），迭代变量此前不入局部帧。③ **重载消歧分级**（D28）：arity + 可定型实参（字面量/标识符/链式/Cast），唯一命中收敛单目标、失败保留整组（报全部重载）；运算符 / f-string / range-for 实参定型随 M5 signatureHelp。验收：96 单测全绿；语料 `--ref-stats` 68763 站点 99.4% 解析、全语料 0.6s；e2e FVector 引用 2846 站点 / 88 文件 + `$/progress`；watched-files 生命周期 e2e（增删复活 + `.d.as` 防抖，`tests/lsp-e2e-m4.mjs`） |---|
 | v1.2 | **M3 落地登记**：§2.2 新增 `hover.rs`（渲染层：`angelscript_snippet` code fence 紧凑签名 + doxygen 8 tag markdown + `@group` 包路径，全部候选同 fence）。实现期 API 形态偏差（设计意图不变）：§7.1 的 `resolve_name(idx, file, at, name)` 落地为 `resolve_at(idx, file, byte)`——名字由光标处 identifier 自取，返回 `Vec<Target>`（Def 或局部/形参的语法层声明）+ 命中级数；局部声明不合成 DefId（索引不收函数体，§4）。delegate/event 计入 `DefKind::is_type_like`（类型名可指向的声明全集——`lookup_type_def` 据此让 `FOnHit` 字段可定型、查找链可触达展开成员集）。Ready 后编辑的重索引粒度与文件收集规则见 D26 |---|
 | v1.1 | **基础类型 DefId 来源修正**（D25，M1 实现期语料取证）：§3.3 「基础类型在 `.d.as` 中有真实 DefId」与实际导出物不符（全语料零基础类型声明）——改为「注入合成 builtin DefId（SYNTHETIC，不进声明统计），类型表仍统一走 Named 不设特例；裸 float 按 IndexConfig 归一化」。设计意图（统一 Named、不设特例）不变 |---|
