@@ -1,6 +1,6 @@
 # LSP 实现规划（模块三/四 落地设计）
 
-> 版本：v0.6（Q1-Q4 已裁决，D1-D20 定案；`FileId`/`Sym` 的 intern 实现见 [`实现优化.md`](实现优化.md)）
+> 版本：v0.7（Q1-Q4 已裁决，D1-D21 定案；`FileId`/`Sym` 的 intern 实现见 [`实现优化.md`](实现优化.md)）
 > 定位：把 [`架构设计.md`](架构设计.md) §4/§5/§6 的骨架细化到**可开工**粒度——crate 内部结构、
 > 数据模型、流水线时序、里程碑与验收。实现前的最后一份设计文档，开工后转为进度跟踪。
 >
@@ -84,9 +84,10 @@ as-core/src/
 ```
 
 - **无 `manifest.rs`**：LSP 不读 `_manifest.dctx`（决策 D20，架构设计 §2.5）。
-  `float_is_float64` 由配置项经 `IndexConfig` 传入；格式版本从 `.d.as` 文件头的
-  `@cache_format` tag 读（走 `decl_tags.rs`，与其它白名单 tag 同一路径）。
-  ⇒ as-core 只认一种输入格式：`.as`/`.d.as` 源码文本。
+  `float_is_float64` 由配置项经 `IndexConfig` 传入。
+- **无版本协商代码**：`@cache_format` 只被 `decl_tags.rs` 识别（防止混入 doc 文本），
+  **其值不消费**（决策 D21）——`.d.as` 是源码非协议，且 tag 白名单规则本身版本无关。
+  ⇒ as-core 只认一种输入：`.as`/`.d.as` 源码文本，且对其「版本」无感。
 
 ## 3. 数据模型（ID 体系）
 
@@ -443,7 +444,7 @@ pub fn resolve_overload(cands: &[DefId], args: &[TypeId]) -> Vec<Ranked>;
 | `completion` | 查找链上下文 + 成员 + UFUNCTION 名单（`AddUFunction(this, n"\|`）+ 说明符 schema + 命名参数 | M5 |
 | `signatureHelp` | 重载集排序 | M5 |
 | `inlayHint` | auto 变量推导类型展示（依赖 §4.2 表达式定型） | M5 |
-| `publishDiagnostics` | M6 起步：仅 `AS09xx` 工具链诊断（`AS0902`/`0903`/`0906`）；P5 全量 | M6 |
+| `publishDiagnostics` | M6 起步：仅 `AS09xx` 工具链诊断（`AS0902` / `AS0903`）；P5 全量 | M6 |
 | `didChangeConfiguration` | `floatIsFloat64` 等索引级配置变更 → 全量重建（§5.3） | M2 |
 
 ## 9. 里程碑与验收
@@ -458,7 +459,7 @@ pub fn resolve_overload(cands: &[DefId], args: &[TypeId]) -> Vec<Ranked>;
 | M3 | 查找链 + hover/definition | as-core 内置单测覆盖查找链 0-6 级命中序（§10），含 `super`、mixin 伪成员、struct 单层、访问器反向默认四类专项用例；as-cli 对语料批量 dump-index 校验 |
 | M4 | references/rename/workspaceSymbol + 重载消歧 | 重载函数引用消歧用例（成功/失败双路径）；`$/progress` 长任务；文件增删改名后索引一致性用例（§5.3） |
 | M5 | completion/signatureHelp/inlayHint | `X.` 成员补全、`n"\|` UFUNCTION 名单、`UCLASS(` 说明符补全、命名参数补全四类截图验收 + `auto` 变量 inlay 类型展示；**命名实参补全跳过 `InArgN` 占位**（架构设计 §2.4.6） |
-| M6 | 诊断起步 | `AS0902` / `AS0903` / `AS0906` 生效（`AS0901`/`AS0905` 已 retired，D20）；`AS04xx` 按取证占号（进入 P5 流程，码表 §6 纪律） |
+| M6 | 诊断起步 | `AS0902` / `AS0903` 生效（`AS09xx` 段其余码号均 retired：`AS0901`/`AS0905` 见 D20，`AS0906` 见 D21）；`AS04xx` 按取证占号（进入 P5 流程，码表 §6 纪律） |
 
 对应架构设计 §6：M0-M2 ≈ P3 前半，M3-M5 ≈ P3 后半 + P4，M6 衔接 P5。
 扩展（模块四）在 M2 提前就位最小版（languageId + client + 配置项骨架），后续里程碑增量加命令。
@@ -510,5 +511,6 @@ pub fn resolve_overload(cands: &[DefId], args: &[TypeId]) -> Vec<Ranked>;
 | v0.2 | 测试策略定稿：单测源码内置（AGENTS.md 硬性规则）；golden 对账取消（决策记录 D2）；Q1-Q4 全部裁决，§11 改为索引 |
 | v0.3 | 挂接 [`实现优化.md`](实现优化.md)：§3 引用 `FileId`/`Sym` intern 实现模板（决策记录 D12/D13） |
 | v0.4 | D14 落地：新增 §4.2 表达式定型管线（`auto` 推导链、range-for 双跳协议）；§8.1 请求路由表与 §9 M5 新增 `inlayHint` |
+| v0.7 | **不做版本协商**（D21）：§2.2 明确 `@cache_format` 识别但不消费、as-core 对 `.d.as`「版本」无感；§8.1 与 §9 M6 的诊断码更新（`AS0906` retired） |
 | v0.6 | **LSP 不读 manifest**（D20）：§2.2 删除 `manifest.rs`（as-core 只认源码文本，格式版本走 `decl_tags.rs` 的 `@cache_format`）；§3.3 `floatIsFloat64` 改为 `IndexConfig` 输入；§5.3 新增配置变更与 manifest 忽略两行；§8.1 新增 `didChangeConfiguration`；§9 M1 改为人工对账 + 新增浮点双取值用例、M6 诊断码更新；§12 修订 G6、新增 G9 |
 | v0.5 | 数据模型与生命周期补全（决策 D15-D18）：§3.2 `DefKind` 给出全集 + 新增 `DefFlags`、新增 §3.2.1（`TextRange` 字节偏移 + 行首偏移表）；§3.3 新增类型**规范形式**约束；§4 Phase 2 产物补 mixin 倒排 / module 归属表 / 行首偏移表，继承闭包限定为 class；§5 重写为「overlay + 编辑时序 + 文件增删改名（含 `.d.as` 防抖与 FileId 墓碑）」；新增 §6.1 冷启动编辑重放；§7.1 查找链改为 0-6 级、参数改字节偏移；§9 M1-M6 验收按新真值收紧；§12 新增 G6-G8 |
