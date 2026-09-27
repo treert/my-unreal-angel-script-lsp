@@ -4,8 +4,11 @@
 // Unreal Angelscript grammar.
 //
 // Specification: ./angelscript.bnf  (Layer A = what users write in .as files).
-// The same grammar parses `.d.as` declaration files (a strict subset: no
-// function bodies).  Deviations from the BNF node-naming table are listed in
+// The same grammar parses `.d.as` declaration files.  The two syntax sets
+// CROSS, they are not subsets of each other (see ./README.md): `.d.as` alone
+// has template declaration headers / `?` / `unresolved_object` /
+// `@templateSpecialization` blocks, while `.as` alone has function bodies and
+// statements.  Deviations from the BNF node-naming table are listed in
 // ./README.md.
 //
 // Expression precedence — angelscript.bnf Part 4 / §5.5.

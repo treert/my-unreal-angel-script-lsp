@@ -1,0 +1,13 @@
+[package]
+name = "as-syntax"
+description = "tree-sitter wrapper for the Unreal Angelscript grammar (grammar/)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+tree-sitter = "0.25"
+
+[build-dependencies]
+cc = "1"

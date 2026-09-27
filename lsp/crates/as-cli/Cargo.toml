@@ -1,0 +1,10 @@
+[package]
+name = "as-cli"
+description = "Debug & acceptance tool (dump-tree; dump-index lands in M1)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+as-core = { path = "../as-core" }

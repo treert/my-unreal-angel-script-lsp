@@ -35,7 +35,8 @@ AGENTS.md（仓库说明 + 测试硬性规则）
 | P1 UE 导出插件 + `.d.as` 格式 | ✅ 初版完成（`Demo_AS/Saved/AS-Cache`，414 个 `.d.as`）；**格式已对账落文档**（架构设计 §2.4）；`_manifest.dctx` LSP **不读**、格式版本**不校验**（D20/D21）；已知缺陷见下 |
 | P2 tree-sitter grammar | ✅ 完成（语料零 ERROR、corpus 40 条全过、生成物不入库）；模板四形态已单独实测通过 |
 | 设计阶段 | ✅ 收官（D1-D24 定案，无阻塞项） |
-| M0-M6 实现 | ⬜ 待开工（里程碑与验收见 [`LSP实现规划.md`](LSP实现规划.md) §9） |
+| M0 Cargo workspace + as-syntax + dump-tree | ✅ 完成（`lsp/` 四 crate 就位，依赖单向图成立；27 `.as` + 414 `.d.as` dump 零 ERROR，与 grammar P2 验收同口径） |
+| M1-M6 实现 | ⬜ 待开工（里程碑与验收见 [`LSP实现规划.md`](LSP实现规划.md) §9） |
 
 ### 开工前的已知待办（不阻塞 M0/M1，但须在对应里程碑前处理）
 

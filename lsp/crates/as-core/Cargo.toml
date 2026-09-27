@@ -1,0 +1,10 @@
+[package]
+name = "as-core"
+description = "Index, type system and lookup chain (pure library: no IO, no async)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lasso = { version = "0.7", features = ["multi-threaded"] }
+as-syntax = { path = "../as-syntax" }
