@@ -14,6 +14,7 @@
 pub mod config;
 pub mod completion;
 pub mod decl_tags;
+pub mod diag;
 pub mod expand;
 pub mod expr;
 pub mod hover;
@@ -39,6 +40,7 @@ pub mod uses;
 pub use as_syntax;
 
 pub use decl_tags::{DocBlock, SemanticTag, TagKind, TagValue};
+pub use diag::{script_diags, Diag, DiagCode, DiagSeverity, Suppression};
 pub use hover::{hover_markdown, render_doc, render_syn, signature};
 pub use id::{DefId, FileId, Sym, TypeId};
 pub use config::IndexConfig;
