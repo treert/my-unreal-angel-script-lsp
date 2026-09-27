@@ -14,9 +14,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 
-use as_core::id::FileId;
+use as_core::id::{FileId, Sym};
 use as_core::intern::{file_id_of_path, file_path, intern_file};
 use as_core::references::{resolve_file_uses, UseResolution};
 use as_core::{filename_to_module_name, FileInput, FileKind, IndexConfig, WorkspaceIndex};
@@ -55,6 +56,9 @@ pub struct WorkspaceState {
     /// UseSite 解析缓存（D5：Phase 3 惰性 + 按文件缓存；编辑失效粒度 =
     /// 文件，联动失效见 [`WorkspaceState::reindex`] 的声明面指纹判定）
     use_cache: Mutex<HashMap<FileId, Arc<Vec<UseResolution>>>>,
+    /// 重建互斥（`.d.as` 防抖触发 vs 配置变更触发的全量重建不并发——
+    /// `watch::run_rebuild` 自旋占用）
+    pub building: AtomicBool,
 }
 
 impl WorkspaceState {
@@ -65,6 +69,7 @@ impl WorkspaceState {
             dirty: Mutex::new(HashSet::new()),
             stale: Mutex::new(HashSet::new()),
             use_cache: Mutex::new(HashMap::new()),
+            building: AtomicBool::new(false),
         }
     }
 
@@ -160,6 +165,29 @@ impl WorkspaceState {
             cache.remove(&file);
         }
     }
+
+    /// watched-files 新增 / 改名（规划 §5.3）：单文件入索引（FileId 由调用方
+    /// intern——同路径复活自动复用，D18）。结构性变更 ⇒ 整表失效解析缓存。
+    pub fn add_file(&self, file: FileId, kind: FileKind, module: Option<Sym>, text: String) {
+        {
+            let mut idx = self.index.write().unwrap();
+            if let Some(i) = idx.as_mut() {
+                i.reindex_file_full(file, kind, module, text);
+            }
+        }
+        self.use_cache.lock().unwrap().clear();
+    }
+
+    /// watched-files 删除（规划 §5.3）：摘除全部查询表条目 + 墓碑（D18）。
+    pub fn remove_file(&self, file: FileId) {
+        {
+            let mut idx = self.index.write().unwrap();
+            if let Some(i) = idx.as_mut() {
+                i.remove_file(file);
+            }
+        }
+        self.use_cache.lock().unwrap().clear();
+    }
 }
 
 /// 路径分隔符规范化（Windows：`/` → `\`）。workspaceFolders / 配置根 /
@@ -188,23 +216,50 @@ fn expand_roots(entries: &[String], folders: &[String]) -> Vec<PathBuf> {
     out
 }
 
+/// 收集根全集（scriptRoots 空 = 全部 workspaceFolders + decl dirs 展开并集）。
+/// watched-files 事件的相关性判定与模块名计算与 `build_index` 共用同一口径。
+pub fn collect_roots(cfg: &WorkspaceConfig, folders: &[String]) -> Vec<PathBuf> {
+    let folders: Vec<String> = folders.iter().map(|f| normalize_path(f)).collect();
+    let mut roots: Vec<PathBuf> = if cfg.script_roots.is_empty() {
+        folders.iter().map(PathBuf::from).collect()
+    } else {
+        expand_roots(&cfg.script_roots, &folders)
+    };
+    roots.extend(expand_roots(&cfg.decl_dirs, &folders));
+    roots
+}
+
+/// 新增 / 改名文件的模块名（规划 §5.3：模块名随新路径重算，local 可见域
+/// 随之改变）：相对首个包含它的收集根按引擎 `FilenameToModuleName` 计算。
+/// 不在任何根下 → None（调用方已按相关性过滤，仅防御）。
+pub fn module_for_path(roots: &[PathBuf], path: &str) -> Option<Sym> {
+    let p = std::path::Path::new(path);
+    for root in roots {
+        if let Ok(rel) = p.strip_prefix(root) {
+            let rel = rel.to_string_lossy();
+            if !rel.is_empty() {
+                return Some(intern_sym_for_module(&filename_to_module_name(&rel)));
+            }
+        }
+    }
+    None
+}
+
+fn intern_sym_for_module(name: &str) -> Sym {
+    as_core::intern::intern_sym(name)
+}
+
 /// 构建全工作区索引（后台线程调用）。
 pub fn build_index(
     cfg: &WorkspaceConfig,
     folders: &[String],
     overlays: &[(FileId, i32, String)],
 ) -> WorkspaceIndex {
-    let folders: Vec<String> = folders.iter().map(|f| normalize_path(f)).collect();
-    let script_roots: Vec<PathBuf> = if cfg.script_roots.is_empty() {
-        folders.iter().map(PathBuf::from).collect()
-    } else {
-        expand_roots(&cfg.script_roots, &folders)
-    };
-    let decl_roots = expand_roots(&cfg.decl_dirs, &folders);
+    let roots = collect_roots(cfg, folders);
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for root in script_roots.iter().chain(decl_roots.iter()) {
+    for root in roots.iter() {
         collect(root, root, &mut seen, &mut files, 0);
     }
     files.sort_by(|a, b| a.1.cmp(&b.1));
@@ -270,7 +325,8 @@ fn collect(
     }
 }
 
-fn kind_of_path(path: &str) -> FileKind {
+/// 路径 → 文件类别（D26 裁决二：任意收集根下 `.d.as` → Decl，其余 `.as` → Script）。
+pub fn kind_of_path(path: &str) -> FileKind {
     if path.to_ascii_lowercase().ends_with(".d.as") {
         FileKind::Decl
     } else {

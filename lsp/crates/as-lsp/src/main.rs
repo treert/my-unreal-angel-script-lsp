@@ -11,11 +11,12 @@
 //! UTF-16 ↔ 字节换算只在本层发生（经 as-core `range.rs` 原语，§3.2.1）。
 
 mod docs;
+mod watch;
 mod workspace;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tower_lsp_server::jsonrpc::Result as RpcResult;
 use tower_lsp_server::ls_types::{self as ls, *};
@@ -28,15 +29,21 @@ use as_core::tokens;
 use as_core::{LEGEND, LineIndex, TextRange};
 
 use docs::{DocStore, TextChange};
+use watch::DeclDebouncer;
 use workspace::{WorkspaceConfig, WorkspaceState};
 
 struct Backend {
     client: Client,
     docs: Arc<Mutex<DocStore>>,
-    /// 索引级配置（任一变更 ⇒ 后台全量重建，§5.3）
-    config: Mutex<WorkspaceConfig>,
+    /// 索引级配置（任一变更 ⇒ 后台全量重建，§5.3）。Arc 共享给 `.d.as`
+    /// 防抖线程——重建时读**当前**值（配置可能在防抖器存活期间变更）
+    config: Arc<Mutex<WorkspaceConfig>>,
     ws: Arc<WorkspaceState>,
-    folders: Mutex<Vec<String>>,
+    folders: Arc<Mutex<Vec<String>>>,
+    /// 客户端是否支持 didChangeWatchedFiles 动态注册（initialize 时探测）
+    watch_supported: Mutex<bool>,
+    /// `.d.as` 防抖器（initialized 注册成功后创建）
+    debouncer: OnceLock<DeclDebouncer>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -47,9 +54,11 @@ async fn main() {
     let (service, socket) = LspService::build(|client| Backend {
         client,
         docs: Arc::new(Mutex::new(DocStore::new())),
-        config: Mutex::new(WorkspaceConfig::default()),
+        config: Arc::new(Mutex::new(WorkspaceConfig::default())),
         ws: Arc::new(WorkspaceState::new()),
-        folders: Mutex::new(Vec::new()),
+        folders: Arc::new(Mutex::new(Vec::new())),
+        watch_supported: Mutex::new(false),
+        debouncer: OnceLock::new(),
     })
     .finish();
 
@@ -119,18 +128,14 @@ impl Backend {
     }
 
     /// 启动冷启动后台线程（§6：Phase 0-2 → 发布 → 重放 pending_dirty）。
+    /// 与 `.d.as` 防抖触发共用 `watch::run_rebuild`（互斥 + 换根语义一致）。
     fn spawn_index_build(&self) {
-        let cfg = self.config.lock().unwrap().clone();
-        let folders = self.folders.lock().unwrap().clone();
+        let cfg = Arc::clone(&self.config);
+        let folders = Arc::clone(&self.folders);
         let docs = Arc::clone(&self.docs);
         let ws = Arc::clone(&self.ws);
         std::thread::spawn(move || {
-            let overlays = {
-                let store = docs.lock().unwrap();
-                store.overlays()
-            };
-            let idx = workspace::build_index(&cfg, &folders, &overlays);
-            ws.publish_and_replay(idx, &docs);
+            watch::run_rebuild(&cfg, &folders, &docs, &ws);
         });
     }
 
@@ -233,6 +238,14 @@ impl LanguageServer for Backend {
                 .collect();
             *self.folders.lock().unwrap() = paths;
         }
+        // didChangeWatchedFiles 动态注册支持探测（M4：文件监视）
+        let watch_ok = params
+            .capabilities
+            .workspace
+            .and_then(|w| w.did_change_watched_files)
+            .and_then(|c| c.dynamic_registration)
+            .unwrap_or(false);
+        *self.watch_supported.lock().unwrap() = watch_ok;
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -277,11 +290,22 @@ impl LanguageServer for Backend {
         let msg = {
             let config = self.config.lock().unwrap();
             format!(
-                "my-as-lsp M3 ready (floatIsFloat64={}, scriptRoots={:?}, typeDeclarationDirs={:?})",
+                "my-as-lsp M4 ready (floatIsFloat64={}, scriptRoots={:?}, typeDeclarationDirs={:?})",
                 config.float_is_float64, config.script_roots, config.decl_dirs
             )
         };
         self.client.log_message(MessageType::INFO, msg).await;
+        // 文件监视动态注册（M4）：`**/*.as` 同时覆盖 `.d.as`；kind 7 = 增|改|删
+        if *self.watch_supported.lock().unwrap() {
+            watch::register_watcher(&self.client).await;
+            let debouncer = DeclDebouncer::spawn(
+                Arc::clone(&self.config),
+                Arc::clone(&self.folders),
+                Arc::clone(&self.docs),
+                Arc::clone(&self.ws),
+            );
+            let _ = self.debouncer.set(debouncer);
+        }
         self.spawn_index_build();
     }
 
@@ -347,6 +371,49 @@ impl LanguageServer for Backend {
             // overlay 丢弃 → 下次语义请求前回落磁盘重读（§5.1）
             if let Some(f) = file {
                 self.ws.mark_stale(f);
+            }
+        }
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        // 事件分类与处置见 watch.rs 模块头；collect_roots 与 build_index
+        // 同口径（D26 裁决二：任意收集根下 .d.as → Decl、其余 .as → Script）
+        let (cfg, folders) = {
+            let cfg = self.config.lock().unwrap().clone();
+            let folders = self.folders.lock().unwrap().clone();
+            (cfg, folders)
+        };
+        let roots = workspace::collect_roots(&cfg, &folders);
+        for event in params.changes {
+            let Some(path) = uri_path(&event.uri) else { continue };
+            let file = as_core::intern::file_id_of_path(&path);
+            // overlay 优先（§5.1）：打开中的文件忽略监视事件（外部工具改盘
+            // 不引发抖动；未保存缓冲由 overlay 保护）
+            let has_overlay = file.is_some_and(|f| self.docs.lock().unwrap().get(f).is_some());
+            let relevant = file.is_some_and(|f| {
+                self.ws.with(|idx| idx.files.contains_key(&f)).unwrap_or(false)
+            }) || roots.iter().any(|r| under_root(&path, r));
+            match watch::classify(event.typ, &path, has_overlay, relevant) {
+                watch::WatchAction::DeclChange => {
+                    // .d.as 任一变化 → 防抖（500ms/5s，D24）→ 全量重建
+                    if let Some(d) = self.debouncer.get() {
+                        d.ping();
+                    }
+                }
+                watch::WatchAction::ScriptCreate | watch::WatchAction::ScriptChange => {
+                    // 读盘入索引（改名 = 删 + 增，模块名随新路径重算——
+                    // local 可见域随之改变，规划 §5.3）
+                    let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                    let file = as_core::intern::intern_file(&path, 0);
+                    let module = workspace::module_for_path(&roots, &path);
+                    self.ws.add_file(file, workspace::kind_of_path(&path), module, text);
+                }
+                watch::WatchAction::ScriptDelete => {
+                    if let Some(file) = file {
+                        self.ws.remove_file(file);
+                    }
+                }
+                watch::WatchAction::Ignore => {}
             }
         }
     }
@@ -845,6 +912,21 @@ fn def_kind_to_symbol_kind(kind: as_core::DefKind) -> SymbolKind {
         D::Param | D::LocalVar | D::AssetDecl => SymbolKind::VARIABLE,
         D::TypeParam => SymbolKind::TYPE_PARAMETER,
         D::VirtualProperty => SymbolKind::PROPERTY,
+    }
+}
+
+/// 路径是否位于收集根之下（大小写不敏感——Windows 盘符大小写不可控；
+/// 两侧均已 normalize，只比前缀）。
+fn under_root(path: &str, root: &std::path::Path) -> bool {
+    let root = root.to_string_lossy().to_ascii_lowercase();
+    let mut p = path.to_ascii_lowercase();
+    if root.ends_with('\\') || root.ends_with('/') {
+        p.starts_with(&root)
+    } else {
+        p.push('\\');
+        let hit = p.starts_with(&root) && p.as_bytes().get(root.len()) == Some(&b'\\');
+        p.pop();
+        hit
     }
 }
 
