@@ -21,11 +21,15 @@ as-lsp ──► as-core ──► as-syntax
 as-cli ──► as-core
 ```
 
-as-lsp 现有能力（M3）：`documentSymbol` / `foldingRange` / `semanticTokens(full)`
+as-lsp 现有能力（M4）：`documentSymbol` / `foldingRange` / `semanticTokens(full)`
 （legend 19 类，wire 名与 Hazelight 对齐——`as_typename` 等）+ `hover` /
-`definition`（查找链 0-6 级，架构设计 §4.5）+ textDocumentSync Incremental +
-`myAngelScriptLsp.*` 配置读取 + 冷启动后台索引（Loading/Ready 状态机）。
-references / completion / signatureHelp 等随 M4/M5。
+`definition`（查找链 0-6 级，架构设计 §4.5）+ `references` / `rename`（+
+`prepareRename`）/ `workspaceSymbol`（M4：重载消歧——失败报全部重载；
+rename 只改消歧成功唯一指向目标的站点；`$/progress` 长任务通知）+
+textDocumentSync Incremental + `myAngelScriptLsp.*` 配置读取 + 冷启动后台索引
+（Loading/Ready 状态机）+ **DidChangeWatchedFiles**（动态注册 `**/*.as`；
+`.as` 增删改名入索引；`.d.as` 任一变化防抖 500ms/5s 后全量重建，D24）。
+completion / signatureHelp / inlayHint 随 M5。
 
 ## 前置：先生成 grammar
 
@@ -158,6 +162,37 @@ cargo run -p as-cli --release -- dump-index --resolve-stats `
 
 # ⑤ VSCode 体感验收（人工）：EDH + tools\test-extension.ps1 打开
 #    test-as-lsp.code-workspace，hover/F12 跳 .d.as
+```
+
+## M4 验收（已完成，可随时复跑）
+
+```powershell
+# ① 内置单测（96 条：UseSite 提取含 f-string 插值/声明名排除、references
+#    匹配语义、重载消歧成功/失败双路径、文件增删复活一致性、声明面指纹、
+#    watched-files 分类 + 防抖时序）
+cargo test --workspace
+
+# ② 冒烟（四请求 + $/progress + 非法新名 error 断言）
+node ..\tests\lsp-smoke.mjs
+
+# ③ 真实工作区端到端：references FVector（全工作区 2846 站点 / 88 文件）
+#    + $/progress begin/end
+node ..\tests\lsp-e2e-workspace.mjs
+# 预期：E2E OK: ... references=2846
+
+# ④ watched-files 生命周期端到端（临时工作区：.as 增删复活 + .d.as 防抖）
+node ..\tests\lsp-e2e-m4.mjs
+# 预期：M4 E2E OK: watched-files lifecycle
+#（时序敏感段已放宽余量，偶发失败可复跑一次确认）
+
+# ⑤ 语料批量 + 引用解析体检
+cargo run -p as-cli --release -- dump-index --ref-stats `
+    d:\WorkGit\UEProjs\Demo_AS\Script d:\WorkGit\UEProjs\Demo_AS\Saved\AS-Cache
+# 预期：对账数字不回归（13814/63338）；ref-stats 68763 站点、
+#   resolved ≈ 99.4%、全语料解析 <1s
+
+# ⑥ VSCode 体感验收（人工）：EDH 里对 FVector / 脚本成员
+#    Find All References（Shift+F12）/ Rename（F2）/ 工作区符号（Ctrl+T）
 ```
 
 ## 约定提醒

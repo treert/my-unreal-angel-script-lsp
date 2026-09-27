@@ -39,7 +39,8 @@ AGENTS.md（仓库说明 + 测试硬性规则）
 | M1 as-core 三阶段 + dump-index + tag 解析 | ✅ 完成（Phase 1 rayon 并行 parse + Phase 2 成员表/继承闭包/类型归一化；15 tag 全解析；对账：type_count 13814 vs manifest 14864、member_count 63338 vs 69337——差额 ≈ 20 个被覆盖 group 的 1050 个类型及其成员，与风险 7 相符；继承环/struct 无闭包/float 双取值/4 零语料 tag 均有内置单测；**D25**：基础类型为合成 builtin DefId） |
 | M2 as-lsp 壳 + documentSymbol/semanticTokens/folding + VSCode 扩展最小版 | ✅ 代码完成（tower-lsp-server + 增量同步 + overlay；legend 19 类 wire 名与 Hazelight 对齐 `as_typename`…；扩展 languageId `angelscript-asl` + 配置骨架 + cargo 开发模式。**VSCode 体感验收与 Hazelight 截图对照待人工执行**：F5 扩展开发宿主打开 Demo_AS/Script） |
 | M3 查找链 + hover/definition + workspace 索引接入 | ✅ 完成（resolve.rs 0-6 级全量 + mixin 五条准入；expand.rs delegate/event 成员集 + StaticClass 合成（引擎取证 ProcessDelegates / BindStaticClass）；hover.rs snippet fence + doxygen markdown；server 冷启动 Loading/Ready + pending_dirty 重放 + 惰性单文件重索引（D26）；路径分隔符规范化防 FileId 分裂（D26）。77 单测全绿；语料 resolve-stats 命中 93.3%（未命中主要是 EnhancedInput 插件类型不在本机 AS-Cache）；端到端：hover `struct FVector` / definition → `Core.d.as:10103`（与架构设计 §2.2.1 记录一致）。**VSCode 体感验收待人工执行**（EDH + test-extension.ps1） |
-| M4-M6 实现 | ⬜ 待开工（里程碑与验收见 [`LSP实现规划.md`](LSP实现规划.md) §9） |
+| M4 references/rename/workspaceSymbol + 重载消歧 + watched-files | ✅ 完成（uses.rs UseSite 记录 + 引用倒排；references.rs 解析内核——**parent 链上溯**修掉从根下潜的 O(兄弟) 重遍历，全语料首查 163s→0.6s；重载消歧 D28（arity + 可定型实参，失败报全部）；rename 严格匹配；workspaceSymbol D30 过滤；$/progress 长任务；watch.rs DidChangeWatchedFiles 动态注册 + `.as` 增删改名 + `.d.as` 防抖 500ms/5s（D24）；声明面指纹联动失效（D29）。**顺带修 M3 遗留**：expand/mixin 幽灵符号（reindex 后旧 DefId 未过滤 ⇒ 重复合成 namespace 进 main）、range-for 迭代变量死分支（`"range_for_statement"` 节点不存在）。96 单测全绿；语料 ref-stats 68763 站点 99.4% 解析；e2e：FVector 引用 2846 站点/88 文件 + $/progress、watched-files 生命周期（增删复活 + 防抖）。**VSCode 体感验收待人工执行**（EDH：Find All References / Rename / Ctrl+T） |
+| M5-M6 实现 | ⬜ 待开工（里程碑与验收见 [`LSP实现规划.md`](LSP实现规划.md) §9） |
 
 ### 开工前的已知待办（不阻塞 M0/M1，但须在对应里程碑前处理）
 

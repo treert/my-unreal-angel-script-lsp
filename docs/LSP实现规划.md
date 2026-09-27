@@ -1,6 +1,6 @@
 # LSP 实现规划（模块三/四 落地设计）
 
-> 版本：v1.2（Q1-Q4 已裁决，D1-D26 定案；`FileId`/`Sym` 的 intern 实现见 [`实现优化.md`](实现优化.md)）
+> 版本：v1.3（Q1-Q4 已裁决，D1-D30 定案；`FileId`/`Sym` 的 intern 实现见 [`实现优化.md`](实现优化.md)）
 > 定位：把 [`架构设计.md`](架构设计.md) §4/§5/§6 的骨架细化到**可开工**粒度——crate 内部结构、
 > 数据模型、流水线时序、里程碑与验收。实现前的最后一份设计文档，开工后转为进度跟踪。
 >
@@ -78,13 +78,20 @@ as-core/src/
 ├── types.rs       # TypeKind / 类型表 / 模板实例化
 ├── expand.rs      # 声明展开：delegate/event 成员集、类隐含成员
 ├── index.rs       # WorkspaceIndex：三阶段流水线的数据产物与构建入口
-├── resolve.rs     # 查找链（架构设计 §4.5 的 0-6 级，见 §7.1）
+├── resolve.rs     # 查找链（架构设计 §4.5 的 0-6 级，见 §7.1）+ 调用点消歧
+├── uses.rs        # UseSite 提取（M4：Phase 2 产物，只记 (name,span,role) 不解析）
+├── references.rs  # references 内核：候选集 / 逐文件解析 / 匹配（M4，见 §4.1）
+├── search.rs      # workspaceSymbol 主索引遍历（M4）
 ├── hover.rs       # hover 渲染：angelscript_snippet 签名 + doxygen markdown（M3 落地）
-├── overload.rs    # 重载解析与排序（一等模块）
+├── overload.rs    # 重载解析与排序（一等模块；含 M4 调用点消歧判定）
 ├── decl_tags.rs   # .d.as 注解标签解析与 tag/doc 分流（架构设计 §2.4.3/§2.4.4）
 ├── diag.rs        # enum DiagCode + 诊断结构（M6 建；码号只在诊断码表登记，§12 G5）
 └── range.rs       # TextRange（字节）+ 行首偏移表；UTF-16 换算原语（移植 mylua 方案）
 ```
+
+as-lsp 侧（M4 增）：`watch.rs`——DidChangeWatchedFiles 事件分类（纯函数）+
+`.d.as` 防抖线程 + 全量重建互斥执行；UseSite 解析缓存在 `workspace.rs`
+（`WorkspaceState`，按文件 + 声明面指纹联动失效）。
 
 - **无 `manifest.rs`**：LSP 不读 `_manifest.dctx`（决策 D20，架构设计 §2.5）。
   `float_is_float64` 由配置项经 `IndexConfig` 传入。
@@ -290,6 +297,21 @@ rayon，**不需要独立调度、也不必单独成阶段**。它只有两件�
 - `references(DefId)` 只需解析「引用倒排给出的候选文件集」的 UseSite，逐文件缓存；
 - 中途编辑只失效一个文件的解析缓存；
 - 代价：首次 references 稍慢（可 `$/progress`），后续命中缓存。
+
+**M4 落地形态**（`uses.rs` / `references.rs`，语义约定见决策 D27/D28）：
+
+- UseSite 记录 `(name, span, role)` 于 `FileSnapshot.uses`，引用倒排
+  `ref_index: name → 文件集合` 随 add/remove 维护。**不记录** primitive
+  使用点（内建无源码声明，不可 references/rename）与命名实参名字（M5）；
+- 解析驱动：`resolve_file_uses` 用 tree-sitter 原生 `descendant_for_byte_range`
+  定位节点 + `resolve_at_node`（**parent 链上溯**建语境）——M4 性能定案：
+  原从根下潜每站点物化 O(路径兄弟节点数) 节点（`children_with_fields`
+  每具名孩子一次 String 分配），Core.d.as 级巨型文件全语料 163s；上溯后
+  **0.6s**（68763 站点、99.4% 解析率，`as-cli dump-index --ref-stats`）；
+- 缓存失效联动：reindex 时对比该文件「声明面指纹」（main 中属于该文件的
+  `(名字, kind, 父名)` 有序集）——变了才整表失效，否则只失效该文件（D29）；
+- 语义匹配见 `references.rs` 模块头：站点集合 ∩ 查询集合 ≠ ∅；DefId **不做**
+  origin 归一（合成成员独立成目标），唯一例外 class 合成 namespace → 类。
 
 ### 4.2 表达式定型管线（Phase 3 内核）
 
@@ -571,6 +593,7 @@ pub fn resolve_overload(cands: &[DefId], args: &[TypeId]) -> Vec<Ranked>;
 
 | 版本 | 内容 |
 |---|
+| v1.3 | **M4 落地登记**：§2.2 补 `uses.rs` / `references.rs` / `search.rs`（as-core）与 as-lsp `watch.rs` + 解析缓存；§4.1 补 M4 落地形态（UseSite 数据结构、节点上溯解析、声明面指纹联动失效、匹配语义）。实现期修正：① **expand/mixin 幽灵符号**（M3 遗留）——remove+re-add 后 arena 遗留旧 DefId，`expand_all` / `build_mixin_index` 未按可达性过滤 ⇒ 被替换的类生成重复合成 namespace 进 main、旧 mixin 重入倒排；修为按 main 可达性（`live_def_ids`）过滤。② **range-for 迭代变量死分支**——M3 写的 `"range_for_statement"` 节点 kind 不存在（正确为 `for_each_statement`），迭代变量此前不入局部帧。③ **重载消歧分级**（D28）：arity + 可定型实参（字面量/标识符/链式/Cast），唯一命中收敛单目标、失败保留整组（报全部重载）；运算符 / f-string / range-for 实参定型随 M5 signatureHelp。验收：96 单测全绿；语料 `--ref-stats` 68763 站点 99.4% 解析、全语料 0.6s；e2e FVector 引用 2846 站点 / 88 文件 + `$/progress`；watched-files 生命周期 e2e（增删复活 + `.d.as` 防抖，`tests/lsp-e2e-m4.mjs`） |---|
 | v1.2 | **M3 落地登记**：§2.2 新增 `hover.rs`（渲染层：`angelscript_snippet` code fence 紧凑签名 + doxygen 8 tag markdown + `@group` 包路径，全部候选同 fence）。实现期 API 形态偏差（设计意图不变）：§7.1 的 `resolve_name(idx, file, at, name)` 落地为 `resolve_at(idx, file, byte)`——名字由光标处 identifier 自取，返回 `Vec<Target>`（Def 或局部/形参的语法层声明）+ 命中级数；局部声明不合成 DefId（索引不收函数体，§4）。delegate/event 计入 `DefKind::is_type_like`（类型名可指向的声明全集——`lookup_type_def` 据此让 `FOnHit` 字段可定型、查找链可触达展开成员集）。Ready 后编辑的重索引粒度与文件收集规则见 D26 |---|
 | v1.1 | **基础类型 DefId 来源修正**（D25，M1 实现期语料取证）：§3.3 「基础类型在 `.d.as` 中有真实 DefId」与实际导出物不符（全语料零基础类型声明）——改为「注入合成 builtin DefId（SYNTHETIC，不进声明统计），类型表仍统一走 Named 不设特例；裸 float 按 IndexConfig 归一化」。设计意图（统一 Named、不设特例）不变 |---|
 | v1.0 | **`.d.as` 全量重建的理由重写 + 防抖定性**（D24）：§5.3 结论不变（仍全量），但换掉原「不读 manifest ⇒ 无从判断增量」的错误论证，改为「导出恒清空重写 ⇒ 变更集恒等全集 + 偶尔触发」与「全量规避逐文件摘除的幽灵符号 bug」两条；明确唯一不可替代的全量触发源是 `floatIsFloat64` 配置变更；防抖补 **5s 硬上限**，并定性为「只避免重复做功、不承担正确性」（正确性由 `arc-swap` 换根保证）。**§4 流水线图与定性澄清**：图上标出「冷启动构建（Phase 1+2）/ 查询期（Phase 3）」分界；新增 Phase 0 定性段（纯文件发现、等价 mylua 的文件遍历、无需独立调度）+ 其两件实质产出表（文件类别标签、所属根 ⇒ 模块名与 `local` 可见域）+ 与 mylua 两步流程的对照表；注明 Phase 编号**不重排**的理由（D4/D5 标题与架构设计 §4.2 对齐声明已引用该编号，治理规则 1）。**开工前终检修订**：头部版本号补齐至 v1.0 / D1-D24（治理规则 5）；§2.2 `resolve.rs` 注释「五级链」改为「0-6 级」（与 §7.1 对齐）、补登记 `diag.rs`（M6 建，G5 要求）；§4 Phase 2 表 mixin 倒排改为「键**不**预展开到子类 + 查询时沿闭包逐级查」（原文「键要展开到子类」与同格后半句及 D23 裁决自相矛盾）；§3.3 模板实例化段的列表层级断裂修正；§12 G9 归位至 G8 之后；本表统一为倒序 |
