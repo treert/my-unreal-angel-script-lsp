@@ -1,6 +1,6 @@
 # LSP 实现规划（模块三/四 落地设计）
 
-> 版本：v0.8（Q1-Q4 已裁决，D1-D22 定案；`FileId`/`Sym` 的 intern 实现见 [`实现优化.md`](实现优化.md)）
+> 版本：v0.9（Q1-Q4 已裁决，D1-D23 定案；`FileId`/`Sym` 的 intern 实现见 [`实现优化.md`](实现优化.md)）
 > 定位：把 [`架构设计.md`](架构设计.md) §4/§5/§6 的骨架细化到**可开工**粒度——crate 内部结构、
 > 数据模型、流水线时序、里程碑与验收。实现前的最后一份设计文档，开工后转为进度跟踪。
 >
@@ -239,7 +239,7 @@ typeDeclDirs      （不做无函数体轻扫）          继承闭包 / 命名�
 | 符号 arena + 成员表 | `class C : P` 成员查找沿 supertype 链 = parent 的成员表串联 |
 | 继承闭包 | 预计算每个 **class** 的祖先链（含环检测——错误源码可能出现环，报诊断不 panic）。**struct 不建**：`.d.as` 的 struct 无父类且 C++ 继承已展平，成员查找单层（架构设计 §4.5 第 2 级） |
 | 命名空间树 | 逐级嵌套关系，供查找链第 5 级回退 |
-| **mixin 倒排** | `首参类型 DefId -> Vec<DefId>`（mixin 函数）。查找链第 4 级据此把 mixin 函数当伪成员；首参类型未解析的 mixin 暂挂「待定」桶，不阻塞构建 |
+| **mixin 倒排** | `首参类型 DefId -> Vec<DefId>`（mixin 函数）。供查找链第 4 级 fallback 使用（准入条件见架构设计 §4.5.1）。**键要展开到子类**：引擎判定是 `DerivesOrShadows(首参类型)`，故查 `C` 时须覆盖「首参为 `C` 或 `C` 任一祖先」的全部 mixin——实现取「沿继承闭包逐级查倒排」而非预展开（省内存，闭包已有）。首参类型未解析的 mixin 暂挂「待定」桶，不阻塞构建。**C++ `ScriptMixin` 库函数不进此表**（导出时已是成员方法，架构设计 §4.5.2） |
 | **module 归属表** | `FileId -> Sym`（模块名，按引擎 `FilenameToModuleName`）+ `local` 符号集合，供模块隔离过滤 |
 | **行首偏移表** | 每文件 `Vec<u32>`，UTF-16 位置换算的前置（§3.2.1） |
 | UseSite 记录 | 每文件所有「标识符使用点」：`(name, span, 语法角色)`，**不做解析** |
@@ -398,12 +398,25 @@ Loading 期间：
 pub fn resolve_name(idx: &Index, file: FileId, at: u32, name: Sym) -> Vec<DefId>;
 // 内部顺序（架构设计 §4.5 的 0-6 级）：
 //   this/super → 局部变量(作用域链上溯) → 类成员(class 沿继承闭包 / struct 单层)
-//   → 属性访问器(不带 NOT_PROPERTY 即候选) → mixin 伪成员(首参倒排)
-//   → 命名空间链(逐级回退) → 全局/类型本身
+//   → 属性访问器(不带 NOT_PROPERTY 即候选) → mixin fallback → 命名空间链(逐级回退)
+//   → 全局/类型本身
 // 约束：local 函数按 module 归属表过滤；同名 type/namespace 按语境择一
 ```
 
 参数是**字节偏移**而非 `Pos`——as-core 不引入行列概念（§3.2.1）。
+
+**mixin 级是短路 fallback，不是候选合并**（架构设计 §4.5.1，引擎
+`as_compiler.cpp:13387-13450`）：第 2/3 级只要返回非空就**直接跳过**第 4 级，
+mixin 不与真实成员一起进 `resolve_overload`。四条额外守卫：
+
+```rust
+// 仅当以下全部成立才查 mixin 倒排：
+//   ① 前序级别结果为空
+//   ② 有对象上下文（显式 recv 或所在类方法体的 this）  ← 全局函数体内不查
+//   ③ 调用点无 scope 限定                              ← NS::Foo(obj) 不查
+//   ④ 首参类型经 DerivesOrShadows 匹配接收者（沿继承闭包查倒排）
+// 命中后 definition/hover 落回 mixin 函数声明本身（真实全局函数，非合成符号）
+```
 
 ### 7.2 重载解析（一等模块，P3 阶段即完成骨架）
 
@@ -457,7 +470,7 @@ pub fn resolve_overload(cands: &[DefId], args: &[TypeId]) -> Vec<Ranked>;
 | M0 | Cargo workspace + as-syntax + `dump-tree` | Demo_AS/Script 27 文件 + 414 `.d.as` dump 零 ERROR（复用 grammar 验收口径，口径一致才说明包装层无损） |
 | M1 | as-core 三阶段 + `dump-index` + tag 解析 | ① **数量对账**：`dump-index` 的类型数/成员数 与 `_manifest.dctx` 的 `type_count=14864` / `member_count=69337` **人工比对**（该文件仅作开发期参照，运行时不读——D20）；差异须逐条解释（如 20 个被覆盖的 group，风险 7）。② 15 个语义 tag 全部解析，含 4 个语料零出现项的内置单测（风险 8）。③ 继承闭包环检测用例；struct 不建闭包的断言。④ `floatIsFloat64` 两种取值下 `FVector.X` 分别定型为 `float64` / `float32` 的用例 |
 | M2 | as-lsp 壳 + documentSymbol/semanticTokens/folding + **VSCode 扩展最小版** | Demo_AS 打开真实体感；semanticTokens 与 Hazelight 扩展同文件截图对照 |
-| M3 | 查找链 + hover/definition | as-core 内置单测覆盖查找链 0-6 级命中序（§10），含 `super`、mixin 伪成员、struct 单层、访问器反向默认四类专项用例；as-cli 对语料批量 dump-index 校验 |
+| M3 | 查找链 + hover/definition | as-core 内置单测覆盖查找链 0-6 级命中序（§10）。四类专项用例：`super`、struct 单层、访问器反向默认、**mixin 五条准入条件**（真实成员优先于 mixin 而短路 / 全局函数体内不命中 / `NS::Foo(obj)` 不命中 / 父命名空间的 mixin 可命中 / 首参为接收者祖先类时命中）；as-cli 对语料批量 dump-index 校验 |
 | M4 | references/rename/workspaceSymbol + 重载消歧 | 重载函数引用消歧用例（成功/失败双路径）；`$/progress` 长任务；文件增删改名后索引一致性用例（§5.3） |
 | M5 | completion/signatureHelp/inlayHint | `X.` 成员补全、`n"\|` UFUNCTION 名单、`UCLASS(` 说明符补全、命名参数补全四类截图验收 + `auto` 变量 inlay 类型展示；**命名实参补全跳过 `InArgN` 占位**（架构设计 §2.4.6） |
 | M6 | 诊断起步 | `AS0902` / `AS0903` 生效（`AS09xx` 段其余码号均 retired：`AS0901`/`AS0905` 见 D20，`AS0906` 见 D21）。**M6 只做诊断框架**（`enum DiagCode` + 发布管道 + 抑制注释解析），具体规则进 P5 按需设计（D22） |
@@ -512,6 +525,7 @@ pub fn resolve_overload(cands: &[DefId], args: &[TypeId]) -> Vec<Ranked>;
 | v0.2 | 测试策略定稿：单测源码内置（AGENTS.md 硬性规则）；golden 对账取消（决策记录 D2）；Q1-Q4 全部裁决，§11 改为索引 |
 | v0.3 | 挂接 [`实现优化.md`](实现优化.md)：§3 引用 `FileId`/`Sym` intern 实现模板（决策记录 D12/D13） |
 | v0.4 | D14 落地：新增 §4.2 表达式定型管线（`auto` 推导链、range-for 双跳协议）；§8.1 请求路由表与 §9 M5 新增 `inlayHint` |
+| v0.9 | **mixin 语义精确化**（D23）：§4 mixin 倒排产物补「沿继承闭包查（`DerivesOrShadows`）」与「C++ `ScriptMixin` 不入表」；§7.1 明确 mixin 级是**短路 fallback** 而非候选合并，列出四条守卫；§9 M3 验收改为 mixin 五条准入条件专项用例 |
 | v0.8 | **诊断按需设计**（D22）：前置索引说明码表新定位；§9 M6 收窄为「只做诊断框架」（`enum DiagCode` + 发布管道 + 抑制注释），具体规则进 P5；§12 G5 重述为「防散落无 code 报错」而非「防发明码号」 |
 | v0.7 | **不做版本协商**（D21）：§2.2 明确 `@cache_format` 识别但不消费、as-core 对 `.d.as`「版本」无感；§8.1 与 §9 M6 的诊断码更新（`AS0906` retired） |
 | v0.6 | **LSP 不读 manifest**（D20）：§2.2 删除 `manifest.rs`（as-core 只认源码文本，格式版本走 `decl_tags.rs` 的 `@cache_format`）；§3.3 `floatIsFloat64` 改为 `IndexConfig` 输入；§5.3 新增配置变更与 manifest 忽略两行；§8.1 新增 `didChangeConfiguration`；§9 M1 改为人工对账 + 新增浮点双取值用例、M6 诊断码更新；§12 修订 G6、新增 G9 |

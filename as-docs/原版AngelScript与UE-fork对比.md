@@ -1,9 +1,9 @@
 # 原版 AngelScript 与 Unreal fork 的差异
 
-> 版本：v0.5.3
+> 版本：v0.6
 > 下游专题：
 > - [`struct类型专题.md`](struct类型专题.md)（`class`/`struct` 全量对照、UE 映射、继承与展平）
-> - [`诊断码表.md`](../docs/诊断码表.md)（`AS0xxx` 权威码表，唯一码号分配处）
+> - [`诊断码表.md`](../docs/诊断码表.md)（码号登记处 + 取证素材库；诊断按需设计，不构成实现承诺）
 >
 > 前置文档：[`../grammar/angelscript.bnf`](../../grammar/angelscript.bnf)（Layer A 完整语法规范）、[`架构设计.md`](../docs/架构设计.md)
 > 证据来源（绝对路径，均为只读参考）：
@@ -247,7 +247,7 @@ struct 里只要成员**可能**含 UObject 引用，即使没写 `UPROPERTY()` 
 |---|---|---|---|---|
 | **lambda** `function(...) {...}` | L2 | 编译器对 lambda 的唯一出口是隐式转换到 funcdef（`ImplicitConvLambdaToFunc` 开头即 `asASSERT(to.IsFuncdef() && ctx->IsLambda())`）；而 funcdef 是死 token（§1.1），且 AngelscriptCode 从不注册脚本可见的 funcdef → lambda 恒报 `Invalid expression: stand-alone anonymous function` | `[ENGINE]as_compiler.cpp:8339`（断言）、`6291`（报错点）、`as_texts.h:150`；AngelscriptCode 全模块无 `RegisterFuncDef` | **文法不实现**（parse error，2026-09 决策）：语法层拒绝与「实际跑不起来」一致；原 `AS0107` 随之 retired |
 | **裸 enum 值** `Value`（非 `MyEnum::Value`） | L2 | `asEP_REQUIRE_ENUM_SCOPE = 1`：符号查找跳过「不写枚举类型名」的兜底分支，落入通用「未找到」错误 | `[UE]Private/AngelscriptManager.cpp:337`；`[ENGINE]as_compiler.cpp:11815`（`!engine->ep.requireEnumScope` 守卫） | 归入 `AS04xx`（符号解析，P3/P4 落地时占号） |
-| **mixin class** `mixin class Foo {...}` | L2 | `mixin` token 活着，但 `ParseMixin` 已被重定义为「mixin + **函数**声明」；`as_builder` 里的 mixin class 机器（`RegisterMixinClass` / `IncludeMethodsFromMixins` 等）是上游遗留、不可达 | `[ENGINE]as_parser.cpp:3700-3714`（"A mixin token must be followed by a function declaration"）；`as_builder.cpp:2022 / 2872 / 3827` | parse error 是**正确**行为：grammar 不实现 mixin class，与引擎一致。注意 mixin **function**（`mixin void f() {...}`）是活功能（BNF §2.6） |
+| **mixin class** `mixin class Foo {...}` | L2 | `mixin` token 活着，但 `ParseMixin` 已被重定义为「mixin + **函数**声明」；`as_builder` 里的 mixin class 机器（`RegisterMixinClass` / `IncludeMethodsFromMixins` 等）是上游遗留、不可达 | `[ENGINE]as_parser.cpp:3700-3714`（"A mixin token must be followed by a function declaration"）；`as_builder.cpp:2022 / 2872 / 3827` | parse error 是**正确**行为：grammar 不实现 mixin class，与引擎一致。**但 mixin 函数是活功能且语义完整**，见 [§5.4](#54-mixin-函数活功能与-mixin-class-无关) |
 | **import** `import void f() from "mod";` | L4 | token 活、`ParseScript` 正常分发（`ttImport` → `ParseImport`）、VM 编译通过；但宿主必须调 `BindAllImportedFunctions` 才可用——AngelscriptCode 全模块 **0** 调用 → 调用时运行期报 `Unbound function called` | `[ENGINE]as_tokendef.h:275`、`as_parser.cpp:2471`、`as_texts.h:363` | **文法不实现**（parse error，2026-09 决策）：语法层拒绝比「放行再等运行期炸」更诚实；原 `AS0904` 随之 retired |
 | **虚属性（带 body）** `int X { get { ... } }` | L3 | VM 把访问器编译成 opGet/opSet 方法，但预处理器 / ClassGenerator 对 VirtualProperty **零处理**，UClass 侧无人认领；官方 pegjs 无此语法，引擎/插件全部脚本零使用 | AngelscriptCode 全模块 `VirtualProperty` **0** 命中；`grammar.js` / BNF §2.3.7 注释已记录 | 语法放行；语义层**暂不报错**（使用率为零，低优先级）；bodyless 形态已有 `AS0005` |
 
@@ -260,7 +260,55 @@ struct 里只要成员**可能**含 UObject 引用，即使没写 `UPROPERTY()` 
 例外是虚属性（AS VM 自身完整支持，拦截发生在 UE 认领层，且 bodyless 形态有 `AS0005`
 诊断依赖），语法放行、语义层暂不报错。
 
-### 5.4 相关引擎属性开关
+### 5.4 mixin 函数：活功能，与 mixin class 无关
+
+`mixin` 这个词在 UE fork 里对应**三套互不相关的机制**，极易混淆：
+
+| # | 形态 | 状态 |
+|---|---|---|
+| 1 | `mixin class Foo {...}`（原版 AS 语法） | ❌ **不存在**，parse error（§5.2） |
+| 2 | `mixin void Foo(AActor T)`（脚本侧扩展方法） | ✅ **活功能**，语义完整 |
+| 3 | `UCLASS(Meta=(ScriptMixin="FVector"))`（C++ 侧） | ✅ 活功能，但**绑定期就变成真成员方法** |
+
+**形态 2（脚本 mixin 函数）**——两种写法等价，都会被打上 `asTRAIT_MIXIN`
+（`[ENGINE]as_builder.cpp:4604`）：
+
+```angelscript
+mixin void Heal(AActor Target, float Amount) { ... }    // 前置：ParseMixin（as_parser.cpp:3700）
+void Heal(AActor Target, float Amount) mixin { ... }    // 后置属性（as_parser.cpp:3249 / 5083）
+```
+
+函数注册为**普通全局函数**，扩展方法效果由编译器在符号查找时补上——
+真值 `[ENGINE]as_compiler.cpp:13387-13450`（`// Look for mixin functions`），
+守卫条件五条**全部满足**才查：
+
+1. `funcs.GetLength() == 0` —— **纯 fallback**，常规成员查找命中就绝不查 mixin；
+2. `objectType != 0 || ThisObjectType != nullptr` —— 需对象上下文（显式 `obj.` 或类方法体内隐式 `this`，引擎自动压栈 `:13436-13449`）；
+3. `scope.GetLength() == 0` —— `NS::Heal(obj)` **不走** mixin；
+4. 沿 `GetParentNameSpace` 逐级回退父命名空间；
+5. 首参存在 && `IsObject()` && `availableObjectType->DerivesOrShadows(首参类型)`
+   —— 注意是 `DerivesOrShadows`（含 AS 类 shadow C++ 类），比单纯继承宽；
+   且 value type 亦满足 `IsObject()` ⇒ **可为 struct 写 mixin**。
+
+`asTRAIT_MIXIN` 在编译器里仅有一处额外用途：no-discard 判定时按 const 方法对待
+（`as_compiler.cpp:18627`），返回值未使用会警告。符号查找本身不因该 trait 特殊化。
+
+UE 反射层效果仅限编辑器：给生成的 UFunction 打 `MixinArgument` + `DefaultToSelf` meta
+（`[UE]Private/ClassGenerator/AngelscriptClassGenerator.cpp:3324-3331`，`#if WITH_EDITOR`），
+用于蓝图节点首参默认连 self。
+
+**形态 3（C++ `ScriptMixin`）** 是 UE fork 的主力用法，引擎自带一大批
+（`AngelscriptMathLibrary.h` 的 `FVector`/`FRotator`/`FQuat`/`FTransform` 库、
+`GameplayTag*MixinLibrary`、`InputComponentScriptMixinLibrary`、`UWidget`/`UWorld` 库等）。
+绑定期 `[UE]Private/Binds/Helper_FunctionSignature.h:283-345` 把静态 UFUNCTION 转成目标类型的
+**真成员方法**（`EBindTargetType::MixinMethod`，摘掉首参）⇒ 脚本侧与普通成员方法无差别。
+
+> **使用现状**：引擎自带 `.as` 脚本中形态 2 的使用数为 **0**（实测），但官方 LSP 有大量
+> `isMixin` 处理逻辑（`as_parser.ts` 数十处）——它是给项目脚本准备的活功能，不是遗迹。
+
+LSP 侧的落地约定见 [`架构设计.md` §4.5.1 / §4.5.2](../docs/架构设计.md)。
+
+### 5.5 相关引擎属性开关
 
 `[UE]Private/AngelscriptManager.cpp:325-355` 集中设置了一批引擎属性，与「写了能不能编过」直接相关的：
 
@@ -353,6 +401,7 @@ struct 里只要成员**可能**含 UObject 引用，即使没写 `UPROPERTY()` 
 
 | 版本 | 内容 |
 |---|---|
+| v0.6 | 新增 **§5.4「mixin 函数：活功能，与 mixin class 无关」**：厘清 `mixin` 一词对应的**三套互不相关机制**（原版 mixin class 不存在 / 脚本侧 mixin 函数活且语义完整 / C++ `ScriptMixin` meta 绑定期即转真成员方法）；含两种声明形式、`as_compiler.cpp:13387-13450` 的五条准入条件取证、struct 可作首参、no-discard 特殊待遇、UE 反射层 meta 效果。原 §5.4（引擎属性开关）顺移为 §5.5；§5.2 的 mixin class 行补指引 |
 | v0.5.2 | §7.3 职责表与同步约定加入新文档 [`设计取舍与使用限制.md`](设计取舍与使用限制.md)（设计取舍总纲，「为什么」层面的因果在此展开，本文保持「是什么」） |
 | v0.5.3 | 文档目录拆分：语言分析类（本文 / struct 专题 / 设计取舍）移入 `as-docs/`，LSP 设计类（架构设计 / 诊断码表 / 引擎内部语法）留在 `docs/`；跨目录引用全部更新 |
 | v0.5 | 新增 §5「解析层放行、实际不可用的构造（paper features）」：四层拦截模型（L1 词法 / L2 编译 / L3 UE 认领 / L4 宿主绑定）、五项逐项取证清单（lambda / 裸 enum 值 / mixin class / import / 带体虚属性）、Hazelight 官方 LSP 有效语法对照、相关引擎属性开关表；原 §5/§6/§7 顺移为 §6/§7/§8；修正 §3.3 指向旧 §5.5 的失效锚点 |
