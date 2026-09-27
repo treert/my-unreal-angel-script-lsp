@@ -1,6 +1,6 @@
 # LSP 实现规划（模块三/四 落地设计）
 
-> 版本：v0.3（Q1-Q4 已裁决；`FileId`/`Sym` 的 intern 实现见 [`实现优化.md`](实现优化.md)）
+> 版本：v0.5（Q1-Q4 已裁决，D1-D19 定案；`FileId`/`Sym` 的 intern 实现见 [`实现优化.md`](实现优化.md)）
 > 定位：把 [`架构设计.md`](架构设计.md) §4/§5/§6 的骨架细化到**可开工**粒度——crate 内部结构、
 > 数据模型、流水线时序、里程碑与验收。实现前的最后一份设计文档，开工后转为进度跟踪。
 >
@@ -79,8 +79,13 @@ as-core/src/
 ├── index.rs       # WorkspaceIndex：三阶段流水线的数据产物与构建入口
 ├── resolve.rs     # 查找链（架构设计 §4.5 五级链）
 ├── overload.rs    # 重载解析与排序（一等模块）
-└── range.rs       # 字节偏移 ↔ LSP 位置（UTF-16）换算（移植 mylua 成熟方案）
+├── decl_tags.rs   # .d.as 注解标签解析与 tag/doc 分流（架构设计 §2.4.3/§2.4.4）
+├── manifest.rs    # _manifest.dctx 解析与校验链（架构设计 §2.5，纯字符串输入）
+└── range.rs       # TextRange（字节）+ 行首偏移表；UTF-16 换算原语（移植 mylua 方案）
 ```
+
+- `manifest.rs` 放 as-core 而非 as-lsp：它是纯解析（输入已读好的字符串），
+  且 `float_is_float64` 影响字面量定型（§3.3），属语义范畴。读盘仍在 as-lsp。
 
 ## 3. 数据模型（ID 体系）
 
@@ -110,24 +115,58 @@ as-core/src/
 ```rust
 struct DefData {
     name: Sym,
-    kind: DefKind,           // Class | Struct | Enum | EnumValue | Function | Property
-                             // | Param | TypeParam | Namespace | Module | AssetDecl
-                             // | MixinFunction | Synthetic(...)   // 展开产物
+    kind: DefKind,
     file: FileId,
-    name_range: Range,       // 名字 token（definition/rename/hover 的锚点）
-    full_range: Range,        // 整个声明
+    name_span: TextRange,    // 名字 token（definition/rename/hover 的锚点）
+    full_span: TextRange,    // 整个声明
     parent: Option<DefId>,   // 所属 class / namespace；顶层则为 Module
-    origin: Option<DefId>,   // 合成符号 → 源头声明
-    // kind 特化数据放 variant：Function 重载组、Property 类型与访问器、
+    origin: Option<DefId>,   // 合成符号 → 源头声明（D10）
+    flags: DefFlags,         // 见下
+    // kind 特化数据放 variant：Function 签名与形参、Property 类型、
     // Class 的 specifier 集合与 doc 注释等
 }
 ```
 
-- **重载组**：同名同作用域的多个 `Function` DefId 天然共存，重载组是「查询时按 name+scope 聚合」
+**`DefKind` 全集**（对齐 grammar 的声明节点 + `.d.as` 形态，不留「以后再加」）：
+
+| 分组 | 变体 |
+|---|---|
+| 类型 | `Class` / `Struct` / `Enum` / `EnumValue` / `Namespace` / `Module` |
+| 类型别名式 | `Delegate` / `Event`（声明本体；展开出的成员另计，见 §3.1） |
+| 可调用 | `Function` / `Method` / `Constructor` / `Destructor` / `Operator` |
+| 数据 | `GlobalVar` / `Field` / `Param` / `LocalVar` / `TypeParam` / `AssetDecl` |
+| 访问器 | `VirtualProperty`（`int X { get {...} }`，顶层与类内均可出现，`AS0005` 依赖它） |
+
+- `Operator` 与 `Method` 分开：引擎内部语法 §1.5 要求对 `opCast`/`opImplCast` 等降权，
+  补全排序需要按 kind 区分，事后用名字前缀判断不可靠。
+- `Delegate`/`Event` 必须有独立 kind：hover 在声明处应显示「delegate 声明」，
+  而不是展开出的 struct。
+
+**`DefFlags`**（位标志，替代散落的 bool）：
+
+```
+CONST  PROTECTED  LOCAL  MIXIN  SYNTHETIC
+EDITABLE        // .d.as @editable：仅 default 块可写（架构设计 §2.4.3）
+NOT_PROPERTY    // .d.as @notProperty：非访问器（反向默认，§2.4.5）
+NOT_CALLABLE    // .d.as @notCallable
+UNNAMED_PARAM   // 形参名是 InArgN 占位（架构设计 §2.4.6），命名实参补全须跳过
+```
+
+- **重载组**：同名同作用域的多个可调用 DefId 天然共存，重载组是「查询时按 name+scope 聚合」
   的视图，不落库——避免维护组的成员增删同步。
 - **属性访问器**（架构设计 §4.5 第 3 级）：`Get<X>`/`Set<X>` 命中时返回**属性访问器视图**
   （读写侧各自的签名），它是对既有 Function DefId 的包装查询，不是新符号。
-- **doc 注释**：声明前连续 `//` 行（含 `.d.as` 的 `@tag` 注解）挂在 DefData，hover 直接消费。
+  判定按**反向默认**：不带 `NOT_PROPERTY` 即为访问器候选。
+- **doc 注释**：声明前连续 `//` 行挂在 DefData。`.d.as` 的 `@tag` 按架构设计 §2.4.4 分流——
+  白名单 tag 进 `flags` / 特化数据，其余留在 doc 文本。
+
+### 3.2.1 span 表示与位置换算（as-core 不依赖 LSP 类型）
+
+- `TextRange` = `(start: u32, end: u32)` **字节偏移**，as-core 内部一律用它；
+- `Position`（行 + UTF-16 列）换算只在 as-lsp 边界发生，实现落 `range.rs`；
+- 换算依赖**每文件行首偏移表**（`Vec<u32>`）+ 行内 UTF-8→UTF-16 扫描。
+  该表是 Phase 2 的持久产物（§4），否则每次换算要重扫整个文件（O(文件长度)）；
+- 行首表随文件文本一起失效/重建（增量编辑时重算该文件）。
 
 ### 3.3 类型表
 
@@ -145,7 +184,24 @@ enum TypeKind {
 
 - 基础类型（`void`/`int`/`float`…）在 `.d.as` 中有真实 DefId，统一走 `Named`，不设特例——
   减少类型表分支。
-- `floatIsFloat64`（manifest 设置）：只影响**字面量表达式的推导结果**，不影响类型表本身。
+- `floatIsFloat64`（manifest 设置，架构设计 §2.5）：只影响**字面量表达式的推导结果**，
+  不影响类型表本身。
+
+**规范形式（canonical form，intern 的前置条件）**：`const T&` 既可表示为
+`Const(Ref(T))` 也可表示为 `Ref(Const(T))`，两种结构不相等 ⇒ 同一类型拿到两个 TypeId，
+「相等即同一」的不变量被破坏。因此强制：
+
+```
+修饰符嵌套顺序（由外到内）：Ref → Const → Array → Named / Param / Wildcard / Auto
+```
+
+- 所有 TypeId 只能经 `intern_type()` 构造，该函数内部重排修饰符到规范顺序并折叠重复
+  （`Const(Const(T))` → `Const(T)`）；
+- 直接 `TypeKind` 字面量构造类型表条目在 as-core 内部标记为私有，杜绝绕过；
+- 单测：随机生成修饰符组合，断言「语义相同的两种写法 → 同一 TypeId」。
+
+**`unresolved_object`**（D8）：不进 `TypeKind`，作为 `.d.as` 成员声明上的语法 flag 存在
+`DefFlags` 之外的渲染信息里，类型本身按基类型 intern。
 - **模板实例化** `instantiate(DefId, Vec<TypeId>) -> TypeId`：
   - 缓存键即 `(def, args)`，TypeId 相等天然去重；
   - 成员克隆惰性：首次被成员查询触达才展开，展开结果缓存为合成 DefId 列表；
@@ -176,10 +232,13 @@ typeDeclDirs      （不做无函数体轻扫）          继承闭包 / 命名�
 | 产物 | 说明 |
 |---|---|
 | 符号 arena + 成员表 | `class C : P` 成员查找沿 supertype 链 = parent 的成员表串联 |
-| 继承闭包 | 预计算每个类的祖先链（含环检测——错误源码可能出现环，报诊断不 panic） |
-| 命名空间树 | 逐级嵌套关系，供查找链第 4 级回退 |
-| UseSite 记录 | 每文件所有「标识符使用点」：`(name, range, 语法角色)`，**不做解析** |
-| delegate/event 展开 | `expand.rs` 按 §4.4 规则表生成合成成员 |
+| 继承闭包 | 预计算每个 **class** 的祖先链（含环检测——错误源码可能出现环，报诊断不 panic）。**struct 不建**：`.d.as` 的 struct 无父类且 C++ 继承已展平，成员查找单层（架构设计 §4.5 第 2 级） |
+| 命名空间树 | 逐级嵌套关系，供查找链第 5 级回退 |
+| **mixin 倒排** | `首参类型 DefId -> Vec<DefId>`（mixin 函数）。查找链第 4 级据此把 mixin 函数当伪成员；首参类型未解析的 mixin 暂挂「待定」桶，不阻塞构建 |
+| **module 归属表** | `FileId -> Sym`（模块名，按引擎 `FilenameToModuleName`）+ `local` 符号集合，供模块隔离过滤 |
+| **行首偏移表** | 每文件 `Vec<u32>`，UTF-16 位置换算的前置（§3.2.1） |
+| UseSite 记录 | 每文件所有「标识符使用点」：`(name, span, 语法角色)`，**不做解析** |
+| delegate/event 展开 | `expand.rs` 按架构设计 §4.4 规则表生成合成成员 |
 | 引用倒排 | `name -> 出现该名字的文件集合`（references 的候选集剪枝） |
 
 **Phase 3 惰性语义**：UseSite → DefId 的解析、表达式类型、模板成员展开、重载排序，全部
@@ -231,22 +290,59 @@ auto 只是**占位记录**（`TypeKind::Auto`），不存在阻塞索引构建�
 第二个红利：auto 推导是**函数体局部的自包含分析**——初始化表达式就在声明处，
 无需流敏感 / 跨函数传播，只读已建好的成员表。
 
-## 5. 增量更新时序
+## 5. 文本来源、增量更新与文件生命周期
+
+### 5.1 overlay：文本的唯一真值来源
+
+as-core 只接受「已读好的字符串 + FileId」（§2），**谁提供字符串必须有唯一规则**，
+否则未保存的编辑会被磁盘内容覆盖：
+
+| 状态 | 文本来源 |
+|---|---|
+| `didOpen` 之后 | **overlay**（客户端发来的内存文本），版本号随 `didChange` 递增 |
+| `didClose` 之后 | 丢弃 overlay，回落磁盘内容并重读一次（客户端可能放弃了未保存修改） |
+| 从未打开 | 磁盘 |
+
+- overlay 表在 as-lsp 侧（`HashMap<FileId, (version, String)>`），as-core 不感知其存在；
+- `didSave` **不触发**重读（磁盘内容此刻必然等于 overlay）；
+- 文件监视事件若命中有 overlay 的文件 → **忽略**（overlay 优先），避免外部工具改盘引发抖动。
+
+### 5.2 编辑时序
 
 ```
 didChange（增量，含 old_tree）
   └─ 单文件增量 parse（毫秒级，请求线程内同步完成）
        ├─ 声明级 diff：增/删/改的 DefId → 更新主索引、成员表、继承闭包（局部重算）
-       ├─ 该文件 UseSite 重建 + Phase3 该文件全部缓存失效
+       ├─ 该文件 UseSite / 行首偏移表 / mixin 倒排条目重建
+       ├─ Phase3 该文件全部缓存失效
        └─ 粗粒度联动失效：若类成员集合变化 → 全局「成员访问解析缓存」失效
             （先正确后优化；441 文件量级重算大概率无感，性能不达标再收敛为
              「依赖该类的文件集」精确失效）
 ```
 
-- `DidChangeWatchedFiles`：`.d.as` 重导出（`Saved/AS-Cache` 变化）→ 校验 manifest 指纹
-  （`AS0901`，诊断码表 §7）→ 全量重建声明索引。
-- 多根 workspace：每根独立收集，主索引合并时同名冲突按「项目根优先于引擎根」消解
-  （即配置顺序，架构设计 §4.2）。
+多根 workspace：每根独立收集，主索引合并时同名冲突按「项目根优先于引擎根」消解
+（即配置顺序，架构设计 §4.2）。
+
+### 5.3 文件增删改名（`DidChangeWatchedFiles`）
+
+| 事件 | 处理 |
+|---|---|
+| `.as` 新增 | 读盘 → 单文件 Phase 1+2 → 并入主索引 |
+| `.as` 删除 | 该 FileId 的全部 DefId 标记失效、从主索引/引用倒排/mixin 倒排/module 表摘除 |
+| `.as` 改名 | = 删除 + 新增。**注意模块名随路径变**（`FilenameToModuleName`），`local` 符号的可见域随之改变，不能简单改 FileId 的路径字段 |
+| `.d.as` 任一变化 | 视为整个 `typeDeclarationDirs` 失效 → 重读 manifest（校验链见架构设计 §2.5）→ **全量重建声明索引** |
+
+**`.d.as` 事件必须防抖**：导出器每次执行会先 `DeleteDirectory` 清空目录再写 414 个文件
+（`TypeDeclarationExporter.cpp:330`），客户端会瞬间推来上千条删除+新增事件。
+约定：收到 `typeDeclarationDirs` 下的任何事件 → 启动 **500ms 静默窗口**计时器，
+窗口内的后续事件只重置计时器，超时后做一次整目录重建。
+
+**FileId 墓碑语义**：`FileId` 注册表是 append-only（[`实现优化.md`](实现优化.md) §1），
+删除文件**不回收 id**，只在 `FileMeta` 上打 `alive = false`：
+
+- 已发出的 DefId/UseSite 里的 FileId 引用不会变成悬垂索引；
+- 同路径文件重新出现 → 复用原 FileId 并翻回 `alive = true`（路径 intern 表命中）；
+- 所有遍历型查询（workspaceSymbol、references 候选集）必须过滤 `!alive` 的 FileId。
 
 ## 6. 并发模型
 
@@ -262,17 +358,45 @@ didChange（增量，含 old_tree）
   粒度 = 文件。
 - 不做跨请求并发语义分析——LSP 客户端串行发请求的场景占绝对多数，先简单后正确。
 
+### 6.1 冷启动期间的编辑不得丢失
+
+冷启动（Phase 0-2）在后台跑，期间客户端已经可以 `didOpen` / `didChange`——
+若这些编辑直接作用于「还不存在的索引」，快照一发布就把它们覆盖了。约定：
+
+```
+状态机：Loading ──(快照发布)──► Ready
+
+Loading 期间：
+  didOpen/didChange → 照常更新 overlay（overlay 独立于索引，永不丢）
+                    → 把 FileId 记入 pending_dirty 集合
+  语义类请求        → 按配置：返回空结果（默认）或挂起等待 Ready
+  非语义请求        → documentSymbol / folding / semanticTokens 可立即服务
+                       （只需单文件 CST，不依赖索引）
+
+发布瞬间（单线程内原子完成）：
+  arc-swap 换根 → 立刻用 overlay 文本重放 pending_dirty 的每个文件（§5.2 单文件路径）
+                → 清空 pending_dirty → 置 Ready
+```
+
+- 关键点：**overlay 是索引之外的独立存储**，因此「编辑不丢」只需保证发布后重放一次；
+- 重放代价 = 打开文件数（个位数），毫秒级；
+- 冷启动本身**读盘时也用 overlay 优先**（§5.1），所以多数情况重放是幂等的空操作。
+
 ## 7. 查找链与重载解析（as-core 对外 API）
 
 ### 7.1 查找链（架构设计 §4.5 原文落地）
 
 ```rust
-/// 在 position 处解析一个名字，返回可见性排序后的候选
-pub fn resolve_name(idx: &Index, file: FileId, pos: Pos, name: Sym) -> Vec<DefId>;
-// 内部顺序：局部变量(作用域链上溯) → 类成员(supertype 链) → 属性访问器(Get/Set 读写侧)
-//         → 命名空间链(逐级回退) → 全局/类型本身
-// 约束：mixin 可见性（args[0] 为本类基类时类内可见）、模块隔离规则
+/// 在 offset 处解析一个名字，返回可见性排序后的候选
+pub fn resolve_name(idx: &Index, file: FileId, at: u32, name: Sym) -> Vec<DefId>;
+// 内部顺序（架构设计 §4.5 的 0-6 级）：
+//   this/super → 局部变量(作用域链上溯) → 类成员(class 沿继承闭包 / struct 单层)
+//   → 属性访问器(不带 NOT_PROPERTY 即候选) → mixin 伪成员(首参倒排)
+//   → 命名空间链(逐级回退) → 全局/类型本身
+// 约束：local 函数按 module 归属表过滤；同名 type/namespace 按语境择一
 ```
+
+参数是**字节偏移**而非 `Pos`——as-core 不引入行列概念（§3.2.1）。
 
 ### 7.2 重载解析（一等模块，P3 阶段即完成骨架）
 
@@ -295,7 +419,9 @@ pub fn resolve_overload(cands: &[DefId], args: &[TypeId]) -> Vec<Ranked>;
 ## 8. as-lsp：能力声明与请求路由
 
 - 框架：**tower-lsp-server**（对齐 mylua，规避自研协议层的坑）。
-- `textDocumentSync`: Incremental（UTF-16 position 直接进 `range.rs` 换算）。
+- `textDocumentSync`: Incremental。UTF-16 `Position` ↔ 字节偏移的换算**只在此层发生**
+  （经 `range.rs` 原语 + 行首偏移表，§3.2.1），进入 as-core 的一律是字节偏移。
+- overlay 表（`FileId -> (version, String)`）归本层持有，规则见 §5.1。
 - 能力按里程碑逐步放开（见 §9），未实现的请求不进 capabilities，避免客户端缓存空结果。
 - 语言 id：`angelscript-asl`（架构设计 §5，避开与 Hazelight 扩展冲突）。
 
@@ -321,12 +447,12 @@ pub fn resolve_overload(cands: &[DefId], args: &[TypeId]) -> Vec<Ranked>;
 | # | 内容 | 验收标准 |
 |---|---|---|
 | M0 | Cargo workspace + as-syntax + `dump-tree` | Demo_AS/Script 27 文件 + 414 `.d.as` dump 零 ERROR（复用 grammar 验收口径，口径一致才说明包装层无损） |
-| M1 | as-core 三阶段 + `dump-index` | dump 输出索引统计（类型/函数/属性数），与 `.d.as` 语料**数量对账**（抽样人工核对）；继承闭包含环检测用例 |
+| M1 | as-core 三阶段 + `dump-index` + manifest/tag 解析 | ① **数量对账**：`dump-index` 的类型数/成员数 vs `_manifest.dctx` 的 `type_count=14864` / `member_count=69337`（现成基准，架构设计 §2.5）；差异必须逐条解释（如 20 个被覆盖的 group，风险 7）。② 15 个语义 tag 全部解析，含 4 个语料零出现项的内置单测（风险 8）。③ 继承闭包环检测用例；struct 不建闭包的断言 |
 | M2 | as-lsp 壳 + documentSymbol/semanticTokens/folding + **VSCode 扩展最小版** | Demo_AS 打开真实体感；semanticTokens 与 Hazelight 扩展同文件截图对照 |
-| M3 | 查找链 + hover/definition | as-core 内置单测覆盖查找链命中序（§10）；as-cli 对语料批量 dump-index 校验 |
-| M4 | references/rename/workspaceSymbol + 重载消歧 | 重载函数引用消歧用例（成功/失败双路径）；`$progress` 长任务 |
-| M5 | completion/signatureHelp/inlayHint | `X.` 成员补全、`n"\|` UFUNCTION 名单、`UCLASS(` 说明符补全、命名参数补全四类截图验收 + `auto` 变量 inlay 类型展示 |
-| M6 | 诊断起步 | `AS0901-0903` 生效；`AS04xx` 按取证占号（进入 P5 流程，码表 §6 纪律） |
+| M3 | 查找链 + hover/definition | as-core 内置单测覆盖查找链 0-6 级命中序（§10），含 `super`、mixin 伪成员、struct 单层、访问器反向默认四类专项用例；as-cli 对语料批量 dump-index 校验 |
+| M4 | references/rename/workspaceSymbol + 重载消歧 | 重载函数引用消歧用例（成功/失败双路径）；`$/progress` 长任务；文件增删改名后索引一致性用例（§5.3） |
+| M5 | completion/signatureHelp/inlayHint | `X.` 成员补全、`n"\|` UFUNCTION 名单、`UCLASS(` 说明符补全、命名参数补全四类截图验收 + `auto` 变量 inlay 类型展示；**命名实参补全跳过 `InArgN` 占位**（架构设计 §2.4.6） |
+| M6 | 诊断起步 | `AS0901-0903` + `AS0905` 生效；`AS04xx` 按取证占号（进入 P5 流程，码表 §6 纪律） |
 
 对应架构设计 §6：M0-M2 ≈ P3 前半，M3-M5 ≈ P3 后半 + P4，M6 衔接 P5。
 扩展（模块四）在 M2 提前就位最小版（languageId + client + 配置项骨架），后续里程碑增量加命令。
@@ -365,6 +491,9 @@ pub fn resolve_overload(cands: &[DefId], args: &[TypeId]) -> Vec<Ranked>;
 | G3 | 模板实例化缓存膨胀 | TypeId intern 天然去重 + 深度上限 32；实测超限再加 LRU |
 | G4 | 增量联动失效粗粒度（类成员变更 → 全部成员访问缓存失效） | 441 文件量级预期无感；先正确后优化 |
 | G5 | `as04xx` 符号解析诊断码诱惑（实现中顺手报错） | 码表 §9 纪律：P5 前不得发明；顺手发现的问题记进码表待办而非代码 |
+| G6 | `.d.as` 数据源本身有缺陷（20 个 group 被覆盖、4 个 tag 零语料、无插件指纹） | 架构设计 §8 风险 7/8/6 已登记；LSP 侧不「修」数据源，只检出（`AS0905`）+ 用内置单测覆盖零语料形态 |
+| G7 | TypeId 规范形式被绕过 → intern 去重失效 | 构造入口私有化 + 随机组合单测（§3.3）；这是「相等即同一」不变量的唯一保护 |
+| G8 | 冷启动期编辑丢失 / overlay 与磁盘打架 | §5.1 overlay 唯一真值 + §6.1 发布后重放 `pending_dirty`；两者都需集成测试覆盖（先 `didOpen`+`didChange` 再等 Ready，断言索引含新符号） |
 
 ## 13. 变更记录
 
@@ -373,3 +502,5 @@ pub fn resolve_overload(cands: &[DefId], args: &[TypeId]) -> Vec<Ranked>;
 | v0.1 | 首版：crate 内部结构、ID 体系与数据模型、三阶段流水线精确时序（Phase1 即全量 parse 的裁决）、增量失效策略、并发模型、重载解析 API、M0-M6 里程碑与验收、开放问题 Q1-Q4 |
 | v0.2 | 测试策略定稿：单测源码内置（AGENTS.md 硬性规则）；golden 对账取消（决策记录 D2）；Q1-Q4 全部裁决，§11 改为索引 |
 | v0.3 | 挂接 [`实现优化.md`](实现优化.md)：§3 引用 `FileId`/`Sym` intern 实现模板（决策记录 D12/D13） |
+| v0.4 | D14 落地：新增 §4.2 表达式定型管线（`auto` 推导链、range-for 双跳协议）；§8.1 请求路由表与 §9 M5 新增 `inlayHint` |
+| v0.5 | 数据模型与生命周期补全（决策 D15-D18）：§3.2 `DefKind` 给出全集 + 新增 `DefFlags`、新增 §3.2.1（`TextRange` 字节偏移 + 行首偏移表）；§3.3 新增类型**规范形式**约束；§4 Phase 2 产物补 mixin 倒排 / module 归属表 / 行首偏移表，继承闭包限定为 class；§5 重写为「overlay + 编辑时序 + 文件增删改名（含 `.d.as` 防抖与 FileId 墓碑）」；新增 §6.1 冷启动编辑重放；§7.1 查找链改为 0-6 级、参数改字节偏移；§9 M1-M6 验收按新真值收紧；§12 新增 G6-G8 |

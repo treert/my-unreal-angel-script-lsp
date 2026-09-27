@@ -8,7 +8,7 @@
 | [`angelscript.bnf`](angelscript.bnf) | **形式化语法规范**（Layer A = 用户实际书写的 `.as` 源码）。改文法前先改 BNF。 |
 | `grammar.js` | Tree-sitter DSL 文法，按 BNF 实现（优先级表 §5.5、节点命名 §5.6、冲突清单 §5.4）。 |
 | `src/scanner.c` | 外部扫描器：格式化字符串 `f"..."` 的文本块与格式说明符（**手写，入库**）。 |
-| `test/corpus/` | 回归测试（声明 / 类型 / 语句 / 表达式 / 字面量 / 错误恢复），42 条，全部通过。 |
+| `test/corpus/` | 回归测试（声明 / 类型 / 语句 / 表达式 / 字面量 / 错误恢复），40 条，全部通过。 |
 | `.gitignore` | 生成物不入库：`src/parser.c`、`src/grammar.json`、`src/node-types.json`、`src/tree_sitter/`。 |
 
 > **生成物不进版本库**：克隆仓库后必须先 `npm install && npx tree-sitter generate`，
@@ -52,7 +52,28 @@ $named | Where-Object { $used -notcontains $_ }   # 输出为空即 100%
 终结符覆盖同理：从 `src/grammar.json` 抽取所有 `"type":"STRING"` 的 `value`，
 再在 corpus 的**源码段**（`===` 标题与 `---` 分隔符之间那一段）里查找。
 
-`.as` 与 `.d.as` 使用**同一 parser**（后者是前者的子集：函数体退化为 `;`）。
+## `.as` 与 `.d.as` 的关系：交叉，不是子集
+
+两者使用**同一 parser**，但**语法集合是交叉关系**——各有对方非法的独占构造。
+（早期文档写作「`.d.as` 是 `.as` 的子集」，**该表述错误**，已于 2026-09 修正。）
+
+| 只在 `.d.as` 合法（脚本侧写了必报错） | 引擎依据 |
+|---|---|
+| `type_parameters`：`struct TArray<T>` / `struct TMap<K,V>` | 模板声明头走独立入口 `ParseTemplateDecl`（`as_parser.cpp:176`），只服务 C++ 注册串；脚本走的 `ParseClass`（`:3774-3810`）标识符后只接受 `;`/`:`/`{`，不认 `<` |
+| `?` 通配类型 | 只能在 C++ 注册串里出现（`docs/架构设计-引擎内部语法.md` §1.1） |
+| `unresolved_object` 类型后缀 | 由绑定层 `FObjectPtrType` 生成，脚本作者不书写（同上 §3） |
+| `@templateSpecialization` + `class TArray<FVector>` | 模板实参是具体类型，脚本侧无此构造 |
+
+| 只在 `.as` 合法（`.d.as` 不出现） |
+|---|
+| 函数体 / 语句 / 表达式 / `default` 块（`.d.as` 一律 `;` 收尾） |
+| `delegate` / `event` / `asset` / `mixin` / `local` 声明 |
+| 局部 `auto`、range-for、f-string、预处理行 |
+
+**为什么措辞重要**：说成「子集」会诱发两个错误推论——① 反向推理「`.as` 能写的 `.d.as` 也能写」，
+从而漏掉「`.as` 里的模板定义头 / `?` / `unresolved_object` 必须报语义诊断」；
+② 以为 414 个 `.d.as` 零 ERROR 的语料验收能覆盖 `.as` 侧形态（或反之）。
+两侧各有独占构造，**验收口径必须分开算**。
 
 ### corpus 格式陷阱（踩过）
 
@@ -122,7 +143,16 @@ Get-ChildItem test\corpus\*.txt | ForEach-Object {
 3. **`(void)` 不是独立产生式**：解析为「单个类型为 `void` 的 `parameter`」。
    消费侧把「仅一个 void 形参」视作空参表。
 4. **模板声明头 `struct TMap<K, V>`**（BNF 未收录，`.d.as` 实际存在）：
-   新增 `type_parameters` / `type_parameter` 节点。
+   新增 `type_parameters` / `type_parameter` 节点。该形态是 `.d.as` 独有的——
+   引擎脚本侧根本不认（见上方「交叉，不是子集」表）。
+   **已实测通过**（2026-09）：`struct TArray<T>`、`struct TMap<K, V>`、`class TSubclassOf<T>`，
+   以及导出器的特化块 `// @templateSpecialization` + `class TArray<FVector>`
+   （`TypeDeclarationExporter.cpp:617-618`，模板**实参是具体类型**）——
+   四种形态**全部零 ERROR，文法无需改动**。
+   注意：`type_parameter` 节点**同时承载**类型形参（`T`）与具体实参（`FVector`），
+   语法层不区分；语义层按「声明前是否有 `@templateSpecialization` tag」消歧
+   （`docs/架构设计-引擎内部语法.md` §4.3）。
+   模板**实例**（使用位 `TArray<FVector> Arr;`）走的是 `template_type` 规则，不是本节点。
 5. **`enum` 尾随 `;` 可选**（BNF 写作必需，`.d.as` 导出不带 `;`）；
    `class` / `struct` / `namespace` / `asset` 的尾随 `;` 同样可选，且被贪婪吸收
    （`prec.right`），不会被误判为 `empty_declaration`。
@@ -155,6 +185,8 @@ Get-ChildItem test\corpus\*.txt | ForEach-Object {
 | 全局变量 / 类成员上的 `&` | `ParseDeclaration` 用 `!isClassProp && !isGlobalVar` 守卫引用后缀，只有**局部**变量能是引用。 |
 | 直接把赋值当实参 `f(a = b)` | 实参是 `ParseCondition()` 而非 ASSIGN；且 `a = b` 会被优先当成命名实参。 |
 | 裸 enum 值 `Value`（不带 `MyEnum::`） | `asEP_REQUIRE_ENUM_SCOPE = 1`，符号查找跳过裸值兜底分支（`as_compiler.cpp:11815`），落入通用「未找到」错误（诊断归 `AS04xx`，P3/P4 占号）。 |
+| **`.as` 里的模板声明头** `class TFoo<T> {...}` | 本文法接受（`type_parameters` 为 `.d.as` 而设，同一 parser 无法按后缀关闭）。引擎侧 `ParseClass` 在标识符后不认 `<` → **parse error `Expected '{'`**；UE 预处理器的类名正则也不含 `<>`（`AngelscriptPreprocessor.cpp:723`）。语义层须报诊断，待取证占号（码表 §7.1）。 |
+| **`.as` 里的 `?` / `unresolved_object`** | 同理：为 `.d.as` 而设的节点在 `.as` 中一律非法（引擎内部语法 §1.4 / §3.2）。 |
 
 > lambda 与 import 原先也在此表（语法放行 + `AS0107`/`AS0904` 语义诊断），
 > 2026-09 决策改为**文法层直接不实现**（见偏差 §8），两个诊断码随之 retired。
