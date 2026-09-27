@@ -25,9 +25,34 @@
         ],
         "extensions": [
           ".as"
-        ]
+        ],
+        "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "angelscript_snippet",
+        "aliases": [
+          "Angelscript Snippet"
+        ],
+        "extensions": []
       }
     ],
+    "grammars": [
+      {
+        "language": "angelscript-asl",
+        "scopeName": "source.angelscript",
+        "path": "./syntaxes/angelscript.tmLanguage.json"
+      },
+      {
+        "language": "angelscript_snippet",
+        "scopeName": "source.angelscript_snippet",
+        "path": "./syntaxes/angelscript_snippet.tmLanguage.json"
+      }
+    ],
+    "configurationDefaults": {
+      "[angelscript-asl]": {
+        "editor.tabSize": 4
+      }
+    },
     "semanticTokenScopes": [
       {
         "language": "angelscript-asl",
