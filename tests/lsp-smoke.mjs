@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 const exe = process.argv[2]
   ?? 'd:/WorkGit/my-angel-script-lsp/lsp/target/debug/as-lsp.exe';
 
-const src = 'class Foo : UObject\n{\n    int Count;\n    void Tick(float Delta)\n    {\n        Count = Count + 1;\n    }\n}\n';
+const src = 'class Foo : UObject\n{\n    int Count;\n    void Tick(float Delta)\n    {\n        Count = Count + 1;\n    }\n}\nUFUNCTION(Blueprint\nvoid GlobalFn() {}\n';
 const uri = 'file:///d%3A/WorkGit/UEProjs/SmokeTest.as';
 
 const p = spawn(exe, [], { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -127,6 +127,13 @@ send({
   params: { textDocument: { uri }, position: { line: 5, character: 23 } },
 });
 await sleep(400);
+// ---- M5c: completion ③（说明符语境：line 8 `UFUNCTION(Blueprint` 前缀
+// Blueprint → BlueprintCallable 等；char 19 = "Blueprint" 尾端点）----
+send({
+  jsonrpc: '2.0', id: 14, method: 'textDocument/completion',
+  params: { textDocument: { uri }, position: { line: 8, character: 19 } },
+});
+await sleep(400);
 send({ jsonrpc: '2.0', method: 'exit' });
 await sleep(800);
 
@@ -239,6 +246,16 @@ if (!items2.some((i) => i.label === 'Delta')) fail(`completion #13 missing local
 if (!items2.some((i) => i.label === 'Count')) fail(`completion #13 missing member 'Count': ${JSON.stringify(items2.map((i) => i.label))}`);
 if (!items2.some((i) => i.kind === 14)) fail(`completion #13 missing keyword kind: ${JSON.stringify(items2.slice(0, 5))}`);
 
+// ---- M5c: completion ③（说明符前缀 Blueprint）----
+const c3 = responses.get(14);
+if (!c3 || !c3.result) fail(`no completion response #14: ${JSON.stringify(c3)}`);
+const items3 = c3.result.items ?? c3.result;
+const ls3 = items3.map((i) => i.label);
+for (const want of ['BlueprintCallable', 'BlueprintEvent', 'BlueprintOverride', 'BlueprintPure']) {
+  if (!ls3.includes(want)) fail(`specifier completion missing '${want}': ${JSON.stringify(ls3)}`);
+}
+if (ls3.includes('Category')) fail(`specifier prefix should filter out 'Category': ${JSON.stringify(ls3)}`);
+
 // ---- M4: $/progress（references 长任务）----
 const progressMsgs = notifications.filter((n) => n.method === '$/progress');
 if (progressMsgs.length === 0) fail('no $/progress notifications for references');
@@ -262,6 +279,6 @@ if (typeof readyParams.floatIsFloat64 !== 'boolean') {
   fail(`indexStatus floatIsFloat64: ${JSON.stringify(readyParams)}`);
 }
 
-console.log(`SMOKE OK: legend ${legend.length} types, ${tokenCount} tokens, symbols OK, didOpen logged=${opened}, hover/definition/references/rename/workspaceSymbol/completion OK, $/progress msgs=${progressMsgs.length}, indexStatus files=${readyParams.files}`);
+console.log(`SMOKE OK: legend ${legend.length} types, ${tokenCount} tokens, symbols OK, didOpen logged=${opened}, hover/definition/references/rename/workspaceSymbol/completion(+specifier) OK, $/progress msgs=${progressMsgs.length}, indexStatus files=${readyParams.files}`);
 p.kill();
 process.exit(0);

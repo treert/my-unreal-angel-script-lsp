@@ -120,13 +120,18 @@ fn last_identifier(node: Node<'_>) -> Option<Node<'_>> {
 /// 说明符扫描：`private`/`protected` 前缀、`mixin`/`local` qualifier（前置）
 /// 与 `mixin` 后置属性、方法尾部 `const`。匿名 token 直接是声明节点的孩子，
 /// 不会误吞 type 节点内部的 const（那在更深层）。
+/// 另：函数声明的 `specifiers` 字段是 `ufunction_specifiers` → SCRIPT_UFUNCTION
+/// （M5c：UFUNCTION 名单候选的数据源，.d.as 侧对应 @ufunction/@event tag）。
 pub fn scan_flags(node: Node<'_>, src: &str) -> DefFlags {
     let mut flags = DefFlags::NONE;
-    for (_field, child) in children_with_fields(node) {
+    for (field, child) in children_with_fields(node) {
         if child.is_named() {
             if child.kind() == "function_attribute" && text(child, src) == "mixin" {
                 // 后置属性形式：`void Heal(...) mixin {}`（架构设计 §4.5.1）
                 flags |= DefFlags::MIXIN;
+            }
+            if field.as_deref() == Some("specifiers") && child.kind() == "ufunction_specifiers" {
+                flags |= DefFlags::SCRIPT_UFUNCTION;
             }
             continue;
         }

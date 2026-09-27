@@ -27,6 +27,7 @@ pub mod range;
 pub mod references;
 pub mod resolve;
 pub mod search;
+pub mod specifiers;
 pub mod symbol;
 pub mod syntax;
 pub mod tokens;

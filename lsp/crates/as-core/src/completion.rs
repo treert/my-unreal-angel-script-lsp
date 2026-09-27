@@ -95,6 +95,8 @@ pub fn complete_at(idx: &WorkspaceIndex, file: FileId, byte: u32) -> Vec<Candida
         Ctx::CallArg { callee, args } => {
             call_arg_candidates(idx, &ctx, src, callee, args, prefix.as_deref())
         }
+        Ctx::Specifier { macro_name } => specifier_candidates(macro_name, prefix.as_deref()),
+        Ctx::FNameUFunction { call } => fname_ufunction_candidates(idx, &ctx, src, call),
         Ctx::Plain => plain_candidates(idx, &ctx, prefix.as_deref()),
     };
     finish(out, prefix.as_deref())
@@ -115,6 +117,11 @@ enum Ctx<'t> {
     /// 正常形态来自 call_expression 的字段，错误恢复形态（未闭合实参表被
     /// ERROR 吞掉）来自 ERROR 的直接孩子。
     CallArg { callee: Node<'t>, args: Node<'t> },
+    /// 说明符宏参数位（`UCLASS(` / `UPROPERTY(Ca|` …）。M5c。
+    Specifier { macro_name: &'static str },
+    /// FName 字面量在 `AddUFunction(this, n"|")` 第 2 实参位（M5c）：
+    /// 候选 = 接收者类型的 UFUNCTION 名单。
+    FNameUFunction { call: Node<'t> },
     /// 裸标识符位置
     Plain,
 }
@@ -152,12 +159,19 @@ fn deepest_at<'t>(root: Node<'t>, byte: u32, src: &str) -> Option<Node<'t>> {
 }
 
 /// 光标处正在输入的标识符前缀（identifier 包含光标、以光标为尾）。
+/// FName 字面量（`n"Fo|"`）取引号内光标前文本（M5c UFUNCTION 名单语境）。
 fn prefix_at(node: Node<'_>, src: &str, byte: u32) -> Option<String> {
-    if node.kind() != "identifier" {
+    let (start, end) = if node.kind() == "name_literal" {
+        // 首 '"' 之后到字面量尾
+        let open = src[node.start_byte()..].find('"')? + node.start_byte() + 1;
+        (open, node.end_byte())
+    } else if node.kind() == "identifier" {
+        (node.start_byte(), node.end_byte())
+    } else {
         return None;
-    }
-    let start = node.start_byte() as u32;
-    let end = node.end_byte() as u32;
+    };
+    let start = start as u32;
+    let end = end as u32;
     if byte < start || byte > end {
         return None;
     }
@@ -172,10 +186,33 @@ fn detect_from<'t>(node: Node<'t>, src: &str, byte: u32) -> Ctx<'t> {
         match n.kind() {
             // 噪声语境：不给候选
             "comment" | "preproc_line" | "string_literal" | "heredoc_string"
-            | "format_string_content" | "format_spec" | "name_literal" => return Ctx::None,
-            // 说明符宏参数（M5c：Specifier 语境接入）
-            "macro_argument" | "macro_value" | "macro_argument_list" => return Ctx::None,
-            k if k.ends_with("_specifiers") => return Ctx::None,
+            | "format_string_content" | "format_spec" => return Ctx::None,
+            // FName 字面量：仅 `AddUFunction(this, n"|")` 第 2 实参位给
+            // UFUNCTION 名单（M5c——限定语境，非任何 n"" 都给）
+            "name_literal" => {
+                if let Some(call) = enclosing_call_of(n) {
+                    if let Some(f) = call.child_by_field_name("function") {
+                        if f.kind() == "identifier"
+                            && syntax::text(f, src) == "AddUFunction"
+                            && is_second_string_arg(call, n)
+                        {
+                            return Ctx::FNameUFunction { call };
+                        }
+                    }
+                }
+                return Ctx::None;
+            }
+            // 说明符宏参数：说明符名位 / 实参表位上溯到 *_specifiers 节点给
+            // schema 候选（M5c）；**值位**（macro_value——字符串/数字）不给。
+            // 引擎消费的四种宏给表（ustruct/umeta 无消费——specifiers.rs 取证）
+            "macro_value" => return Ctx::None,
+            "macro_argument" | "macro_argument_list" => {}
+            k if k.ends_with("_specifiers") => {
+                return match crate::specifiers::macro_of_specifier_node(k) {
+                    Some(m) => Ctx::Specifier { macro_name: m },
+                    None => Ctx::None,
+                };
+            }
             // 错误恢复形态：ERROR 吞掉了中途编辑的构造（缺 property 的成员
             // 访问 / 未闭合实参表）——按直接孩子归约
             "ERROR" => {
@@ -237,6 +274,30 @@ fn recover_error_ctx<'t>(err: Node<'t>, byte: u32) -> Option<Ctx<'t>> {
                 .find(|(_, c)| c.is_named() && c.end_byte() <= dot.start_byte());
             if let Some((_, o)) = obj {
                 return Some(Ctx::Member { object: *o });
+            }
+        }
+    }
+    // 形态 C（先于 B——宏 token 特征更强，否则宏的 "(" 会被当调用）：
+    // 宏参数中途（`UCLASS(Pla` 未闭合——uclass_specifiers 未形成，宏 token
+    // 与 "(" 是 ERROR 直接孩子）。光标在宏的 "(" 之后 → Specifier。
+    // 宏名 token 的 kind 即字面量文本（UCLASS/UFUNCTION/UPROPERTY/UENUM；
+    // USTRUCT/UMETA 引擎无消费不给——specifiers.rs 取证）
+    for (_, c) in children.iter() {
+        let macro_name = match c.kind() {
+            "UCLASS" => "UCLASS",
+            "UFUNCTION" => "UFUNCTION",
+            "UPROPERTY" => "UPROPERTY",
+            "UENUM" => "UENUM",
+            _ => continue,
+        };
+        if let Some((_, lp)) = children
+            .iter()
+            .skip_while(|(_, x)| x.id() != c.id())
+            .skip(1)
+            .find(|(_, x)| !x.is_named() && x.kind() == "(")
+        {
+            if byte > lp.start_byte() as u32 {
+                return Some(Ctx::Specifier { macro_name });
             }
         }
     }
@@ -566,8 +627,110 @@ fn provided_named_args(args: Node<'_>, src: &str, prefix: Option<&str>) -> HashS
 }
 
 // ---------------------------------------------------------------------------
-// Plain：裸标识符全集
+// Specifier：说明符 schema（M5c）
 // ---------------------------------------------------------------------------
+
+fn specifier_candidates(macro_name: &'static str, prefix: Option<&str>) -> Vec<Candidate> {
+    crate::specifiers::specifiers_of(macro_name)
+        .iter()
+        .filter(|s| prefix_match(s.name, prefix))
+        .map(|s| Candidate {
+            label: s.name.to_string(),
+            kind: CandidateKind::Keyword,
+            detail: Some(s.doc.to_string()),
+            // 带值说明符补 `Name=`（值由用户续写）；无值说明符与 label 同，
+            // 无需特殊插入
+            insert: s.takes_value.then(|| format!("{}=", s.name)),
+            sort_hint: 0,
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// FName：AddUFunction 第 2 实参的 UFUNCTION 名单（M5c）
+// ---------------------------------------------------------------------------
+
+/// name_literal 所属的 call_expression（其 argument 包装的父链上溯）。
+fn enclosing_call_of<'t>(lit: Node<'t>) -> Option<Node<'t>> {
+    let mut cur = lit.parent();
+    while let Some(p) = cur {
+        if p.kind() == "call_expression" {
+            return Some(p);
+        }
+        if p.kind() != "argument" {
+            return None; // 越过 argument 还没到 call：不是调用实参
+        }
+        cur = p.parent();
+    }
+    None
+}
+
+/// 该 name_literal 是否为调用的第 2 个实参（argument 顺序计数，
+/// `AddUFunction(this, n"|", ...)` 的函数名位）。
+fn is_second_string_arg(call: Node<'_>, lit: Node<'_>) -> bool {
+    let Some(args) = call.child_by_field_name("arguments") else { return false };
+    syntax::children_with_fields(args)
+        .into_iter()
+        .filter(|(_, c)| c.kind() == "argument")
+        .nth(1)
+        .is_some_and(|(_, a)| {
+            // 字面量直接是 argument 的孩子；或经 named_argument 包装（不常见）
+            lit.parent().is_some_and(|p| p.id() == a.id())
+                || lit.parent().is_some_and(|p| {
+                    p.parent().is_some_and(|gp| gp.id() == a.id())
+                })
+        })
+}
+
+/// UFUNCTION 名单：接收者（第 1 实参定型，通常 this）类型的成员中——
+/// 脚本侧 `UFUNCTION()` 宏（SCRIPT_UFUNCTION flag）∪ `.d.as` 侧
+/// `@ufunction`/`@event` tag（TagKind::UFunction/Event）——的方法名。
+fn fname_ufunction_candidates(
+    idx: &WorkspaceIndex,
+    ctx: &SemCtx,
+    src: &str,
+    call: Node<'_>,
+) -> Vec<Candidate> {
+    // callee 必须是 AddUFunction（n"" 其它场景不给——限定语境）
+    let Some(f) = call.child_by_field_name("function") else { return Vec::new() };
+    if f.kind() != "identifier" || syntax::text(f, src) != "AddUFunction" {
+        return Vec::new();
+    }
+    // 接收者：第 1 实参定型（this → 所在类）；失败回落 ctx.type_def
+    let args = syntax::children_with_fields(call)
+        .into_iter()
+        .filter(|(_, c)| c.kind() == "argument")
+        .map(|(_, c)| c)
+        .collect::<Vec<_>>();
+    let recv = args
+        .first()
+        .and_then(|a| expr_type(idx, ctx, src, *a).map(|t| t.base))
+        .or(ctx.type_def);
+    let Some(recv) = recv else { return Vec::new() };
+    let space = member_search_space(idx, recv);
+    let mut out = Vec::new();
+    let mut seen: HashSet<Sym> = HashSet::new();
+    for &t in &space {
+        let Some(ms) = idx.members.get(&t) else { continue };
+        for &m in ms {
+            let d = idx.def(m);
+            if d.kind != DefKind::Method && d.kind != DefKind::Function {
+                continue;
+            }
+            let is_ufunc = d.flags.contains(DefFlags::SCRIPT_UFUNCTION)
+                || d.tags.iter().any(|tag| {
+                    matches!(
+                        tag.kind,
+                        crate::decl_tags::TagKind::UFunction | crate::decl_tags::TagKind::Event
+                    )
+                });
+            if is_ufunc && seen.insert(d.name) {
+                out.push(def_candidate(idx, m, 0));
+            }
+        }
+    }
+    out
+}
 
 const HINT_NAMED_ARG: u8 = 10;
 const HINT_MEMBER: u8 = 20;
@@ -1107,6 +1270,109 @@ void F()
         let file = file_of("unique://cmp/noise.as");
         assert!(complete_at(&idx, file, at(SRC, "// comment", 5)).is_empty(), "注释内不补");
         assert!(complete_at(&idx, file, at(SRC, "\"inside", 3)).is_empty(), "字符串内不补");
+    }
+
+    // ------------------------------------------------------------------
+    // M5c：说明符 schema / FName UFUNCTION 名单
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn specifier_completion_by_macro() {
+        // 真实形态：宏挂声明前（UCLASS→class / UFUNCTION→function），
+        // 光标在宏参数表内
+        const SRC: &str = "\
+UCLASS(Pla
+class C
+{
+}
+UFUNCTION(
+void F() {}
+";
+        let idx = build(&[("unique://cmp/spec.as", SRC)]);
+        let file = file_of("unique://cmp/spec.as");
+        // UCLASS(Pla| ：光标在 Pla 尾端点（needle 10 字符）→ 前缀 Pla
+        let cands = complete_at(&idx, file, at(SRC, "UCLASS(Pla", 10));
+        let ls = labels(&cands);
+        assert_eq!(ls, vec!["Placeable"], "前缀 Pla: {ls:?}");
+        // UFUNCTION(| ：全表（首项按 label 序）
+        let cands = complete_at(&idx, file, at(SRC, "UFUNCTION(", 10));
+        let ls = labels(&cands);
+        assert!(ls.contains(&"BlueprintCallable".to_string()), "UFUNCTION 表: {ls:?}");
+        assert!(ls.contains(&"Meta".to_string()), "UFUNCTION 表: {ls:?}");
+        assert!(!ls.contains(&"EditAnywhere".to_string()), "不串 UPROPERTY 表: {ls:?}");
+    }
+
+    #[test]
+    fn specifier_value_position_empty() {
+        // 宏值位（macro_value / 字符串内）不给候选
+        const SRC: &str = "\
+UFUNCTION(Category=\"Math\")
+void F() {}
+";
+        let idx = build(&[("unique://cmp/specval.as", SRC)]);
+        let file = file_of("unique://cmp/specval.as");
+        // "Math" 字符串内
+        assert!(complete_at(&idx, file, at(SRC, "\"Math", 3)).is_empty(), "宏值字符串内不给");
+    }
+
+    #[test]
+    fn specifier_prefix_filter_and_insert() {
+        const SRC: &str = "\
+UFUNCTION(Blue
+void F() {}
+";
+        let idx = build(&[("unique://cmp/specpfx.as", SRC)]);
+        let file = file_of("unique://cmp/specpfx.as");
+        // 光标在 Blue 尾端点（needle 14 字符）→ 前缀 Blue
+        let cands = complete_at(&idx, file, at(SRC, "UFUNCTION(Blue", 14));
+        let ls = labels(&cands);
+        for want in ["BlueprintCallable", "BlueprintEvent", "BlueprintOverride", "BlueprintPure", "BlueprintProtected"] {
+            assert!(ls.contains(&want.to_string()), "前缀 Blue 应含 {want}: {ls:?}");
+        }
+        assert!(!ls.contains(&"Category".to_string()), "Cat 不匹配 Blue 前缀: {ls:?}");
+        let bc = cands.iter().find(|c| c.label == "BlueprintCallable").unwrap();
+        assert_eq!(bc.insert.as_deref(), None, "无值说明符原样插入");
+        let cat = crate::specifiers::specifiers_of("UFUNCTION")
+            .iter()
+            .find(|s| s.name == "Category")
+            .unwrap();
+        assert_eq!(cat.insert(), "Category=", "带值说明符补 =");
+    }
+
+    #[test]
+    fn fname_ufunction_list_for_addufunction() {
+        const SRC: &str = "\
+class C
+{
+    UFUNCTION()
+    void MyEvent() {}
+    void PlainFn() {}
+    void Bind()
+    {
+        AddUFunction(this, n\"My
+    }
+}
+";
+        let idx = build(&[("unique://cmp/fname.as", SRC)]);
+        let file = file_of("unique://cmp/fname.as");
+        // 光标在 n"My 之后（第 2 实参、前缀 My）
+        let cands = complete_at(&idx, file, at(SRC, "n\"My", 4));
+        let ls = labels(&cands);
+        assert_eq!(ls, vec!["MyEvent"], "UFUNCTION 名单 + 前缀 My: {ls:?}");
+    }
+
+    #[test]
+    fn fname_other_name_literals_empty() {
+        // 非 AddUFunction 第 2 实参的 n"" 不给候选（限定语境）
+        const SRC: &str = "\
+void F()
+{
+    FName N = n\"Any
+}
+";
+        let idx = build(&[("unique://cmp/fname2.as", SRC)]);
+        let file = file_of("unique://cmp/fname2.as");
+        assert!(complete_at(&idx, file, at(SRC, "n\"Any", 5)).is_empty());
     }
 
     #[test]

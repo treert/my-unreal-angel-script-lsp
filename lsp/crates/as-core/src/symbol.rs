@@ -116,6 +116,9 @@ impl DefFlags {
     pub const NOT_CALLABLE: DefFlags = DefFlags(1 << 7);
     /// 形参名是 InArgN 占位（§2.4.6），命名实参补全须跳过
     pub const UNNAMED_PARAM: DefFlags = DefFlags(1 << 8);
+    /// 脚本方法带 `UFUNCTION(...)` 宏前缀（M5c：`AddUFunction(this, n"|")`
+    /// 的 UFUNCTION 名单候选；`.d.as` 侧对应 `@ufunction`/`@event` tag）
+    pub const SCRIPT_UFUNCTION: DefFlags = DefFlags(1 << 9);
 
     pub const NONE: DefFlags = DefFlags(0);
 
