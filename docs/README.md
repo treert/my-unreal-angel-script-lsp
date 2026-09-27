@@ -37,7 +37,8 @@ AGENTS.md（仓库说明 + 测试硬性规则）
 | 设计阶段 | ✅ 收官（D1-D24 定案，无阻塞项） |
 | M0 Cargo workspace + as-syntax + dump-tree | ✅ 完成（`lsp/` 四 crate 就位，依赖单向图成立；27 `.as` + 414 `.d.as` dump 零 ERROR，与 grammar P2 验收同口径） |
 | M1 as-core 三阶段 + dump-index + tag 解析 | ✅ 完成（Phase 1 rayon 并行 parse + Phase 2 成员表/继承闭包/类型归一化；15 tag 全解析；对账：type_count 13814 vs manifest 14864、member_count 63338 vs 69337——差额 ≈ 20 个被覆盖 group 的 1050 个类型及其成员，与风险 7 相符；继承环/struct 无闭包/float 双取值/4 零语料 tag 均有内置单测；**D25**：基础类型为合成 builtin DefId） |
-| M2-M6 实现 | ⬜ 待开工（里程碑与验收见 [`LSP实现规划.md`](LSP实现规划.md) §9） |
+| M2 as-lsp 壳 + documentSymbol/semanticTokens/folding + VSCode 扩展最小版 | ✅ 代码完成（tower-lsp-server + 增量同步 + overlay；legend 19 类 wire 名与 Hazelight 对齐 `as_typename`…；扩展 languageId `angelscript-asl` + 配置骨架 + cargo 开发模式。**VSCode 体感验收与 Hazelight 截图对照待人工执行**：F5 扩展开发宿主打开 Demo_AS/Script） |
+| M3-M6 实现 | ⬜ 待开工（里程碑与验收见 [`LSP实现规划.md`](LSP实现规划.md) §9） |
 
 ### 开工前的已知待办（不阻塞 M0/M1，但须在对应里程碑前处理）
 

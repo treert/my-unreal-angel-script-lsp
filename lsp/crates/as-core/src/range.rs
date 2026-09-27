@@ -78,6 +78,34 @@ impl LineIndex {
         (line as u32, col16)
     }
 
+    /// LSP `Position`（0 起行 + UTF-16 列）→ 字节偏移。越界取边界值。
+    /// as-lsp 边界专用（增量编辑的 range 换算）。
+    pub fn offset_of_utf16(&self, text: &str, line: u32, col16: u32) -> u32 {
+        let line = line as usize;
+        if line >= self.line_starts.len() {
+            return text.len() as u32;
+        }
+        let start = self.line_starts[line] as usize;
+        let line_end = if line + 1 < self.line_starts.len() {
+            self.line_starts[line + 1] as usize
+        } else {
+            text.len()
+        };
+        let mut col = 0u32;
+        let mut offset = start;
+        for (i, ch) in text[start..line_end].char_indices() {
+            if ch == '\n' || ch == '\r' {
+                break;
+            }
+            if col >= col16 {
+                return (start + i) as u32;
+            }
+            col += ch.len_utf16() as u32;
+            offset = start + i + ch.len_utf8();
+        }
+        offset as u32
+    }
+
     /// 1 起行 + 1 起字节列（dump / 调试输出用；不是 LSP 语义）。
     pub fn line_col_debug(&self, byte: u32) -> (u32, u32) {
         let line = self.line_of(byte);

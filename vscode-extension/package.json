@@ -1,0 +1,149 @@
+{
+  "name": "my-angel-script-lsp",
+  "displayName": "my-as-lsp (Unreal Angelscript)",
+  "description": "Unreal Angelscript language support backed by tree-sitter + Rust LSP (my-as-lsp)",
+  "version": "0.1.0",
+  "publisher": "my-as-lsp",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:angelscript-asl"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "angelscript-asl",
+        "aliases": [
+          "Angelscript (my-as-lsp)"
+        ],
+        "extensions": [
+          ".as"
+        ]
+      }
+    ],
+    "semanticTokenScopes": [
+      {
+        "language": "angelscript-asl",
+        "scopes": {
+          "as_typename": [
+            "support.type.angelscript"
+          ],
+          "as_typename_component": [
+            "support.type.component.angelscript"
+          ],
+          "as_typename_actor": [
+            "support.type.actor.angelscript"
+          ],
+          "as_typename_delegate": [
+            "support.type.delegate.angelscript"
+          ],
+          "as_typename_event": [
+            "support.type.event.angelscript"
+          ],
+          "as_typename_struct": [
+            "support.type.struct.angelscript"
+          ],
+          "as_typename_primitive": [
+            "storage.type.primitive.angelscript"
+          ],
+          "as_namespace": [
+            "entity.name.namespace.angelscript"
+          ],
+          "as_template_base_type": [
+            "support.type.angelscript"
+          ],
+          "as_parameter": [
+            "variable.parameter.angelscript"
+          ],
+          "as_local_variable": [
+            "variable.other.local.angelscript"
+          ],
+          "as_member_variable": [
+            "variable.other.property.angelscript"
+          ],
+          "as_member_accessor": [
+            "variable.other.property.accessor.angelscript"
+          ],
+          "as_global_variable": [
+            "variable.other.global.angelscript"
+          ],
+          "as_global_accessor": [
+            "variable.other.global.accessor.angelscript"
+          ],
+          "as_member_function": [
+            "entity.name.function.member.angelscript"
+          ],
+          "as_global_function": [
+            "entity.name.function.angelscript"
+          ],
+          "as_unknown_error": [
+            "invalid"
+          ],
+          "as_access_specifier": [
+            "support.type.access_specifier.angelscript"
+          ]
+        }
+      }
+    ],
+    "configuration": {
+      "title": "my-as-lsp",
+      "properties": {
+        "myAngelScriptLsp.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "as-lsp 可执行文件的绝对路径。留空时（开发模式）自动 `cargo run -p as-lsp`。"
+        },
+        "myAngelScriptLsp.typeDeclarationDirs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "${workspaceFolder}/Saved/AS-Cache"
+          ],
+          "description": ".d.as 类型声明目录（UE 导出插件输出处）。支持 ${workspaceFolder}。"
+        },
+        "myAngelScriptLsp.scriptRoots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": ".as 脚本搜索根；留空 = 全部 workspace 根。"
+        },
+        "myAngelScriptLsp.floatIsFloat64": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "对应引擎设置 `bScriptFloatIsFloat64`（AngelscriptSettings.h，引擎默认 `true`）：裸 `float` 按 `float64`（true）还是 `float32`（false）解析。**若项目在 DefaultEngine.ini 改过引擎设置，必须同步此项**——配错是静默错误（类型宽度偏差且无任何报错）。"
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "myAngelScriptLsp.restartServer",
+        "title": "my-as-lsp: Restart Language Server"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "node esbuild.js --production",
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.80.0",
+    "esbuild": "^0.23.0",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}

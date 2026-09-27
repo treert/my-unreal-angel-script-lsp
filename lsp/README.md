@@ -9,9 +9,9 @@ my-as-lsp 的 LSP 核心层（架构设计模块三）。架构与里程碑的**
 ```
 crates/
 ├── as-syntax/   # tree-sitter 包装：build.rs 用 cc 编译 ../../grammar 的生成物
-├── as-core/     # 索引/类型/查找链（纯库：无 IO、无 async）—— M0 仅 ID/intern 骨架
-├── as-lsp/      # LSP server 壳 —— M0 占位 stub（M2 引入 tower-lsp-server）
-└── as-cli/      # 调试与验收工具（dump-tree；dump-index 随 M1 就位）
+├── as-core/     # 索引/类型/查找链（纯库：无 IO、无 async）+ outline/tokens CST 映射
+├── as-lsp/      # LSP server 壳（tower-lsp-server）：增量同步、overlay、M2 三请求
+└── as-cli/      # 调试与验收工具（dump-tree / dump-index）
 ```
 
 依赖严格单向，禁止环：
@@ -20,6 +20,10 @@ crates/
 as-lsp ──► as-core ──► as-syntax
 as-cli ──► as-core
 ```
+
+as-lsp 现有能力（M2）：`documentSymbol` / `foldingRange` / `semanticTokens(full)`
+（legend 19 类，wire 名与 Hazelight 对齐——`as_typename` 等）+ textDocumentSync
+Incremental + `myAngelScriptLsp.*` 配置读取。hover/definition 等随 M3。
 
 ## 前置：先生成 grammar
 
@@ -39,8 +43,30 @@ npx tree-sitter generate    # grammar.js -> src/parser.c
 ```powershell
 cargo build --workspace     # 构建全部 crate
 cargo test  --workspace     # 单元测试（.as 用例全部内置于 Rust 源码，见 AGENTS.md 硬性规则）
-cargo run -p as-lsp         # M0 stub：打印版本退出
+cargo run -p as-lsp         # LSP server（stdio；一般由 VSCode 扩展拉起，不手动跑）
 ```
+
+server 冒烟（initialize 握手，不依赖 VSCode）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ..\tests\lsp-smoke.ps1
+# 预期：SMOKE OK + serverInfo: my-as-lsp + legend: as_typename present
+```
+
+## VSCode 扩展（`../vscode-extension/`，M2 最小版）
+
+开发模式（F5「扩展开发宿主」即可用）：`serverPath` 留空时自动
+`cargo run -p as-lsp --manifest-path <仓库>/lsp/Cargo.toml`。
+构建：
+
+```powershell
+cd ..\vscode-extension
+npm install
+npm run compile     # esbuild -> dist/extension.js
+```
+
+languageId 为 `angelscript-asl`（避开 Hazelight 扩展的 `angelscript`）；
+`.as` 后缀的关联归属由两扩展的启用状态决定，需要体感对照时可临时禁用其一。
 
 ## as-cli：dump-tree
 

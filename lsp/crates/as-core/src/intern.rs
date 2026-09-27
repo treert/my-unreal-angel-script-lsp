@@ -129,6 +129,11 @@ pub fn intern_file(path: &str, root_index: u32) -> FileId {
     id
 }
 
+/// 只读查询：路径是否已注册（不创建）。as-lsp 用它把 URI 映射到 overlay。
+pub fn file_id_of_path(path: &str) -> Option<FileId> {
+    files().read().unwrap().by_path.get(path).copied()
+}
+
 /// 取文件元数据（含墓碑行；`alive` 由调用方过滤）。
 pub fn file_meta(file: FileId) -> Option<FileMeta> {
     files().read().unwrap().by_id.get(file.as_usize()).cloned()
