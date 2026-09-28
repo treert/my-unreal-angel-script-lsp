@@ -123,7 +123,7 @@
         "myAngelScriptLsp.serverPath": {
           "type": "string",
           "default": "",
-          "description": "as-lsp 可执行文件的绝对路径。留空时（开发模式）自动 `cargo run -p as-lsp`。"
+          "description": "as-lsp 可执行文件的绝对路径。留空时（开发模式）自动 `cargo run -p as-lsp`（profile 由 tools/test-extension.ps1 的 -Release 决定，缺省 debug）。"
         },
         "myAngelScriptLsp.typeDeclarationDirs": {
           "type": "array",

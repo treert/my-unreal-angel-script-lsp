@@ -10,6 +10,7 @@
  * - 状态栏：💛 starting → 💚 ready（tooltip 常显 floatIsFloat64 生效值——
  *   架构设计 §8 风险 11 的既定缓解项）→ ⚠️ failed。
  */
+import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import {
@@ -76,12 +77,37 @@ function resolveServerOptions(
     };
   }
 
-  // 开发模式：从本仓库的 lsp workspace 用 cargo 起 server
+  // 开发模式：从本仓库的 lsp workspace 用 cargo 起 server（增量编译后启动）。
+  // profile 由 tools/test-extension.ps1 写入 lsp/target/.build-profile
+  //（-Release 开关），缺省 debug——不用环境变量：`code` CLI 在 VS Code
+  // 已运行时只通过 IPC 转发开窗请求，EDH 不继承脚本 shell 的环境。
+  const profile = readDevBuildProfile(context);
+  log(`dev server profile: ${profile}`);
   const manifest = path.join(context.extensionPath, '..', 'lsp', 'Cargo.toml');
   return {
     command: 'cargo',
-    args: ['run', '--quiet', '-p', 'as-lsp', '--manifest-path', manifest],
+    args: [
+      'run', '--quiet',
+      ...(profile === 'release' ? ['--release'] : []),
+      '-p', 'as-lsp', '--manifest-path', manifest,
+    ],
   };
+}
+
+/** 读脚本（tools/test-extension.ps1）写入的 dev 构建 profile 标记。 */
+function readDevBuildProfile(
+  context: vscode.ExtensionContext
+): 'debug' | 'release' {
+  const marker = path.join(
+    context.extensionPath, '..', 'lsp', 'target', '.build-profile'
+  );
+  try {
+    const value = fs.readFileSync(marker, 'utf8').trim();
+    if (value === 'release' || value === 'debug') return value;
+  } catch {
+    // 未 build 过（target/ 不存在）或读取失败：回退 debug
+  }
+  return 'debug';
 }
 
 function logConfigSnapshot(): void {

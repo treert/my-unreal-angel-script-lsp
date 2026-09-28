@@ -71,7 +71,9 @@ node ..\tests\lsp-smoke.mjs
 ## VSCode 扩展（`../vscode-extension/`，M2 最小版）
 
 开发模式（F5「扩展开发宿主」即可用）：`serverPath` 留空时自动
-`cargo run -p as-lsp --manifest-path <仓库>/lsp/Cargo.toml`。
+`cargo run -p as-lsp --manifest-path <仓库>/lsp/Cargo.toml`；profile
+（debug/release）读 `lsp/target/.build-profile`（`tools\test-extension.ps1
+-Release` 写入，缺省 debug）。
 构建：
 
 ```powershell

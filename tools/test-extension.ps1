@@ -1,28 +1,57 @@
-#
-# Launch (or restart) the my-as-lsp Extension Development Host.
-#
-# Usage:
-#   tools/test-extension.ps1 [-SkipBuild] [-SkipLsp] [-SkipExt] [-Target <path>]
-#
-# -SkipBuild         Skip both LSP build and extension compile.
-# -SkipLsp           Skip LSP build only.
-# -SkipExt           Skip extension compile only.
-#
-# -Target <path>     Open any directory or .code-workspace file.
-#                   (default: paths.test_as from config/paths.local.yaml)
-#
-# NOTE on profiles: the extension's dev mode hardwires
-#   `cargo run --quiet -p as-lsp` (debug). Building here only warms the
-#   cargo cache so the EDH starts fast. To test a release binary, set
-#   `myAngelScriptLsp.serverPath` to lsp/target/release/as-lsp.exe in the
-#   target workspace settings instead.
+<#
+.SYNOPSIS
+Launch (or restart) the my-as-lsp Extension Development Host.
 
+.DESCRIPTION
+Builds the LSP server (debug or release) and the VS Code extension, kills any
+existing Extension Development Host, then launches a new one via `code`/`cursor`.
+
+.PARAMETER SkipBuild
+Skip both LSP build and extension compile.
+
+.PARAMETER SkipLsp
+Skip LSP build only.
+
+.PARAMETER SkipExt
+Skip extension compile only.
+
+.PARAMETER Release
+Build LSP with `cargo build --release` (default: debug). The profile is
+written to lsp/target/.build-profile; the extension's dev mode reads it and
+launches the server with `cargo run --release` accordingly.
+
+.PARAMETER Target
+Open any directory or .code-workspace file.
+(default: paths.test_as from config/paths.local.yaml)
+
+.EXAMPLE
+tools/test-extension.ps1
+Launch EDH with debug LSP, default test workspace.
+
+.EXAMPLE
+tools/test-extension.ps1 -Release -SkipExt
+Launch EDH with release LSP (rebuild if stale), skip extension compile.
+
+.EXAMPLE
+tools/test-extension.ps1 -Target D:\proj\MyGame.code-workspace
+Launch EDH opening a custom workspace.
+#>
 param(
     [switch]$SkipBuild,
     [switch]$SkipLsp,
     [switch]$SkipExt,
-    [string]$Target = ""
+    [switch]$Release,
+    [string]$Target = "",
+    # -h shorthand (PowerShell auto-handles -? for comment-based help)
+    [Alias("h")]
+    [switch]$Help
 )
+
+if ($Help) {
+    # Same content as -? / Get-Help: comment-based help above.
+    Get-Help $PSCommandPath -Detailed
+    exit 0
+}
 
 $ErrorActionPreference = "Stop"
 
@@ -52,6 +81,22 @@ if (Test-Path $ConfigFile) {
 
 $DefaultTarget = $Paths["test_as"]
 $EdhMarker = "extensionDevelopmentPath=$ExtDir"
+
+# ── Resolve build profile ─────────────────────────────────────────────
+$BuildProfile = if ($Release) { "release" } else { "debug" }
+# NOTE: [string[]] cast is required. PowerShell unwraps single-element arrays
+# returned from `if` to a scalar string, which would then be splatted as a
+# char array ("build" → b u i l d), causing `cargo: unexpected argument 'u'`.
+[string[]]$CargoBuildArgs = if ($Release) { @("build", "--release") } else { @("build") }
+
+# The extension's dev mode reads this marker to pick the cargo profile.
+# Env vars don't survive the `code` CLI: when VS Code is already running, the
+# CLI just forwards the open-window request over IPC, and the new EDH inherits
+# the environment of the *running* main process, not this shell. target/ is
+# gitignored and cargo leaves unknown files alone, so this is a stable side
+# channel. cargo clean removes it — harmless, dev mode falls back to debug
+# (and a cleaned target needs a rebuild anyway).
+$ProfileMarker = Join-Path $RepoRoot "lsp" "target" ".build-profile"
 
 # ── Resolve launch target ─────────────────────────────────────────────
 if ($Target -ne "") {
@@ -84,9 +129,9 @@ if (Get-Command "code" -ErrorAction SilentlyContinue) {
 
 # ── Step 1: Build LSP server ──────────────────────────────────────────
 if (-not $SkipBuild -and -not $SkipLsp) {
-    Write-Host "==> [1/4] Building LSP server (cargo build [debug])..."
+    Write-Host "==> [1/4] Building LSP server (cargo build [$BuildProfile])..."
     Push-Location (Join-Path $RepoRoot "lsp")
-    & cargo build
+    & cargo @CargoBuildArgs
     if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
     Pop-Location
 } else {
@@ -124,7 +169,15 @@ if ($edhProcesses) {
 }
 
 # ── Step 4: Launch Extension Development Host ─────────────────────────
-Write-Host "==> [4/4] Launching Extension Development Host ($EditorCli) [debug]..."
+# Write the profile marker even when the build was skipped: the caller's
+# intent (-Release) is what matters, and `cargo run` rebuilds if needed.
+$ProfileDir = Split-Path $ProfileMarker -Parent
+if (-not (Test-Path $ProfileDir)) {
+    New-Item -ItemType Directory -Path $ProfileDir -Force | Out-Null
+}
+Set-Content -Path $ProfileMarker -Value $BuildProfile -NoNewline
+
+Write-Host "==> [4/4] Launching Extension Development Host ($EditorCli) [$BuildProfile]..."
 Write-Host "    Extension: $ExtDir"
 Write-Host "    Target ($LaunchTargetLabel): $LaunchTarget"
 
@@ -146,5 +199,5 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host ""
-Write-Host "==> Done! Extension Development Host launched with $LaunchTargetLabel."
+Write-Host "==> Done! Extension Development Host launched with $LaunchTargetLabel ($BuildProfile)."
 Write-Host "    Run again to restart."
