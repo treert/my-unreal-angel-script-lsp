@@ -1,6 +1,6 @@
 # 索引架构（per-file summary + 薄聚合层 + 按需定型）
 
-> 版本 v1.0（2026-09-28）
+> 版本 v1.1（2026-09-28）
 >
 > **定位**：索引层的**重构设计稿**。现行架构（三阶段流水线、全局扁平符号 arena、
 > use-site 预收集）的替代方案。驱动因素：冷启动性能（414 `.d.as` ~1s 仍偏慢且
@@ -95,8 +95,8 @@ pub struct FileSummary {
     pub decls: Vec<RawDecl>,
     /// 名字 → 局部 id 倒排（本文件内查找，含重载组）
     pub by_name: HashMap<Sym, Vec<u32>>,
-    /// 局部定型表（§3.3）：函数体内的局部/形参/迭代变量
-    pub locals: Vec<LocalDeclEntry>,
+    /// 局部作用域树（§3.3）：函数体内的局部/形参/迭代变量 + 预推导类型
+    pub scope_tree: ScopeTree,
 }
 
 pub struct RawDecl {
@@ -140,27 +140,56 @@ pub struct FileEntry {           // 替代 FileSnapshot
 **不再有**：`uses: Vec<UseSite>`（→ §6 查询期）、`errors`（已删，诊断期
 按需 `verify_tree`，`has_error` 剪枝）。
 
-### 3.3 局部定型表（summary 期可做的推导）
+### 3.3 scope_tree（局部作用域树 + 局部定型）
 
-参考 mylua scope_tree，但 AS 更简单——**无 lambda 即无逃逸**，块作用域
-顺序扫描一趟即可。推导产物一律是 `SynType`（名字），**不是** DefId；
-推不出的保留 `Auto`（宁缺毋假，语义与现状一致）。
+**FileSummary 必含 scope_tree**（mylua `scope.rs` 同构，定案——曾考虑
+扁平局部表，否决：遮蔽语义下每次查询都要现场重建树形关系，不如提取期
+一次建好）。结构（设计稿形态）：
 
-summary 期能解的（零全局依赖）：
+```rust
+pub struct ScopeTree {
+    /// 作用域 arena：块 / 函数体 / for-range 体各一节点，parent 指针
+    scopes: Vec<Scope>,
+}
+
+pub struct Scope {
+    pub parent: Option<u32>,
+    pub span: TextRange,                // 块 span（查询点包含判定）
+    pub decls: Vec<LocalDecl>,
+}
+
+pub struct LocalDecl {
+    pub name: Sym,
+    pub kind: LocalKind,                // Var / Param / IterVar / LocalFn
+    pub name_span: TextRange,           // 声明锚点（rename/definition）
+    /// 预推导类型（§3.3.1）；推不出 = None（查询期补）
+    pub ty: Option<SynType>,
+}
+```
+
+**查询原语**（L3 各功能共用）：`resolve_local(tree, byte, name)`——
+定位最内层包含 byte 的 scope，沿 parent 链上溯找最近声明（遮蔽天然
+正确）；`locals_visible(tree, byte)`——completion 候选用。
+
+**AS 简化**（相对 mylua）：无 lambda / 闭包逃逸 → 树只反映语法块嵌套，
+无捕获拷贝、无 upvalue 记账；`local` 函数的**模块级**可见性不在这棵树
+（那是 L2 的 `module_files` 职责），树里只有函数体内的局部。
+
+#### 3.3.1 summary 期可做的局部推导
+
+建树同趟完成。推导产物一律是 `SynType`（名字），**不是** DeclRef；
+推不出的保留 `None`（宁缺毋假，语义与现状一致）。
 
 | 模式 | 结果 |
 |---|---|
 | `Cast<T>(x)` | `Named(T)` —— 名字直接抄，不解 |
 | `auto X = FVector(1,2,3)` | 构造调用 → 显式类型名（本文件可见） |
-| `auto X = OtherLocal` | 复制已定型局部的名字（顺序扫描） |
+| `auto X = OtherLocal` | 复制已定型局部的名字（同趟顺序扫描） |
 | 字面量 | `1`→int、`1.5`→float（按配置归一）、`n"…"`→FName、f-string→FString（D25） |
 
 **推不出的**（跨文件传播，如 `auto X = Actor.GetComponent()`）：保留
-`Auto`，L3 查询期补。**预推导是加速器，不是真值源**——命中率高低不影响
+`None`，L3 查询期补。**预推导是加速器，不是真值源**——命中率高低不影响
 正确性。
-
-结构取舍（实现期验证项）：完整 scope_tree vs 扁平局部表 + 块 span 区间
-二分。倾向后者（省内存），AS 无闭包逃逸使扁平表语义等价。
 
 ### 3.4 并行与确定性
 
@@ -388,7 +417,7 @@ append-only 内存单调涨与重映射复杂度——旧设计不迁就（用�
 | Aggregation.main + contributions | GlobalShard + uri_to_paths | AS 扁平名字空间（无 Lua 的 `a.b.c` 树形贡献） |
 | 查询期 references | references.rs find_word_occurrences + verify | verify 逻辑 = 既有查找链，不用重写 |
 | 诊断调度 | diagnostic_scheduler.rs | 优先级队列 + 300ms 防抖，可直接移植结构 |
-| 局部定型表 | scope_tree | AS 无 lambda，扁平表可能够用（§3.3 验证项） |
+| scope_tree | scope.rs | AS 无 lambda：树只反映语法块嵌套，无捕获/upvalue 记账；`resolve_local` / `locals_visible` 两原语即覆盖全部消费方 |
 
 ---
 
@@ -396,7 +425,7 @@ append-only 内存单调涨与重映射复杂度——旧设计不迁就（用�
 
 | # | 内容 | 验收 |
 |---|---|---|
-| 1 | `FileSummary` / `RawDecl` 类型 + `extract_summary` 纯函数（从 `extract_decl` 平移，输出改局部 id） | 单测：summary 内容等价断言（对照现有索引逐字段） |
+| 1 | `FileSummary` / `RawDecl` / `ScopeTree` 类型 + `extract_summary` 纯函数（从 `extract_decl` 平移，输出改局部 id；scope_tree 建树同趟，参考 mylua scope.rs） | 单测：summary 内容等价断言（对照现有索引逐字段）；scope_tree 遮蔽 / for-range / 形参用例 |
 | 2 | `Aggregation` + 冷启动单临界区构建 + 候选排序 | 单测：排序规则；对账 type_count/member_count 不回归 |
 | 3 | L3 数据后端切换：DeclRef + fetch 访问器替换 DefId 直查（resolve/expr/completion/hover/inlay/outline/tokens/signature） | 全部既有单测绿（这是最大的一步，靠 138+ 单测兜底） |
 | 4 | 闭包/mixin/合成成员/TypeTable 改按需 + 缓存 | 单测：走链等价（含环 / unresolved / struct mixin） |
@@ -416,9 +445,8 @@ append-only 内存单调涨与重映射复杂度——旧设计不迁就（用�
 | 1 | DefId → DeclRef 改动面大（几十处消费点） | 切分步骤 3 独立成步；fetch 访问器先行；138 单测 + 语料对账兜底 |
 | 2 | 重载组顺序语义变化（注册序 → 文件序+源码序） | §4.2 排序规则单测；消歧单测全量过 |
 | 3 | workspaceSymbol 实时展开性能 | §7；实现期量化，超阈值再加缓存 |
-| 4 | 局部定型表扁平化是否够用 | §3.3 验证项；不够再升级 scope_tree |
-| 5 | references 全库扫在超大工作区的延迟 | 预留 rayon；先按 mylua 实测接受 |
-| 6 | 双源 `.d.as`（多副本）同名冲突排序 | 沿用 root_index 优先级（§4.2）；多副本消解仍属 D24 搁置项 |
+| 4 | references 全库扫在超大工作区的延迟 | 预留 rayon；先按 mylua 实测接受 |
+| 5 | 双源 `.d.as`（多副本）同名冲突排序 | 沿用 root_index 优先级（§4.2）；多副本消解仍属 D24 搁置项 |
 
 ---
 
@@ -426,4 +454,5 @@ append-only 内存单调涨与重映射复杂度——旧设计不迁就（用�
 
 | 版本 | 日期 | 内容 |
 |---|---|---|
+| v1.1 | 2026-09-28 | **scope_tree 升级为 FileSummary 必含组件**（§3.3 重写）：否决「扁平局部表」倾向——遮蔽语义下每次查询都要现场重建树形关系（区间包含 + 深度比较），resolve 第 1 级 / completion 局部候选 / references 逐点验证 / inlay 全依赖它，不如提取期一次建好；结构定案（Scope arena + parent 链 + LocalDecl 含预推导类型）、两查询原语（`resolve_local` / `locals_visible`）、AS 简化点（无 lambda ⇒ 无捕获记账；`local` 函数模块级可见性归 L2）；风险 4（扁平表验证项）随之移除 |
 | v1.0 | 2026-09-28 | 首版：三层模型（per-file summary / 薄聚合层 / 按需定型）；D5/D23/D29 翻案裁决；mixin 名字倒排简化；auto-only 推导边界与局部定型表；references 查询期化；DefId → DeclRef 一步到位；实施切分 7 步 |
