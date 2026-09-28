@@ -45,7 +45,7 @@
 | # | 事项 | 现状 | 登记处 |
 |---|---|---|---|
 | 3.1 | 成员访问解析缓存的精确联动失效 | 类成员集合变化 ⇒ 全部缓存失效；441 文件量级实测无感（ref-stats 全语料 <1s），不达标再收敛为「依赖该类的文件集」 | 规划 §5.2 / §12 G4 |
-| 3.2 | didChange 诊断推送防抖 | 每次同步计算（`verify_tree` O(文件) 毫秒级）；体感卡顿再补 ~200ms 防抖 | D36 第 5 条 |
+| 3.2 | ~~didChange 诊断推送防抖~~ | ✅ 已完成（Phase D / D40，2026-09-28）：300ms 防抖调度队列（`DiagnosticScheduler`，D36 翻案）——本条所防的「体感卡顿」场景已整体消除 | D40 |
 
 ## 4. 数据源与工具链缺陷（LSP 侧不可修 / 只能报）
 
@@ -62,7 +62,7 @@
 | 5.1 | **VSCode 体感验收（M2-M6 五批）** | 唯一**积欠**的验收硬项：semanticTokens 渲染对照（M2）、hover/F12（M3）、references/F2/Ctrl+T（M4）、四类补全 + inlay + InArgN 断言（M5）、诊断红线 + 抑制注释（M6）。执行方式见 lsp/README 各里程碑验收段第 ⑤ 步 | 各里程碑验收段 |
 | 5.2 | `Export Type Declarations` 命令转发 | 架构设计 §5 列的三个命令只落了 `restartServer`；此命令依赖引擎在线通道（P6）或提示用户在 UE 编辑器执行 | 架构设计 §5 |
 | 5.3 | `Dump Syntax Tree` 调试命令 | 同上未做；可先行（调 as-cli，不依赖 P6） | 架构设计 §5 |
-| 5.4 | `.d.as` 目录自动发现 | **已搁置**（D24）：需先解消多副本双源冲突（`Saved/AS-Cache` 与版本库过期副本同时入索引 ⇒ 双定义 + 静默错误）；消解规则占新码 `AS0907`。继续用 `typeDeclarationDirs` 显式配置 | D24 搁置项 / docs/README 待办表 #5 |
+| 5.4 | `.d.as` 目录自动发现 | **已搁置**（D24）：需先解消多副本双源冲突（`Saved/AS-Cache` 与版本库过期副本同时入索引 ⇒ 双定义 + 静默错误）；消解规则占新码 ~~`AS0907`~~ `AS0908`（原预占号被 Phase D 继承环占用，码表 v1.0 为准）。继续用 `typeDeclarationDirs` 显式配置 | D24 搁置项 / docs/README 待办表 #5 |
 
 ## 6. 文档修缮 ✎
 
@@ -75,6 +75,7 @@
 
 | 版本 | 内容 |
 |---|
+| v0.4 | Phase D（D40）连带修订：3.2 诊断防抖已完成（`DiagnosticScheduler` 300ms，D36 翻案）；5.4 预占号 `AS0907` → `AS0908`（被继承环占用，码表 v1.0 为准） |
 | v0.3 | 新增 2.5（rename 无 `.d.as` 只读保护——Phase B e2e 探针观察项，实测 89 文件 / 2848 编辑）；修 6.2 重复行
 | v0.2 | 6.1 完成（grammar README 偏差 §3 + grammar.js 同源注释按实测改写：裸 `(void)` 不可达、带名 `void X` 可达但零语料） |
 | v0.1 | 首版（M6 完成后）：汇总 P5/P6 主线、语义近似（模板实例化 / mixin shadow / 隐式转换 / preproc）、性能收敛、数据源缺陷（group 冲突 / EnhancedInput / f-string 文法）、扩展侧（体感验收积欠 / 命令补全 / 自动发现搁置）、文档修缮（grammar README §3） |
