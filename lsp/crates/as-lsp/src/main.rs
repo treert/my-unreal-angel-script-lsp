@@ -11,6 +11,7 @@
 //! UTF-16 ↔ 字节换算只在本层发生（经 as-core `range.rs` 原语，§3.2.1）。
 
 mod diag;
+mod diagnostic_scheduler;
 mod docs;
 mod watch;
 mod workspace;
