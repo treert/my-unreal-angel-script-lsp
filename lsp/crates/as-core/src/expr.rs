@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use as_syntax::tree_sitter::Node;
 
 use crate::aggregation::DeclRef;
-use crate::id::{Sym, TypeId};
+use crate::id::Sym;
 use crate::intern::{intern_sym, sym_str};
 use crate::resolve::{
     builtin_target, find_accessors, member_search_space, members_named, resolve_callee,
@@ -44,7 +44,7 @@ use crate::resolve::{
 use crate::summary::RawExtra;
 use crate::symbol::{DefFlags, DefKind};
 use crate::syntax;
-use crate::types::{SynType, TypeKind};
+use crate::types::SynType;
 use crate::workspace::Workspace;
 
 /// 表达式的定型结果：成员查找基 + 声明侧语法类型。
@@ -566,14 +566,11 @@ fn def_expr_ty(ws: &Workspace, def: DeclRef) -> Option<ExprTy> {
             Some(ExprTy { base: def, syn: Some(syn_of_base(ws, def)) })
         }
         DefKind::Field | DefKind::GlobalVar | DefKind::VirtualProperty | DefKind::AssetDecl => {
-            match def_decl_syn(ws, def) {
-                Some(syn) => Some(ExprTy { base: syn_type_base(ws, &syn)?, syn: Some(syn) }),
-                None => {
-                    // 声明类型缺失时回落归一化表（resolved）
-                    let &t = ws.resolved.get(&def)?;
-                    Some(ExprTy { base: named_base(ws, t)?, syn: None })
-                }
-            }
+            // C7（Phase C）：原「声明类型缺失时回落 resolved 归一化表」经语料
+            // 取证 0 命中（触发条件 Variable{ty:None} 与填充条件
+            // Variable{ty:Some} 不相交）——死路径删除。
+            let syn = def_decl_syn(ws, def)?;
+            Some(ExprTy { base: syn_type_base(ws, &syn)?, syn: Some(syn) })
         }
         _ => None,
     }
@@ -687,18 +684,6 @@ fn type_def_of(ws: &Workspace, name: Sym) -> Option<DeclRef> {
             let d = ws.decl(&r);
             d.kind.is_type_like() && !d.flags.contains(DefFlags::SYNTHETIC)
         })
-}
-
-/// TypeId 剥壳取具名基类（workspace::resolve_syn 产物的只读消费）。
-fn named_base(ws: &Workspace, t: TypeId) -> Option<DeclRef> {
-    let mut cur = t;
-    loop {
-        match ws.types.get(cur) {
-            TypeKind::Named { def, .. } => return Some(*def),
-            TypeKind::Ref(inner, _) | TypeKind::Const(inner) | TypeKind::Array(inner) => cur = *inner,
-            _ => return None,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1138,5 +1123,46 @@ class A
         let r = resolve_at(&ws, file, off(SRC, "R.Handled") + 2).unwrap();
         assert_eq!(r.level, LEVEL_MEMBER);
         assert_eq!(first_name(&ws, &r), "Handled");
+    }
+
+    #[test]
+    fn syn_type_base_float_normalizes_by_config() {
+        // 原 workspace.rs float_dual_config_normalization 的继任（C7）：裸
+        // float 归一化的活跃消费点自本期起唯一存在于 syn_type_base
+        use crate::range::TextRange;
+        let mk = |f64cfg: bool| {
+            Workspace::build(
+                IndexConfig { float_is_float64: f64cfg },
+                vec![FileInput {
+                    file: intern_file("unique://exprflt/f.as", 0),
+                    kind: FileKind::Script,
+                    source: String::new(),
+                    module: None,
+                }],
+            )
+        };
+        let syn = SynType::Primitive(intern_sym("float"), TextRange::new(0, 0));
+        for (cfg, expect) in [(true, "float64"), (false, "float32")] {
+            let ws = mk(cfg);
+            let base = syn_type_base(&ws, &syn).expect("内建 float 必命中");
+            assert_eq!(sym_str(ws.decl(&base).name), expect);
+        }
+    }
+
+    #[test]
+    fn syn_type_base_template_targets_container() {
+        // 原 workspace.rs template_field_type_resolution 的继任（C7）：模板
+        // 使用位的成员查找落点 = 模板本体；实参替换（template_map/subst_syn）
+        // 由 expr.rs 既有模板用例覆盖
+        use crate::range::TextRange;
+        const SRC: &str = "struct TArray<T> { }\nstruct FVector { }\n";
+        let ws = build(&[("unique://exprtpl/t.as", SRC)]);
+        let syn = SynType::Template {
+            name: intern_sym("TArray"),
+            name_span: TextRange::new(0, 0),
+            args: vec![SynType::Named(intern_sym("FVector"), TextRange::new(0, 0))],
+        };
+        let base = syn_type_base(&ws, &syn).unwrap();
+        assert_eq!(sym_str(ws.decl(&base).name), "TArray");
     }
 }

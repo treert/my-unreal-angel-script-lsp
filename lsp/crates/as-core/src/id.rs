@@ -4,11 +4,12 @@
 //! |----|-------|------|
 //! | `FileId` | 文件注册表（`intern.rs`） | 一个已加载的 `.as` / `.d.as` 文本 |
 //! | `Sym` | 字符串 intern（`intern.rs`） | 标识符 / 名字 |
-//! | `TypeId` | 类型表（`types.rs`） | 一个归一化类型 |
 //!
 //! Phase B（D37）：`DefId`（全局符号 arena 下标）删除——声明的存储形态是
 //! per-file 的 `summary::RawDecl`，跨文件锚点是 `aggregation::DeclRef`
 //! （`{file, local}` 二元组，文件重索引不扰动其他文件）。
+//! Phase C（D39）：`TypeId`（类型表下标）随 TypeTable 退役（C7）——定型走
+//! DeclRef + SynType 双件套（expr），M3 若需类型身份再按当期需求设计。
 //! 接口不变量类骨架（实现优化 §1.1 判据）：这些类型第一天就位，任何模块
 //! 都不得用裸字符串 / 裸下标替代。
 
@@ -42,12 +43,6 @@ macro_rules! define_u32_id {
 define_u32_id!(
     /// 已加载文件的 id。注册表见 `intern.rs`：append-only + 墓碑（D18）。
     FileId
-);
-
-define_u32_id!(
-    /// 归一化类型的 id（类型表下标，M1 落地）。构造只能经 `intern_type()`，
-    /// 修饰符须先排到规范形式（LSP实现规划 §3.3，D17）。
-    TypeId
 );
 
 /// intern 过的符号名（lasso `Spur` 的 newtype：u32，相等即同一字符串）。

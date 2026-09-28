@@ -388,23 +388,6 @@ fn dump_index(
     // 继承与类型解析健康度
     let mut unresolved_bases = 0usize;
     let mut classes_with_base = 0usize;
-    let type_jobs: usize = ws
-        .files
-        .values()
-        .map(|e| {
-            e.summary
-                .decls
-                .iter()
-                .filter(|d| {
-                    !d.flags.contains(DefFlags::SYNTHETIC)
-                        && matches!(
-                            d.kind,
-                            DefKind::Field | DefKind::GlobalVar | DefKind::AssetDecl | DefKind::VirtualProperty
-                        )
-                })
-                .count()
-        })
-        .sum();
     let mut classes_total = 0usize;
     let mut chain_links = 0usize;
     for (&file, entry) in ws.files.iter() {
@@ -432,13 +415,7 @@ fn dump_index(
         ws.agg.mixin_by_name.len(),
         ws.agg.mixin_by_name.values().map(Vec::len).sum::<usize>()
     );
-    println!(
-        "types: interned {}, variable decl types resolved {}/{}",
-        ws.types.len(),
-        ws.resolved.len(),
-        type_jobs
-    );
-    println!("build: {build_elapsed:?} (parse+summary rayon | aggregation+derived serial)");
+    println!("build: {build_elapsed:?} (parse+summary rayon | aggregation serial)");
 
     // --sym：查符号明细
     if let Some(name) = sym_filter {

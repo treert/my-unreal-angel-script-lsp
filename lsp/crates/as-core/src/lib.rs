@@ -48,7 +48,7 @@ pub use as_syntax;
 pub use decl_tags::{DocBlock, SemanticTag, TagKind, TagValue};
 pub use diag::{script_diags, Diag, DiagCode, DiagSeverity, Suppression};
 pub use hover::{hover_markdown, render_doc, render_syn, signature};
-pub use id::{FileId, Sym, TypeId};
+pub use id::{FileId, Sym};
 pub use aggregation::{Aggregation, DeclRef};
 pub use config::IndexConfig;
 pub use outline::{document_symbols, folding_ranges, Fold, FoldKind, OutlineKind, OutlineSymbol};
@@ -62,7 +62,7 @@ pub use resolve::{
 };
 pub use symbol::{BaseRef, DefFlags, DefKind, ParamDecl};
 pub use tokens::{semantic_tokens, SemanticToken, LEGEND};
-pub use types::{RefKind, SynType, TypeKind, TypeTable};
+pub use types::{RefKind, SynType};
 pub use workspace::{
     filename_to_module_name, FileInput, FileKind, SyntheticMember, Workspace,
 };

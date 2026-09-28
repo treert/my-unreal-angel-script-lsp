@@ -9,7 +9,7 @@
 //! references（重载消歧）、hover（选中候选）。M3 仅 hover 接入。
 
 use crate::aggregation::DeclRef;
-use crate::id::{Sym, TypeId};
+use crate::id::Sym;
 use crate::intern::{intern_sym, sym_str};
 use crate::summary::RawExtra;
 use crate::types::SynType;
@@ -36,11 +36,12 @@ pub struct Ranked {
 }
 
 /// 重载解析：候选按可服务性降序（同分保持声明序——sort 稳定）。
-/// 参数是实参的归一化类型（个数即可区分当前骨架的全部得分）。
+/// 参数是实参的基类型（个数即可区分当前骨架的全部得分——C7：TypeId
+/// 退役，DeclRef 承载；活跃路径 `disambiguate` 传 `Option<DeclRef>`）。
 pub fn resolve_overload(
     ws: &Workspace,
     cands: &[DeclRef],
-    args: &[TypeId],
+    args: &[DeclRef],
 ) -> Vec<Ranked> {
     let mut out: Vec<Ranked> = cands
         .iter()
@@ -154,8 +155,8 @@ mod tests {
         ws.lookup(intern_sym(name)).to_vec()
     }
 
-    fn args(n: usize) -> Vec<TypeId> {
-        vec![TypeId::from_raw(0); n]
+    fn args(n: usize) -> Vec<DeclRef> {
+        vec![DeclRef { file: crate::id::FileId::from_raw(0), local: 0 }; n]
     }
 
     /// 用例源码全部内置（AGENTS.md 硬性规则 / D1）。
