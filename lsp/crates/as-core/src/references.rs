@@ -21,7 +21,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::id::{DefId, FileId};
+use crate::id::{DefId, FileId, Sym};
 use crate::index::WorkspaceIndex;
 use crate::range::TextRange;
 use crate::resolve::{self, Target};
@@ -150,6 +150,149 @@ pub fn find_references(idx: &WorkspaceIndex, targets: &[RefTarget]) -> Vec<(File
     out
 }
 
+// ---------------------------------------------------------------------------
+// 查询期 references（D5 翻案 / index-architecture §6，Phase B1：
+// 先对旧 WorkspaceIndex 实现——B3 平移到 Workspace 后倒排路径整体删除）
+// ---------------------------------------------------------------------------
+
+/// 词边界搜索（大小写敏感）：`word` 在 `src` 的全部出现起始字节偏移。
+/// 边界 = `[A-Za-z0-9_]` 之外（防 `Health` 误中 `GetHealthTime`）。
+/// 命中含注释 / 字符串 / 声明名——由调用方逐点解析验证滤掉（超集过滤）。
+pub fn find_word_occurrences(src: &str, word: &str) -> Vec<u32> {
+    let bytes = src.as_bytes();
+    let w = word.as_bytes();
+    debug_assert!(!w.is_empty());
+    let is_id = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + w.len() <= bytes.len() {
+        if &bytes[i..i + w.len()] == w {
+            let left_ok = i == 0 || !is_id(bytes[i - 1]);
+            let right_end = i + w.len();
+            let right_ok = right_end >= bytes.len() || !is_id(bytes[right_end]);
+            if left_ok && right_ok {
+                out.push(i as u32);
+            }
+        }
+        // 无匹配处快进：找下一个候选首字节
+        i += 1;
+    }
+    out
+}
+
+/// 查询目标的名字集合（Def 组名字 ∪ 局部变量名字——局部名字从声明锚点
+/// 的 CST 节点取回）。返回 `(Sym, 源文本)` 对，去重。
+fn query_names(idx: &WorkspaceIndex, targets: &[RefTarget]) -> Vec<(Sym, &'static str)> {
+    let mut out: Vec<(Sym, &'static str)> = Vec::new();
+    for t in targets {
+        match *t {
+            RefTarget::Def(id) => {
+                let name = idx.def(id).name;
+                let s = crate::intern::sym_str(name);
+                if !out.iter().any(|(n, _)| *n == name) {
+                    out.push((name, s));
+                }
+            }
+            RefTarget::Local { file, span } => {
+                // 局部名字：声明锚点处的 CST 节点文本
+                if let Some(snap) = idx.files.get(&file) {
+                    if let Some(node) = snap
+                        .tree
+                        .root_node()
+                        .descendant_for_byte_range(span.start as usize, span.end as usize)
+                    {
+                        let s = node.utf8_text(snap.source.as_bytes()).unwrap_or("");
+                        let name = crate::intern::intern_sym(s);
+                        if !out.iter().any(|(n, _)| *n == name) {
+                            out.push((name, crate::intern::sym_str(name)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 查询期 references（字符串搜 + 逐点解析验证，mylua 同构）。
+/// 语义与 [`find_references`]（倒排路径）完全一致——站点解析集合 ∩ 查询
+/// 集合 ≠ ∅ 即命中；`strict`（rename）= 解析唯一且等于目标。
+pub fn find_references_query(
+    idx: &WorkspaceIndex,
+    targets: &[RefTarget],
+    strict: bool,
+) -> Vec<(FileId, TextRange)> {
+    let names = query_names(idx, targets);
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let has_def_target = targets.iter().any(|t| matches!(t, RefTarget::Def(_)));
+    // 文件级 rayon 并行（设计稿 §6.2 预留）：文件间完全独立，resolve 只读。
+    // 串行实测 10MB 语料 ~700ms/查询（逐 occurrence 全链解析），并行后
+    // 进入可接受区间；文件内仍串行（保持命中序 = 源码序）。
+    use rayon::prelude::*;
+    let mut out: Vec<(FileId, TextRange)> = idx
+        .files
+        .par_iter()
+        .flat_map_iter(|(&file, snap)| {
+            // 局部变量目标：引用天然限声明所在文件（Def 目标才全库扫）
+            if !has_def_target {
+                let declared_here = targets.iter().any(|t| match *t {
+                    RefTarget::Local { file: f, .. } => f == file,
+                    RefTarget::Def(_) => false,
+                });
+                if !declared_here {
+                    return Vec::new();
+                }
+            }
+            let root = snap.tree.root_node();
+            let mut hits: Vec<u32> = Vec::new();
+            for (_, word) in &names {
+                hits.extend(find_word_occurrences(&snap.source, word));
+            }
+            hits.sort_unstable();
+            hits.dedup();
+            let mut file_hits = Vec::new();
+            for off in hits {
+                let Some(node) = root.descendant_for_byte_range(off as usize, off as usize + 1)
+                else {
+                    continue;
+                };
+                // 命中必须是 identifier 节点本身（注释 / 字符串 / 类型 token 滤掉）
+                if node.kind() != "identifier" || node.start_byte() as u32 != off {
+                    continue;
+                }
+                let Some(res) = resolve::resolve_at_node(idx, file, &snap.source, node) else {
+                    continue;
+                };
+                // 声明名位点不计引用（旧路径 UseSite 提取排除声明名——
+                // `is_decl_name`；此处按解析级数等价排除）
+                if res.level == crate::resolve::LEVEL_DECL_SELF {
+                    continue;
+                }
+                let mut matched = false;
+                for t in &res.targets {
+                    let rt = match t {
+                        Target::Def(id) => RefTarget::Def(origin_fallback(idx, *id)),
+                        Target::Local(l) => RefTarget::Local { file, span: l.name_span },
+                    };
+                    if targets.contains(&rt) && (!strict || res.targets.len() == 1) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if matched {
+                    file_hits
+                        .push((file, crate::range::TextRange::new(off, node.end_byte() as u32)));
+                }
+            }
+            file_hits
+        })
+        .collect::<Vec<_>>();
+    out.sort_by_key(|(f, s)| (*f, s.start, s.end));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,6 +342,70 @@ mod tests {
                 Target::Local(l) => RefTarget::Local { file, span: l.name_span },
             })
             .collect()
+    }
+
+    // ------------------------------------------------------------------
+    // 查询期内核（B1）：词边界搜索 + 与倒排路径的等价性
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn word_occurrences_respect_boundaries() {
+        let src = "Health GetHealthTime HealthX MyHealth Health";
+        let hits = find_word_occurrences(src, "Health");
+        // 只命中独立词：首尾两处；前缀/后缀/中缀全部排除
+        assert_eq!(hits, vec![0, 38], "词边界过滤（源串长 44，尾词起始 38）");
+        assert_eq!(find_word_occurrences("health Health", "Health"), vec![7], "大小写敏感");
+        assert!(find_word_occurrences("abc", "abcd").is_empty(), "超长不命中");
+    }
+
+    #[test]
+    fn query_time_matches_inverted_index() {
+        // 覆盖：跨文件 / 重载组（消歧失败报全部）/ 局部变量（限本文件）/
+        // 声明名不计 / f-string 插值段
+        const A: &str = "\
+int Counter = 0;
+void Target2() {}
+void OverloadFn(int A) {}
+void OverloadFn(float B) {}
+void F()
+{
+    int Local = 1;
+    int X = Local + Counter;
+    Print(f\"{Local}\");
+    OverloadFn(X);
+    OverloadFn(1.5);
+}
+";
+        const B: &str = "\
+void G()
+{
+    int Local = 9;   // 另一文件的同名局部——不串
+    Target2();
+    OverloadFn(1);
+}
+";
+        let idx = build(&[("unique://qtime/a.as", A), ("unique://qtime/b.as", B)]);
+        let fa = file_of("unique://qtime/a.as");
+        let queries: Vec<(u32, &str)> = vec![
+            (off(A, "Counter = 0"), "全局变量（声明名锚点查询）"),
+            (off(A, "Target2() {}"), "跨文件函数"),
+            (nth(A, "OverloadFn(", 2), "重载组"),
+            (off(A, "Local + Counter"), "局部变量"),
+        ];
+        for (byte, what) in queries {
+            let targets = query_at(&idx, fa, A, byte);
+            let old = find_references(&idx, &targets);
+            let new = find_references_query(&idx, &targets, false);
+            assert_eq!(old, new, "两法结果不等（{what}）: old {old:?} vs new {new:?}");
+        }
+        // 局部变量：另一文件同名局部不得串
+        let targets = query_at(&idx, fa, A, off(A, "Local + Counter"));
+        let hits = find_references_query(&idx, &targets, false);
+        assert!(hits.iter().all(|(f, _)| *f == fa), "局部限本文件");
+        // 声明名不计：Counter 全部引用 = 使用点 1 处（声明除外）
+        let targets = query_at(&idx, fa, A, off(A, "Counter = 0"));
+        let hits = find_references_query(&idx, &targets, false);
+        assert_eq!(hits.len(), 1, "声明位点不计引用");
     }
 
     // ------------------------------------------------------------------

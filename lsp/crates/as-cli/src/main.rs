@@ -584,6 +584,61 @@ fn dump_index(
             if sites == 0 { 0.0 } else { resolved as f64 / sites as f64 * 100.0 },
             start.elapsed()
         );
+
+        // B1 A/B 对账：引用最多的 top-20 名字，倒排路径 vs 查询期路径
+        //（字符串扫 + 逐点解析验证）结果必须逐位相等——D5 翻案的语料级验证
+        use as_core::references::{find_references, find_references_query};
+        use as_core::id::Sym;
+        let mut top: Vec<(usize, Sym)> = idx
+            .ref_index
+            .iter()
+            .map(|(sym, fs)| (fs.len(), *sym))
+            .collect();
+        top.sort_by(|a, b| b.0.cmp(&a.0));
+        let t_ab = std::time::Instant::now();
+        let mut ab_fail = 0usize;
+        let mut old_total = 0usize;
+        let mut new_total = 0usize;
+        let mut old_elapsed = std::time::Duration::ZERO;
+        let mut new_elapsed = std::time::Duration::ZERO;
+        for (_, sym) in top.iter().take(20) {
+            // 目标 = 该名字的全部声明（重载组整体——references 的真实查询形态）
+            let targets: Vec<as_core::RefTarget> = idx
+                .main
+                .get(sym)
+                .map(|ds| ds.iter().copied().map(as_core::RefTarget::Def).collect())
+                .unwrap_or_default();
+            if targets.is_empty() {
+                continue;
+            }
+            let t0 = std::time::Instant::now();
+            let old = find_references(&idx, &targets);
+            old_elapsed += t0.elapsed();
+            let t1 = std::time::Instant::now();
+            let new = find_references_query(&idx, &targets, false);
+            new_elapsed += t1.elapsed();
+            old_total += old.len();
+            new_total += new.len();
+            if old != new {
+                ab_fail += 1;
+                println!(
+                    "  AB MISMATCH {}: old {} hits vs new {} hits",
+                    as_core::intern::sym_str(*sym),
+                    old.len(),
+                    new.len()
+                );
+            }
+        }
+        println!(
+            "  A/B (top-20 names): old {old_total} hits | query {new_total} hits | {} | old {:?} / query {:?} (rayon)",
+            if ab_fail == 0 { "MATCH" } else { "MISMATCH" },
+            old_elapsed,
+            new_elapsed,
+        );
+        let _ = t_ab;
+        if ab_fail > 0 {
+            return ExitCode::FAILURE;
+        }
     }
 
     if n_err > 0 || read_failures > 0 || bad_utf8 > 0 {
