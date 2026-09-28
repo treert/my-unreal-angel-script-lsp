@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- `missing-type-decls` diagnostic (a warning on every script file when no
+  `.d.as` type declarations are indexed): standalone scripts that don't
+  reference engine types no longer get warned. `undefined-function` remains
+  skipped while no `.d.as` is indexed (engine functions are unresolvable
+  there), so no false positives are introduced.
+
 ## [0.1.1] - 2026-09-28
 
 ### Added
@@ -15,8 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   callee unresolved through the full lookup chain — the same resolution used
   by hover / goto definition) are now reported as errors. Suppressible per line
   with `// as-ignore: undefined-function`. Skipped entirely when no `.d.as`
-  type declarations are indexed (`missing-type-decls` already covers that
-  case).
+  type declarations are indexed (engine functions are unresolvable there).
 
 ## [0.1.0] - 2026-09-28
 

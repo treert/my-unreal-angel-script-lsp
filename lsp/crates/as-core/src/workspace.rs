@@ -247,8 +247,8 @@ impl Workspace {
             })
     }
 
-    /// 是否存在真实 `.d.as` 声明文件（builtin 伪文件不算——诊断 missing-type-decls 的
-    /// 「decl 计数」口径与旧架构对齐）。
+    /// 是否存在真实 `.d.as` 声明文件（builtin 伪文件不算——undefined-function
+    /// 的 decl 缺失门控口径，与旧架构对齐）。
     pub fn has_decl_files(&self) -> bool {
         let builtin = intern_file(BUILTIN_FILE_PATH, u32::MAX);
         self.files.iter().any(|(&f, e)| f != builtin && e.kind == FileKind::Decl)

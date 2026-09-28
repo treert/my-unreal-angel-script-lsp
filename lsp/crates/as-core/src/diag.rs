@@ -31,10 +31,6 @@ use as_syntax::tree_sitter::Tree;
 /// **禁止实现里出现未登记的 code 字符串**（G5：统一走本枚举）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum DiagCode {
-    /// `missing-type-decls`：typeDeclarationDirs 全为空，或目录下无任何
-    /// `.d.as` ⇒ 引擎类型不可解析（工作区级事实，按打开文档逐个发布，
-    /// range = (0,0)）。
-    MissingTypeDecls,
     /// `parse-error`：解析错误（tree-sitter `ERROR`/`MISSING` 节点）——已知
     /// 文法缺口的最小闭环（如 f-string 嵌套格式说明符，grammar/README §9）。
     ParseError,
@@ -50,10 +46,10 @@ pub enum DiagCode {
 
 impl DiagCode {
     /// 抑制注释里的码字面量 → 枚举（未知码返回 None——静默忽略，与 D15
-    /// 「未登记 tag 静默忽略」同族考量）。
+    /// 「未登记 tag 静默忽略」同族考量；retired 码如 `missing-type-decls`
+    /// 同样落 None）。
     pub fn parse(s: &str) -> Option<DiagCode> {
         match s {
-            "missing-type-decls" => Some(DiagCode::MissingTypeDecls),
             "parse-error" => Some(DiagCode::ParseError),
             "cyclic-inheritance" => Some(DiagCode::CyclicInheritance),
             "undefined-function" => Some(DiagCode::UndefinedFunction),
@@ -65,7 +61,6 @@ impl DiagCode {
 impl std::fmt::Display for DiagCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            DiagCode::MissingTypeDecls => "missing-type-decls",
             DiagCode::ParseError => "parse-error",
             DiagCode::CyclicInheritance => "cyclic-inheritance",
             DiagCode::UndefinedFunction => "undefined-function",
@@ -154,11 +149,6 @@ fn parse_marker(comment: &str) -> Option<(bool, Option<Vec<DiagCode>>)> {
     Some((next_line, Some(codes)))
 }
 
-/// missing-type-decls 的措辞（M6 定案：工作区级配置/数据缺失，Warning 而非 Error）。
-pub const MISSING_TYPE_DECLS_MESSAGE: &str = "未找到任何 .d.as 类型声明，引擎类型将无法解析。\
-请检查 myAngelScriptLsp.typeDeclarationDirs 配置，或在 UE 编辑器中执行 \
-Tools > Angelscript > Export Type Declarations (.d.as)。";
-
 /// parse-error 的措辞（M6 定案：把「可能是文法缺口而非用户错误」讲清楚）。
 pub const PARSE_ERROR_MESSAGE: &str = "语法无法解析。若代码本身正确，\
 可能是已知文法缺口（如 f-string 嵌套格式说明符，grammar/README 偏差 §9）。";
@@ -166,24 +156,14 @@ pub const PARSE_ERROR_MESSAGE: &str = "语法无法解析。若代码本身正�
 /// cyclic-inheritance 的措辞（Phase D / D40）。
 pub const CYCLIC_INHERITANCE_MESSAGE: &str = "该类的继承链成环（cyclic inheritance），引擎侧无法编译。";
 
-/// 一个脚本文件的诊断全集（M6：parse-error + 可选 missing-type-decls，经抑制过滤）。
+/// 一个脚本文件的诊断全集（M6：parse-error，经抑制过滤）。
 ///
-/// - `engine_decls_missing`：索引中 `.d.as` 数为 0（工作区级事实）——只对
-///   **Script** 文件传 `true`（`.d.as` 自身不适用；由 as-lsp 侧判定）；
 /// - parse-error 逐 `ERROR`/`MISSING` 节点一条（数据源 `as_syntax::verify_tree`，
 ///   不深入 ERROR 子树重复计数——该函数既有契约）；
 /// - 输出按 range.start 排序，再按行级抑制过滤（诊断 range **起始行**命中
-///   即丢弃）。missing-type-decls 落 (0,0) ⇒ 文件首行 `// as-ignore: missing-type-decls` 可抑制。
-pub fn script_diags(tree: &Tree, text: &str, engine_decls_missing: bool) -> Vec<Diag> {
+///   即丢弃）。
+pub fn script_diags(tree: &Tree, text: &str) -> Vec<Diag> {
     let mut out = Vec::new();
-    if engine_decls_missing {
-        out.push(Diag {
-            code: DiagCode::MissingTypeDecls,
-            range: TextRange::new(0, 0),
-            severity: DiagSeverity::Warning,
-            message: MISSING_TYPE_DECLS_MESSAGE.to_string(),
-        });
-    }
     for e in as_syntax::verify_tree(tree) {
         out.push(Diag {
             code: DiagCode::ParseError,
@@ -298,19 +278,18 @@ mod tests {
 
     #[test]
     fn diag_code_display_and_parse() {
-        assert_eq!(DiagCode::MissingTypeDecls.to_string(), "missing-type-decls");
         assert_eq!(DiagCode::ParseError.to_string(), "parse-error");
-        assert_eq!(DiagCode::parse("missing-type-decls"), Some(DiagCode::MissingTypeDecls));
         assert_eq!(DiagCode::parse("parse-error"), Some(DiagCode::ParseError));
         assert_eq!(DiagCode::parse("no-such-code"), None); // 未登记名静默忽略
         assert_eq!(DiagCode::parse("parse_error"), None); // 名字形态唯一（kebab-case）
+        assert_eq!(DiagCode::parse("missing-type-decls"), None); // retired（码表 v2.2），同未知名
     }
 
     #[test]
     fn parse_error_reports_error_nodes() {
         let src = "void F(\n";
         let tree = as_syntax::parse(src, None);
-        let diags = script_diags(&tree, src, false);
+        let diags = script_diags(&tree, src);
         assert!(!diags.is_empty(), "未闭合声明应产出 parse-error");
         assert!(diags.iter().all(|d| d.code == DiagCode::ParseError));
         assert!(diags.iter().all(|d| d.severity == DiagSeverity::Error));
@@ -323,7 +302,7 @@ mod tests {
         // smoke 用例同款形态：宏参数未闭合 + 后续声明（错误恢复吞掉片段）
         let src = "void GlobalFn() {}\nUFUNCTION(Blueprint\nvoid Other() {}\n";
         let tree = as_syntax::parse(src, None);
-        let diags = script_diags(&tree, src, false);
+        let diags = script_diags(&tree, src);
         assert!(!diags.is_empty(), "UFUNCTION(Blueprint 未闭合应有 parse-error");
         assert!(diags.iter().any(|d| d.range.start >= 20), "错误不在首行");
     }
@@ -332,19 +311,7 @@ mod tests {
     fn clean_source_has_no_diags() {
         let src = "class Foo : UObject\n{\n    int Count;\n    void Tick(float Delta)\n    {\n        Count = Count + 1;\n    }\n}\n";
         let tree = as_syntax::parse(src, None);
-        assert!(script_diags(&tree, src, false).is_empty());
-    }
-
-    #[test]
-    fn missing_type_decls_fires_only_when_decls_missing() {
-        let src = "int X = 1;\n";
-        let tree = as_syntax::parse(src, None);
-        let diags = script_diags(&tree, src, true);
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].code, DiagCode::MissingTypeDecls);
-        assert_eq!(diags[0].severity, DiagSeverity::Warning);
-        assert_eq!((diags[0].range.start, diags[0].range.end), (0, 0));
-        assert!(script_diags(&tree, src, false).is_empty());
+        assert!(script_diags(&tree, src).is_empty());
     }
 
     #[test]
@@ -352,22 +319,22 @@ mod tests {
         // ERROR 在行 0，同行尾注释抑制
         let src = "))) // as-ignore: parse-error\n";
         let tree = as_syntax::parse(src, None);
-        assert!(script_diags(&tree, src, false).is_empty());
+        assert!(script_diags(&tree, src).is_empty());
         // 无关码不抑制
-        let src = "))) // as-ignore: missing-type-decls\n";
+        let src = "))) // as-ignore: cyclic-inheritance\n";
         let tree = as_syntax::parse(src, None);
-        assert!(!script_diags(&tree, src, false).is_empty());
+        assert!(!script_diags(&tree, src).is_empty());
     }
 
     #[test]
     fn suppression_next_line() {
         let src = "// as-ignore-next-line: parse-error\n)))\n";
         let tree = as_syntax::parse(src, None);
-        assert!(script_diags(&tree, src, false).is_empty());
+        assert!(script_diags(&tree, src).is_empty());
         // 只抑制下一行：再下一行的错误保留
         let src = "// as-ignore-next-line: parse-error\nint X = 1;\n)))\n";
         let tree = as_syntax::parse(src, None);
-        assert!(!script_diags(&tree, src, false).is_empty());
+        assert!(!script_diags(&tree, src).is_empty());
     }
 
     #[test]
@@ -375,11 +342,11 @@ mod tests {
         // 无码形式：抑制该行全部
         let src = "))) // as-ignore\n";
         let tree = as_syntax::parse(src, None);
-        assert!(script_diags(&tree, src, false).is_empty());
+        assert!(script_diags(&tree, src).is_empty());
         // 逗号分隔多码：命中的码被抑制
-        let src = "))) // as-ignore: missing-type-decls, parse-error\n";
+        let src = "))) // as-ignore: cyclic-inheritance, parse-error\n";
         let tree = as_syntax::parse(src, None);
-        assert!(script_diags(&tree, src, false).is_empty());
+        assert!(script_diags(&tree, src).is_empty());
     }
 
     #[test]
@@ -387,31 +354,20 @@ mod tests {
         // 全为未知码 ⇒ 空表 ⇒ 不抑制任何诊断
         let src = "))) // as-ignore: no-such-code\n";
         let tree = as_syntax::parse(src, None);
-        assert!(!script_diags(&tree, src, false).is_empty());
-    }
-
-    #[test]
-    fn missing_type_decls_suppressible_on_line0() {
-        let src = "// as-ignore: missing-type-decls\nint X = 1;\n";
-        let tree = as_syntax::parse(src, None);
-        assert!(script_diags(&tree, src, true).is_empty());
-        // 无码形式同样可抑制
-        let src = "// as-ignore\nint X = 1;\n";
-        let tree = as_syntax::parse(src, None);
-        assert!(script_diags(&tree, src, true).is_empty());
+        assert!(!script_diags(&tree, src).is_empty());
     }
 
     #[test]
     fn plain_and_doxygen_comments_are_not_suppressions() {
         let src = "// @param X some doc\n// as-ignored: parse-error\n// just a comment\n)))\n";
         let tree = as_syntax::parse(src, None);
-        let diags = script_diags(&tree, src, false);
+        let diags = script_diags(&tree, src);
         assert!(!diags.is_empty(), "doxygen/普通注释/as-ignored 均不应抑制");
     }
 
     #[test]
     fn parse_suppressions_shapes() {
-        let text = "int A;\n// as-ignore\n// as-ignore: missing-type-decls, parse-error\n// as-ignore-next-line: parse-error\nint B;\n";
+        let text = "int A;\n// as-ignore\n// as-ignore: cyclic-inheritance, parse-error\n// as-ignore-next-line: parse-error\nint B;\n";
         let sups = parse_suppressions(text);
         assert_eq!(sups.len(), 3);
         assert_eq!(
@@ -420,7 +376,7 @@ mod tests {
         );
         assert_eq!(
             sups[1],
-            Suppression { line: 2, codes: Some(vec![DiagCode::MissingTypeDecls, DiagCode::ParseError]) }
+            Suppression { line: 2, codes: Some(vec![DiagCode::CyclicInheritance, DiagCode::ParseError]) }
         );
         assert_eq!(
             sups[2],

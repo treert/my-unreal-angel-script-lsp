@@ -92,7 +92,7 @@ as-core/src/
 ├── overload.rs    # 重载解析与排序（一等模块；含 M4 调用点消歧判定）
 ├── decl_tags.rs   # .d.as 注解标签解析与 tag/doc 分流（架构设计 §2.4.3/§2.4.4）
 ├── diag.rs        # 诊断内核（M6 已落地：DiagCode/Diag/DiagSeverity + 行级抑制
-│                  #   解析 + missing-type-decls/parse-error/cyclic-inheritance
+│                  #   解析 + parse-error/cyclic-inheritance/undefined-function
 │                  #   规则本体；诊断名只在诊断码表登记（实现时命名，D42），
 │                  #   §12 G5；发布管道在 as-lsp 侧 diag.rs + 调度器，D40）
 └── range.rs       # TextRange（字节）+ 行首偏移表；UTF-16 换算原语（移植 mylua 方案）
@@ -556,7 +556,7 @@ pub fn resolve_overload(cands: &[DefId], args: &[TypeId]) -> Vec<Ranked>;
 | `completion` | 查找链上下文 + 成员 + UFUNCTION 名单（`AddUFunction(this, n"\|`）+ 说明符 schema + 命名参数 | M5 |
 | `signatureHelp` | 重载集排序 | M5 |
 | `inlayHint` | auto 变量推导类型展示（依赖 §4.2 表达式定型） | M5 |
-| `publishDiagnostics` | M6 落地 + **Phase D（D40）升级为调度队列**：as-core `diag.rs`（规则本体 + 抑制过滤）+ as-lsp `diagnostic_scheduler.rs`（热文件 300ms 防抖 + 结构变化全量 + 打开优先 + 插队）+ `diag.rs`（`drain` 消费侧）；`missing-type-decls`/`parse-error`/`cyclic-inheritance` + `// as-ignore:` 行级抑制；P5 全量规则 | M6 |
+| `publishDiagnostics` | M6 落地 + **Phase D（D40）升级为调度队列**：as-core `diag.rs`（规则本体 + 抑制过滤）+ as-lsp `diagnostic_scheduler.rs`（热文件 300ms 防抖 + 结构变化全量 + 打开优先 + 插队）+ `diag.rs`（`drain` 消费侧）；`parse-error`/`cyclic-inheritance`/`undefined-function`（decl 全缺失时整类跳过）+ `// as-ignore:` 行级抑制；P5 全量规则 | M6 |
 | `didChangeConfiguration` | `floatIsFloat64` 等索引级配置变更 → 全量重建（§5.3） | M2 |
 
 ## 9. 里程碑与验收

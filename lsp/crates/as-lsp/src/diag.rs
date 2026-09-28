@@ -28,17 +28,17 @@ use crate::workspace::{kind_of_path, WorkspaceState};
 
 /// 一轮 drain 的工作区事实（每 drain 算一次，ms 级）。
 pub struct DrainFacts {
-    /// missing-type-decls：索引中无真实 `.d.as`（builtin 伪文件不算——B2 口径）。
+    /// 索引中无真实 `.d.as`（builtin 伪文件不算——B2 口径）。仅作
+    /// undefined-function 的门控（decl 全缺失时引擎函数一概不可解析，
+    /// 整类跳过；`missing-type-decls` 诊断已移除，码表 v2.2）。
     pub decl_missing: bool,
     /// cyclic-inheritance：文件 → 环诊断（未经抑制过滤，`file_ls_diags` 统一滤）。
     pub cycle_diags: HashMap<FileId, Vec<Diag>>,
 }
 
 /// per-file 统一入口（打开 / 未打开同构，P9）：
-/// parse-error ∪ missing-type-decls（`decl_missing && Script`）∪
-/// undefined-function（`Script && !decl_missing`——decl 全缺失时引擎函数一概
-/// 不可解析，missing-type-decls 已在解释，语义诊断整类跳过）∪
-/// cyclic-inheritance，经抑制过滤。
+/// parse-error ∪ undefined-function（`Script && !decl_missing`——decl 全缺失时
+/// 引擎函数一概不可解析，语义诊断整类跳过）∪ cyclic-inheritance，经抑制过滤。
 fn file_ls_diags(
     ws: &Workspace,
     file: FileId,
@@ -48,7 +48,7 @@ fn file_ls_diags(
     is_script: bool,
     facts: &DrainFacts,
 ) -> Vec<ls::Diagnostic> {
-    let mut diags = script_diags(tree, text, is_script && facts.decl_missing);
+    let mut diags = script_diags(tree, text);
     if is_script && !facts.decl_missing {
         diags.extend(undefined_call_diags(ws, file, tree, text));
     }
@@ -195,7 +195,7 @@ mod tests {
     #[test]
     fn file_ls_diags_maps_code_and_severity() {
         let mut store = DocStore::new();
-        // 未闭合宏（parse-error）+ 索引 0 个 .d.as（missing-type-decls）
+        // 未闭合宏（parse-error）；decl_missing 也不再产 missing-type-decls（已移除）
         let src = "UFUNCTION(Blueprint\nvoid F() {}\n".to_string();
         let file = store.open("unique://lspdiag/a.as", 1, src);
         // 空索引：decl_missing ⇒ 语义诊断整类跳过（脚本无需入索引）
@@ -203,9 +203,10 @@ mod tests {
         let doc = store.get(file).unwrap();
         let facts = DrainFacts { decl_missing: true, cycle_diags: HashMap::new() };
         let diags = file_ls_diags(&idx, file, &doc.tree, &doc.text, &doc.lines, true, &facts);
-        let decl_diag = diags.iter().find(|d| d.code == code("missing-type-decls")).unwrap();
-        assert_eq!(decl_diag.severity, Some(DiagnosticSeverity::WARNING));
-        assert_eq!(decl_diag.range.start, Position { line: 0, character: 0 });
+        assert!(
+            diags.iter().all(|d| d.code != code("missing-type-decls")),
+            "missing-type-decls 已移除（码表 v2.2）：{diags:?}"
+        );
         let parse_diag = diags.iter().find(|d| d.code == code("parse-error")).unwrap();
         assert_eq!(parse_diag.severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(parse_diag.source.as_deref(), Some("my-as-lsp"));
@@ -213,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn file_ls_diags_no_missing_type_decls_when_decls_present() {
+    fn file_ls_diags_clean_when_decls_present() {
         let mut store = DocStore::new();
         let src = "int X = 1;\n";
         let file = store.open("unique://lspdiag/b.as", 1, src.to_string());
@@ -238,6 +239,27 @@ mod tests {
         assert!(
             file_ls_diags(&idx, file, &doc.tree, &doc.text, &doc.lines, true, &facts).is_empty()
         );
+    }
+
+    /// decl_missing 门控（missing-type-decls 移除后仍保留）：decl 全缺失 ⇒
+    /// undefined-function 整类跳过；decl 在位 ⇒ 报。
+    #[test]
+    fn file_ls_diags_skips_undefined_function_when_decls_missing() {
+        const SRC: &str = "void F()\n{\n    Printxxx(1);\n}\n";
+        let inputs = vec![script_entry("unique://lspdiag/gate.as", SRC)];
+        let idx = as_core::workspace::Workspace::build(as_core::IndexConfig::default(), inputs);
+        let file = as_core::intern::intern_file("unique://lspdiag/gate.as", 0);
+        let e = idx.files.get(&file).unwrap();
+        let missing = DrainFacts { decl_missing: true, cycle_diags: HashMap::new() };
+        assert!(
+            file_ls_diags(&idx, file, &e.tree, &e.source, &e.lines, true, &missing).is_empty(),
+            "decl 缺失时 undefined-function 整类跳过"
+        );
+        let present = DrainFacts { decl_missing: false, cycle_diags: HashMap::new() };
+        let diags = file_ls_diags(&idx, file, &e.tree, &e.source, &e.lines, true, &present);
+        assert_eq!(diags.len(), 1, "decl 在位时报 Printxxx：{diags:?}");
+        assert_eq!(diags[0].code, code("undefined-function"));
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
     }
 
     #[test]
