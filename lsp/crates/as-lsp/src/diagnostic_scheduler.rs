@@ -135,6 +135,8 @@ impl DiagnosticScheduler {
     }
 
     /// 测试入口：防抖旁路（直接标记，不 spawn timer）。
+    /// `#[cfg(test)]`——bin crate 无库接口，不加会在非 test 构建报 dead_code。
+    #[cfg(test)]
     pub fn schedule_now_for_test(&self, file: FileId, full: bool) {
         self.record(file, full);
     }
