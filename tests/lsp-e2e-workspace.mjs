@@ -1,13 +1,46 @@
-// 真实工作区端到端验收（手工工具，路径为本机 Demo_AS）：双根
-// （Script + AS-Cache，对齐 test-as-lsp.code-workspace）→ 冷启动 →
+// 真实工作区端到端验收（手工工具）：双根（Script + AS-Cache）→ 冷启动 →
 // hover 命中 struct FVector → definition 落到 Core.d.as（架构设计 §2.2.1
-// 记录的落点 :10103）。用法: node tests/lsp-e2e-workspace.mjs
+// 记录的落点 :10103）。用法: node tests/lsp-e2e-workspace.mjs [path-to-as-lsp.exe]
+// 语料根取 config/paths.local.yaml 的 paths.demo_as；未配置或目录不存在时跳过。
 import { spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
-const exe = 'd:/WorkGit/my-angel-script-lsp/lsp/target/release/as-lsp.exe';
-const scriptRoot = 'd:/WorkGit/UEProjs/Demo_AS/Script';
-const cacheRoot = 'd:/WorkGit/UEProjs/Demo_AS/Saved/AS-Cache';
+// config/paths.local.yaml 微型解析（schema 见 config/paths.example.yaml，
+// 仅支持单层 `paths:` 下的 `key: "value"` 行——PS1/Node 均无内置 YAML，
+// 结构固定故手写）
+function readPaths() {
+  const file = fileURLToPath(new URL('../config/paths.local.yaml', import.meta.url));
+  try {
+    const text = readFileSync(file, 'utf8');
+    const paths = {};
+    let inPaths = false;
+    for (const line of text.split(/\r?\n/)) {
+      if (!inPaths) {
+        if (/^paths:\s*$/.test(line)) inPaths = true;
+        continue;
+      }
+      if (/^\S/.test(line)) break; // 顶层键：paths 节结束
+      const m = /^\s*([A-Za-z0-9_]+):\s*"([^"]*)"/.exec(line);
+      if (m) paths[m[1]] = m[2];
+    }
+    return paths;
+  } catch {
+    return {};
+  }
+}
+
+const exe = process.argv[2]
+  ?? fileURLToPath(new URL('../lsp/target/release/as-lsp.exe', import.meta.url));
+const demoAs = readPaths().demo_as ?? '';
+const scriptRoot = `${demoAs}/Script`;
+const cacheRoot = `${demoAs}/Saved/AS-Cache`;
+if (!demoAs || !existsSync(scriptRoot) || !existsSync(cacheRoot)) {
+  console.error('SKIP: paths.demo_as 未配置或目录不存在（config/paths.local.yaml，'
+    + '模板见 config/paths.example.yaml）。LSP 日常测试可用 paths.test_as 代替。');
+  console.error(`      paths.demo_as = ${demoAs || '(empty)'}`);
+  process.exit(0);
+}
 const target = `${scriptRoot}/Script-Examples/Examples/Example_MovingObject.as`;
 
 const src = readFileSync(target, 'utf8');

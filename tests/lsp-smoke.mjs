@@ -3,12 +3,13 @@
 // rename/workspaceSymbol + $/progress (M4). 用例源码内置（D1）。
 // 用法: node tests/lsp-smoke.mjs [path-to-as-lsp.exe]
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 const exe = process.argv[2]
-  ?? 'd:/WorkGit/my-angel-script-lsp/lsp/target/debug/as-lsp.exe';
+  ?? fileURLToPath(new URL('../lsp/target/debug/as-lsp.exe', import.meta.url));
 
 const src = 'class Foo : UObject\n{\n    int Count;\n    void Tick(float Delta)\n    {\n        Count = Count + 1;\n        auto Total = Count + 1;\n        Wide(1, 2.5);\n    }\n}\nvoid Wide(int A, float B) {}\nUFUNCTION(Blueprint\nvoid GlobalFn() {}\n';
-const uri = 'file:///d%3A/WorkGit/UEProjs/SmokeTest.as';
+const uri = 'file:///c%3A/tmp/SmokeTest.as';
 
 const p = spawn(exe, [], { stdio: ['pipe', 'pipe', 'pipe'] });
 let buf = Buffer.alloc(0);

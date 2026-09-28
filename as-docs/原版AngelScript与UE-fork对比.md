@@ -7,8 +7,8 @@
 >
 > 前置文档：[`../grammar/angelscript.bnf`](../../grammar/angelscript.bnf)（Layer A 完整语法规范）、[`架构设计.md`](../docs/架构设计.md)
 > 证据来源（绝对路径，均为只读参考）：
-> - `[ENGINE]` = `d:/WorkGit/UnrealEngine/Engine/Plugins/Angelscript/ThirdParty/source/`
-> - `[UE]` = `d:/WorkGit/UnrealEngine/Engine/Plugins/Angelscript/Source/AngelscriptCode/`
+> - `[ENGINE]` = `config.paths.unreal_engine`/Engine/Plugins/Angelscript/ThirdParty/source/
+> - `[UE]` = `config.paths.unreal_engine`/Engine/Plugins/Angelscript/Source/AngelscriptCode/
 
 ## 0. 为什么需要这份文档
 

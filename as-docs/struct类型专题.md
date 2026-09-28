@@ -5,9 +5,9 @@
 > 诊断码定义：[`诊断码表.md`](../docs/诊断码表.md)（本文只引用码号，不定义）
 > 相关文档：[`架构设计.md`](../docs/架构设计.md)、[`../grammar/angelscript.bnf`](../../grammar/angelscript.bnf)
 > 证据来源（只读参考）：
-> - `[ENGINE]` = `d:/WorkGit/UnrealEngine/Engine/Plugins/Angelscript/ThirdParty/source/`
-> - `[UE]` = `d:/WorkGit/UnrealEngine/Engine/Plugins/Angelscript/Source/AngelscriptCode/`
-> - `[DUMP]` = `d:/WorkGit/UEProjs/Demo_AS/Saved/AS-Cache/*.d.as`（414 个文件，实测样本）
+> - `[ENGINE]` = `config.paths.unreal_engine`/Engine/Plugins/Angelscript/ThirdParty/source/
+> - `[UE]` = `config.paths.unreal_engine`/Engine/Plugins/Angelscript/Source/AngelscriptCode/
+> - `[DUMP]` = `config.paths.demo_as`/Saved/AS-Cache/*.d.as（414 个文件，实测样本）
 
 ## 0. 为什么单独成篇
 
@@ -135,7 +135,7 @@ UObject → UField → UStruct → ┬ UClass         (类的描述符)
 
 `UStruct` 自身是 UObject 派生的，所以在 AS 里它是 `class`：
 
-```52:57:d:\WorkGit\UEProjs\Demo_AS\Saved\AS-Cache\CoreUObject.d.as
+```52:57:config.paths.demo_as/Saved/AS-Cache/CoreUObject.d.as
 class UStruct : UField
 class UScriptStruct : UStruct
 ```
@@ -155,7 +155,7 @@ class UScriptStruct : UStruct
 
 ### 5.3 「无父类 → 隐式 `UObject`」（不是 `UClass`）
 
-```745:754:d:\WorkGit\UnrealEngine\Engine\Plugins\Angelscript\Source\AngelscriptCode\Private\Preprocessor\AngelscriptPreprocessor.cpp
+```745:754:config.paths.unreal_engine/Engine/Plugins/Angelscript/Source/AngelscriptCode/Private/Preprocessor\AngelscriptPreprocessor.cpp
 	// Determine the direct superclass of this type
 	ClassDesc->SuperClass = MatchClass.GetCaptureGroup(5);
 	if (ClassDesc->SuperClass.Len() == 0)
@@ -205,7 +205,7 @@ struct FTimerHandle       ← 真 USTRUCT
 
 项目里现成的例子就没写宏：
 
-```1:1:d:\WorkGit\UEProjs\Demo_AS\Script\IntroductionActor.as
+```1:1:config.paths.demo_as/Script/IntroductionActor.as
 class AIntroductionActor : AActor
 ```
 
@@ -229,7 +229,7 @@ USTRUCT() struct FTableRowBase { ... };   // 所有 DataTable 行的基类
 
 ### 6.2 AS 脚本侧：四道锁禁止
 
-```1122:1127:d:\WorkGit\UnrealEngine\Engine\Plugins\Angelscript\Source\AngelscriptCode\Private\Preprocessor\AngelscriptPreprocessor.cpp
+```1122:1127:config.paths.unreal_engine/Engine/Plugins/Angelscript/Source/AngelscriptCode/Private/Preprocessor\AngelscriptPreprocessor.cpp
 	// Structs cannot inherit from anything
 	if (ClassDesc->SuperClass.Len() != 0)
 	{
@@ -253,7 +253,7 @@ USTRUCT() struct FTableRowBase { ... };   // 所有 DataTable 行的基类
 
 绑定层用 `TFieldIterator`，它**默认包含 SuperStruct 的字段**：
 
-```430:430:d:\WorkGit\UnrealEngine\Engine\Plugins\Angelscript\Source\AngelscriptCode\Private\Binds\Bind_UStruct.cpp
+```430:430:config.paths.unreal_engine/Engine/Plugins/Angelscript/Source/AngelscriptCode/Private/Binds\Bind_UStruct.cpp
 		for (TFieldIterator<FProperty> It(UsedStruct); It; ++It)
 ```
 
@@ -313,7 +313,7 @@ hover 时应标注「此方法会被 UE 用于结构体比较 / 哈希 / 序列�
 但 struct 是值类型、内嵌在宿主内存中，**自身不是 UObject**，UE GC 无法直接扫到它内部的 UObject 引用。
 对策是强制生成隐藏 `FProperty`：
 
-```283:287:d:\WorkGit\UnrealEngine\Engine\Plugins\Angelscript\Source\AngelscriptCode\Private\ClassGenerator\AngelscriptClassGenerator.cpp
+```283:287:config.paths.unreal_engine/Engine/Plugins/Angelscript/Source/AngelscriptCode/Private/ClassGenerator\AngelscriptClassGenerator.cpp
 			if (ClassData.NewClass->bIsStruct)
 				bShouldMakeProperty = !PropertyType.NeverRequiresGC();
 			if (PropertyType.RequiresProperty())
@@ -325,7 +325,7 @@ hover 时应标注「此方法会被 UE 用于结构体比较 / 哈希 / 序列�
 
 相关的 offset 处理差异：
 
-```314:324:d:\WorkGit\UnrealEngine\Engine\Plugins\Angelscript\Source\AngelscriptCode\Private\ClassGenerator\AngelscriptClassGenerator.cpp
+```314:324:config.paths.unreal_engine/Engine/Plugins/Angelscript/Source/AngelscriptCode/Private/ClassGenerator\AngelscriptClassGenerator.cpp
 			if (bMarkNonUpropertyPropertiesAsTransient || !bIsStruct)
 				PropDesc->bTransient = true;
 			if (bMarkNonUpropertyPropertiesAsNotReplicated && bIsStruct)

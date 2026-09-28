@@ -9,7 +9,7 @@
 # -SkipExt           Skip extension compile only.
 #
 # -Target <path>     Open any directory or .code-workspace file.
-#                   (default: D:\WorkGit\UEProjs\test-as-lsp.code-workspace)
+#                   (default: paths.test_as from config/paths.local.yaml)
 #
 # NOTE on profiles: the extension's dev mode hardwires
 #   `cargo run --quiet -p as-lsp` (debug). Building here only warms the
@@ -28,7 +28,29 @@ $ErrorActionPreference = "Stop"
 
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $ExtDir   = Join-Path $RepoRoot "vscode-extension"
-$DefaultTarget = "D:\WorkGit\UEProjs\test-as-lsp.code-workspace"
+
+# ── Read path config (config/paths.local.yaml) ─────────────────────────
+# Schema/defaults: config/paths.example.yaml (committed). The local file is
+# gitignored; tiny hand parser for the flat single-level `paths:` section.
+$Paths = @{}
+$ConfigFile = Join-Path $RepoRoot "config" "paths.local.yaml"
+if (Test-Path $ConfigFile) {
+    $inPaths = $false
+    foreach ($line in Get-Content $ConfigFile) {
+        if (-not $inPaths) {
+            if ($line -match '^paths:\s*$') { $inPaths = $true }
+            continue
+        }
+        if ($line -match '^\S') { break }  # top-level key: section ends
+        if ($line -match '^\s*([A-Za-z0-9_]+):\s*"([^"]*)"') {
+            $Paths[$Matches[1]] = $Matches[2]
+        }
+    }
+} else {
+    Write-Warning "Config not found: $ConfigFile (copy config/paths.example.yaml to paths.local.yaml)"
+}
+
+$DefaultTarget = $Paths["test_as"]
 $EdhMarker = "extensionDevelopmentPath=$ExtDir"
 
 # ── Resolve launch target ─────────────────────────────────────────────
@@ -36,8 +58,12 @@ if ($Target -ne "") {
     $LaunchTarget = $Target
     $LaunchTargetLabel = "custom ($Target)"
 } else {
+    if ([string]::IsNullOrWhiteSpace($DefaultTarget)) {
+        Write-Error "No default target: paths.test_as is not set in config/paths.local.yaml (copy from config/paths.example.yaml), or pass -Target explicitly."
+        exit 1
+    }
     $LaunchTarget = $DefaultTarget
-    $LaunchTargetLabel = "test workspace"
+    $LaunchTargetLabel = "test workspace (paths.test_as)"
 }
 
 if (-not (Test-Path $LaunchTarget)) {

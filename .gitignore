@@ -2,6 +2,9 @@
 node_modules/
 .cache*/
 
+# Local path config (external dependency dirs)
+config/*.local.yaml
+
 # Build / artifacts
 dist/
 out/

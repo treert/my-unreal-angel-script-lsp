@@ -1,0 +1,34 @@
+# 外部依赖路径配置模板
+#
+# 使用方式:
+#   1. 复制本文件为 paths.local.yaml(与模板同目录)
+#   2. 把各 path 改成本机实际目录
+#   3. paths.local.yaml 已被 .gitignore 忽略,不会提交到 git
+#
+# 优先级: 脚本命令行参数(如 -Target) > paths.local.yaml
+#
+# 文档与脚本中的占位符写法: config.paths.<key>,例如
+#   config.paths.unreal_engine / Engine/Plugins/Angelscript
+#
+# 派生子路径约定(不在配置里重复登记,按需拼接):
+#   angelscript_plugin = <unreal_engine>/Engine/Plugins/Angelscript
+#   demo_as_script    = <demo_as>/Script
+#   demo_as_cache     = <demo_as>/Saved/AS-Cache
+
+paths:
+  # 关键依赖: 带 Angelscript 插件的 UnrealEngine 引擎源码
+  # (语言行为与 VM 实现的最终真值来源;下载中可暂空)
+  unreal_engine: ""
+
+  # 可选: UE 测试工程(AngelscriptTypeExporter 导出 .d.as + 官方示例脚本)
+  # 本机未下载时可留空,LSP 测试可用下方 test_as 的本地拷贝代替
+  demo_as: ""
+
+  # LSP 测试用 as 语料目录(tools/test-extension.ps1 的默认打开目标)
+  test_as: ""
+
+  # 参考: 官方 VSCode 扩展(LSP + DAP,仅作实现参考)
+  vscode_unreal_angelscript: ""
+
+  # 参考: mylua-lsp(同技术栈的既有实现,正常不需要访问)
+  ai_mylua_lsp: ""

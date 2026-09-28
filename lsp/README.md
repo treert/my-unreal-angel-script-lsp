@@ -64,7 +64,7 @@ cargo run -p as-lsp         # LSP server（stdio；一般由 VSCode 扩展拉起
 server 冒烟（initialize 握手，不依赖 VSCode）：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File ..\tests\lsp-smoke.ps1
+node ..\tests\lsp-smoke.mjs
 # 预期：SMOKE OK + serverInfo: my-as-lsp + legend: as_typename present
 ```
 
@@ -120,10 +120,10 @@ decl-only 对账口径（type_count~ / member_count~）、继承健康度（闭�
 ## M0 验收（已完成，可随时复跑）
 
 ```powershell
-cargo run -p as-cli --release -- dump-tree d:\WorkGit\UEProjs\Demo_AS\Script
+cargo run -p as-cli --release -- dump-tree config.paths.demo_as/Script
 # 预期：27 files, 0 with errors —— 退出码 0
 
-cargo run -p as-cli --release -- dump-tree d:\WorkGit\UEProjs\Demo_AS\Saved\AS-Cache
+cargo run -p as-cli --release -- dump-tree config.paths.demo_as/Saved/AS-Cache
 # 预期：414 files, 0 with errors —— 退出码 0
 ```
 
@@ -134,7 +134,7 @@ cargo run -p as-cli --release -- dump-tree d:\WorkGit\UEProjs\Demo_AS\Saved\AS-C
 
 ```powershell
 cargo run -p as-cli --release -- dump-index `
-    d:\WorkGit\UEProjs\Demo_AS\Script d:\WorkGit\UEProjs\Demo_AS\Saved\AS-Cache
+    config.paths.demo_as/Script config.paths.demo_as/Saved/AS-Cache
 ```
 
 对账（manifest：`type_count=14864` / `member_count=69337`，仅作开发期人工参照）：
@@ -158,19 +158,19 @@ cargo test --workspace
 # ② 冒烟（hover/definition 含 snippet fence 断言）
 node ..\tests\lsp-smoke.mjs
 
-# ③ 真实工作区端到端（双根布局；本机 Demo_AS 路径）
+# ③ 真实工作区端到端（双根布局；语料根取 config.paths.demo_as，未配置时跳过）
 node ..\tests\lsp-e2e-workspace.mjs
 # 预期：E2E OK: hover=struct FVector; definition -> Core.d.as:10103
 
 # ④ 语料批量 + 查找链体检
 cargo run -p as-cli --release -- dump-index --resolve-stats `
-    d:\WorkGit\UEProjs\Demo_AS\Script d:\WorkGit\UEProjs\Demo_AS\Saved\AS-Cache
+    config.paths.demo_as/Script config.paths.demo_as/Saved/AS-Cache
 # 预期：对账数字不回归（13814/63338）；resolve-stats hit ≈ 93%
 #（未命中主要是 EnhancedInput 插件类型不在本机 AS-Cache + 表达式定型
 #  推迟子集——f-string 插值/字面量运算等，M4+ 扩）
 
 # ⑤ VSCode 体感验收（人工）：EDH + tools\test-extension.ps1 打开
-#    test-as-lsp.code-workspace，hover/F12 跳 .d.as
+#    config.paths.test_as，hover/F12 跳 .d.as
 ```
 
 ## M5 验收（已完成，可随时复跑）
@@ -191,7 +191,7 @@ node ..\tests\lsp-e2e-workspace.mjs
 
 # ④ 语料批量 + 查找链体检（定型扩展的命中率红利）
 cargo run -p as-cli --release -- dump-index --resolve-stats `
-    d:\WorkGit\UEProjs\Demo_AS\Script d:\WorkGit\UEProjs\Demo_AS\Saved\AS-Cache
+    config.paths.demo_as/Script config.paths.demo_as/Saved/AS-Cache
 # 预期：对账数字不回归（13814/63338）；resolve-stats hit ≈ 94.9%
 #（M4 基线 94.3%——M5a 定型扩展新增命中）
 
@@ -217,7 +217,7 @@ node ..\tests\lsp-e2e-m4.mjs
 
 # ④ 语料批量对账（13814/63338 不回归）
 cargo run -p as-cli --release -- dump-index `
-    d:\WorkGit\UEProjs\Demo_AS\Script d:\WorkGit\UEProjs\Demo_AS\Saved\AS-Cache
+    config.paths.demo_as/Script config.paths.demo_as/Saved/AS-Cache
 
 # ⑤ VSCode 体感验收（人工）：EDH 打开含语法错误的 .as → 红波浪线 +
 #    Problems 面板（code=AS0903、source=my-as-lsp）；typeDeclarationDirs
@@ -247,7 +247,7 @@ node ..\tests\lsp-e2e-m4.mjs
 
 # ⑤ 语料批量 + 引用解析体检
 cargo run -p as-cli --release -- dump-index --ref-stats `
-    d:\WorkGit\UEProjs\Demo_AS\Script d:\WorkGit\UEProjs\Demo_AS\Saved\AS-Cache
+    config.paths.demo_as/Script config.paths.demo_as/Saved/AS-Cache
 # 预期：对账数字不回归（13814/63338）；ref-stats 68763 站点、
 #   resolved ≈ 99.4%、全语料解析 <1s
 
@@ -258,6 +258,8 @@ cargo run -p as-cli --release -- dump-index --ref-stats `
 ## 约定提醒
 
 - **禁止任何 Rust 格式化**（`cargo fmt` / rustfmt / IDE format），改动只保持局部既有格式；
+- 命令示例与文档中的 `config.paths.*` 是 `config/paths.local.yaml` 里配置的本机
+  路径占位符（模板与约定见 `config/paths.example.yaml`）；
 - **单测 `.as` 用例一律内置源码字符串字面量**，禁止读 `../tests/` 外部文件；
 - 文法节点增删后须同步 `crates/as-syntax/src/node.rs`（文件头附再生成命令）。
 

@@ -24,8 +24,8 @@
 
 三份文档统一使用只读参考路径（引擎源码为准，任何歧义以 VM 代码为最终真值）：
 
-- `[ENGINE]` = `d:/WorkGit/UnrealEngine/Engine/Plugins/Angelscript/ThirdParty/source/`
-- `[UE]` = `d:/WorkGit/UnrealEngine/Engine/Plugins/Angelscript/Source/AngelscriptCode/`
+- `[ENGINE]` = `config.paths.unreal_engine`/Engine/Plugins/Angelscript/ThirdParty/source/
+- `[UE]` = `config.paths.unreal_engine`/Engine/Plugins/Angelscript/Source/AngelscriptCode/
 
 ## 维护规则
 

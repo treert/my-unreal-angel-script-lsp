@@ -8,9 +8,10 @@ import { spawn } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const exe = process.argv[2]
-  ?? 'd:/WorkGit/my-angel-script-lsp/lsp/target/release/as-lsp.exe';
+  ?? fileURLToPath(new URL('../lsp/target/release/as-lsp.exe', import.meta.url));
 
 const tmp = mkdtempSync(join(tmpdir(), 'as-lsp-m4-'));
 const scriptDir = tmp; // scriptRoots 空 = 全部 workspaceFolders
