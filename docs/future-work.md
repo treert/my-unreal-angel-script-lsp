@@ -38,6 +38,7 @@
 | 2.2 | **mixin shadow 语义** | `DerivesOrShadows` 的 shadow 半边（AS 脚本类 shadow C++ 类）未建模，现按继承闭包近似 | D23 / 架构设计 §4.5.1 |
 | 2.3 | **primitive 隐式转换精确矩阵** | D32 最小提升近似（数值域档位表）；有符号/无符号混合不追引擎精确规则 | D32 |
 | 2.4 | **preproc `#if EDITOR` 区域感知** | 第一期全可见（D7，已知失真）；若 P5 诊断需要再升级 | 架构设计 §8 风险 3 |
+| 2.5 | **rename 无 `.d.as` 只读保护** | 对引擎类型发起 rename（如 FVector）会给出全语料编辑（e2e 实测 89 文件 / 2848 处）——`.d.as` 是导出生成物，改写即丢失。候选策略：目标声明在 Decl 文件 ⇒ prepareRename 返回 None + 提示，或 WorkspaceEdit 打 `documentChanges` + 确认对话框。Phase B e2e 探针发现（`tools/probe-e2e.mjs` 观察项） | Phase B e2e（2026-09-28） |
 
 ## 3. 性能收敛（先正确后优化）
 
@@ -69,11 +70,11 @@
 |---|---|---|
 | 6.1 | ~~grammar/README 偏差 §3 失实~~ | ✅ 已完成（2026-09-28）：实测裁决——**裸 `(void)` 不可达**（`void_argument` 的 `prec(1)` 在括号语境恒压 `primitive_type`；有体形态落 ERROR、无体形态被 `variable_declarator name(arguments)` 吞掉），带名 `void X` 可达但语料零出现。偏差 §3 与 grammar.js 同源注释均已按实测改写 |
 | 6.2 | as-docs 增补建议 | 随 P5 诊断逐条落地时，把「触发条件 → 码号」的引用（现有 26 处 `→ ASxxxx`）按实现后的最终形态复核一遍 |
-| 6.2 | as-docs 增补建议 | 随 P5 诊断逐条落地时，把「触发条件 → 码号」的引用（现有 26 处 `→ ASxxxx`）按实现后的最终形态复核一遍 |
 
 ## 7. 变更记录
 
 | 版本 | 内容 |
 |---|
+| v0.3 | 新增 2.5（rename 无 `.d.as` 只读保护——Phase B e2e 探针观察项，实测 89 文件 / 2848 编辑）；修 6.2 重复行
 | v0.2 | 6.1 完成（grammar README 偏差 §3 + grammar.js 同源注释按实测改写：裸 `(void)` 不可达、带名 `void X` 可达但零语料） |
 | v0.1 | 首版（M6 完成后）：汇总 P5/P6 主线、语义近似（模板实例化 / mixin shadow / 隐式转换 / preproc）、性能收敛、数据源缺陷（group 冲突 / EnhancedInput / f-string 文法）、扩展侧（体感验收积欠 / 命令补全 / 自动发现搁置）、文档修缮（grammar README §3） |
