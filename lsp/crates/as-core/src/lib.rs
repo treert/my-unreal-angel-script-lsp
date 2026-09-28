@@ -28,6 +28,7 @@ pub mod overload;
 pub mod range;
 pub mod references;
 pub mod resolve;
+pub mod scope;
 pub mod search;
 pub mod signature;
 pub mod specifiers;
