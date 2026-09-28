@@ -437,9 +437,7 @@ fn extend_mixin_candidates(
     out: &mut Vec<Candidate>,
 ) {
     let mut chain = vec![recv];
-    if let Some(cl) = ws.closures.get(&recv) {
-        chain.extend(cl.iter().copied());
-    }
+    chain.extend(ws.ancestor_chain(&recv));
     let mut seen: HashSet<DeclRef> = HashSet::new();
     for base in chain {
         let base_name = ws.decl(&base).name;
@@ -473,10 +471,7 @@ fn scoped_candidates(
 
     // `Super::` → 直接父类成员（§4.5 第 0 级）
     if scope_text == "Super" || scope_text == "super" {
-        if let Some(base) = ctx
-            .type_def
-            .and_then(|t| ws.closures.get(&t).and_then(|c| c.first().copied()))
-        {
+        if let Some(base) = ctx.type_def.and_then(|t| ws.base_class(&t)) {
             let space = member_search_space(ws, base);
             let mut seen = HashSet::new();
             let mut out = Vec::new();

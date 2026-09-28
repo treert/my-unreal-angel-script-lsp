@@ -428,7 +428,7 @@ pub fn resolve_at_node(
             if s == "Super" || s == "super" {
                 return ctx
                     .type_def
-                    .and_then(|t| ws.closures.get(&t).and_then(|c| c.first().copied()))
+                    .and_then(|t| ws.base_class(&t))
                     .map(|b| Resolution { targets: vec![Target::Def(b)], level: LEVEL_THIS_SUPER });
             }
             resolve_scoped_first(ws, name)
@@ -660,9 +660,7 @@ fn resolve_scoped_last(
     // Super::Foo —— 显式父类调用（§4.5 第 0 级）
     let scope_str = sym_str(scope_name);
     if scope_str == "Super" || scope_str == "super" {
-        let base = ctx
-            .type_def
-            .and_then(|t| ws.closures.get(&t).and_then(|c| c.first().copied()))?;
+        let base = ctx.type_def.and_then(|t| ws.base_class(&t))?;
         let space = member_search_space(ws, base);
         let hits = members_named(ws, &space, name, |_| true);
         return (!hits.is_empty()).then(|| Resolution {
@@ -788,9 +786,7 @@ pub(crate) fn resolve_plain(ws: &Workspace, ctx: &SemCtx, name: Sym) -> Option<R
         return None;
     }
     if name_str == "Super" || name_str == "super" {
-        let base = ctx
-            .type_def
-            .and_then(|t| ws.closures.get(&t).and_then(|c| c.first().copied()))?;
+        let base = ctx.type_def.and_then(|t| ws.base_class(&t))?;
         return Some(Resolution { targets: vec![Target::Def(base)], level: LEVEL_THIS_SUPER });
     }
 
@@ -937,9 +933,7 @@ pub(crate) fn member_search_space(ws: &Workspace, def: DeclRef) -> Vec<DeclRef> 
     match d.kind {
         DefKind::Class => {
             let mut space = vec![def];
-            if let Some(chain) = ws.closures.get(&def) {
-                space.extend(chain.iter().copied());
-            }
+            space.extend(ws.ancestor_chain(&def));
             space
         }
         _ => vec![def],
@@ -998,9 +992,7 @@ pub(crate) fn find_accessors(ws: &Workspace, space: &[DeclRef], name: Sym) -> Ve
 /// shadow 语义（AS 脚本类 shadow C++ 类）M3 不建模——继承侧已覆盖脚本语料。
 fn mixin_candidates(ws: &Workspace, recv: DeclRef, name: Sym, ns_syms: &[Sym]) -> Vec<DeclRef> {
     let mut chain = vec![recv];
-    if let Some(cl) = ws.closures.get(&recv) {
-        chain.extend(cl.iter().copied());
-    }
+    chain.extend(ws.ancestor_chain(&recv));
     let mut out = Vec::new();
     for base in chain {
         let base_name = ws.decl(&base).name;

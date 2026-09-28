@@ -405,14 +405,18 @@ fn dump_index(
                 .count()
         })
         .sum();
+    let mut classes_total = 0usize;
+    let mut chain_links = 0usize;
     for (&file, entry) in ws.files.iter() {
         for (i, d) in entry.summary.decls.iter().enumerate() {
             if d.kind != DefKind::Class || d.flags.contains(DefFlags::SYNTHETIC) {
                 continue;
             }
+            classes_total += 1;
+            let r = DeclRef { file, local: i as u32 };
+            chain_links += ws.ancestor_chain(&r).len();
             if d.bases.iter().any(|b| b.simple) {
                 classes_with_base += 1;
-                let r = DeclRef { file, local: i as u32 };
                 if ws.base_class(&r).is_none() {
                     unresolved_bases += 1;
                 }
@@ -420,9 +424,8 @@ fn dump_index(
         }
     }
     println!(
-        "inheritance: class closures {}, cycles {}, classes-with-base {classes_with_base} (unresolved base {unresolved_bases})",
-        ws.closures.len(),
-        ws.cycle_classes.len()
+        "inheritance: classes {classes_total}, chain links {chain_links}, cycles {}, classes-with-base {classes_with_base} (unresolved base {unresolved_bases})",
+        ws.cyclic_classes().len()
     );
     println!(
         "mixins: by-name buckets {} entries {}",

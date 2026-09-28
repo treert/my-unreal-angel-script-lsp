@@ -5,8 +5,10 @@
 //! - `files: HashMap<FileId, FileEntry>`——per-file（source + tree + lines +
 //!   summary + by_parent），A 阶段已验证的并行产物；
 //! - `agg: Aggregation`——薄聚合层（名字 → DeclRef 倒排）；
-//! - eager 派生表（Phase B 保持预计算，Phase C 按需化）：`closures`（class
-//!   继承闭包）、`resolved`（声明类型归一化）、`types`（TypeTable）。
+//! - 继承走链现算（Phase C / C6，零缓存）：`base_class` / `ancestor_chain` /
+//!   `cyclic_classes`——链由 bases 名 + agg 一跳完全推导；
+//! - `resolved` / `types`（声明类型归一化 + TypeTable）Phase B 保持 eager，
+//!   Phase C Task 4 随 TypeId 体系退役（C7）删除。
 //!
 //! 与旧架构的语义对应（Phase B 裁决，见计划 B1-B7）：
 //! - **B2 builtin**：合成 FileSummary（`<as-core:builtin>` 伪文件，进程级
@@ -120,11 +122,9 @@ pub struct Workspace {
     pub config: IndexConfig,
     pub files: HashMap<FileId, FileEntry>,
     pub agg: Aggregation,
-    /// class 继承闭包（Phase B eager；struct 不建——D16）
-    pub closures: HashMap<DeclRef, Vec<DeclRef>>,
-    pub cycle_classes: Vec<DeclRef>,
     /// 声明类型归一化表 + TypeTable（Task 3 与 types.rs 的 TypeKind::Named
-    /// 切 DeclRef 一起落地——消费者 expr.rs 同批切换，孤立切换无意义）
+    /// 切 DeclRef 一起落地——消费者 expr.rs 同批切换，孤立切换无意义）。
+    /// Phase C Task 4 随 TypeId 体系退役（C7）删除。
     pub resolved: HashMap<DeclRef, crate::id::TypeId>,
     pub types: TypeTable,
 }
@@ -180,25 +180,20 @@ impl Workspace {
         let agg = Aggregation::build(
             &files.iter().map(|(f, e)| (*f, &e.summary)).collect::<HashMap<FileId, &FileSummary>>(),
         );
-        let t_agg = t0.elapsed();
 
         let mut ws = Workspace {
             config,
             files,
             agg,
-            closures: HashMap::new(),
-            cycle_classes: Vec::new(),
             resolved: HashMap::new(),
             types: TypeTable::new(),
         };
-        ws.build_closures();
         ws.resolve_decl_types();
         crate::as_log!(
-            "workspace: built {} files | parse+summary {:?} | aggregation {:?} | derived {:?}",
+            "workspace: built {} files | parse+summary {:?} | aggregation+derived {:?}",
             ws.files.len(),
             t_parse,
-            t_agg - t_parse,
-            t0.elapsed() - t_agg,
+            t0.elapsed() - t_parse,
         );
         ws
     }
@@ -468,18 +463,13 @@ impl Workspace {
         match &old_summary {
             Some(old) => {
                 self.agg.replace_file(file, old, &entry.summary);
-                // 摘除旧派生条目（closures 全量重建——量级毫秒）
-                self.closures.clear();
-                self.cycle_classes.clear();
                 self.resolved.retain(|r, _| r.file != file);
                 self.files.insert(file, entry);
-                self.build_closures();
                 self.resolve_decl_types_in(Some(file));
             }
             None => {
                 self.agg.replace_file(file, &crate::summary::FileSummary::default_for(kind), &entry.summary);
                 self.files.insert(file, entry);
-                self.build_closures();
                 self.resolve_decl_types_in(Some(file));
             }
         }
@@ -487,62 +477,18 @@ impl Workspace {
         old_surface.map_or(true, |old| old != new_surface)
     }
 
-    /// 删除文件：贡献摘除 + 派生重建 + 墓碑（D18 的 FileId 层语义不变）。
+    /// 删除文件：贡献摘除 + 墓碑（D18 的 FileId 层语义不变）。
     pub fn remove_file(&mut self, file: FileId) {
         if let Some(entry) = self.files.remove(&file) {
             self.agg.remove_file(file, &entry.summary);
-            self.closures.clear();
-            self.cycle_classes.clear();
             self.resolved.retain(|r, _| r.file != file);
-            self.build_closures();
             crate::intern::tombstone_file(file);
         }
     }
 
     // -----------------------------------------------------------------------
-    // eager 派生（Phase B 保持预计算；Phase C 按需化）
+    // 继承走链（Phase C / C6：零缓存，查询期现算）
     // -----------------------------------------------------------------------
-
-    /// class 继承闭包（平移自 index.rs build_closures；struct 不建——D16）。
-    fn build_closures(&mut self) {
-        let classes: Vec<DeclRef> = self
-            .files
-            .iter()
-            .flat_map(|(&file, e)| {
-                e.summary
-                    .decls
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, d)| {
-                        d.kind == DefKind::Class && !d.flags.contains(DefFlags::SYNTHETIC)
-                    })
-                    .map(move |(i, _)| DeclRef { file, local: i as u32 })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let mut cyclic: Vec<DeclRef> = Vec::new();
-        for class in classes {
-            let mut chain: Vec<DeclRef> = Vec::new();
-            let mut path: Vec<DeclRef> = vec![class];
-            let mut cur = class;
-            for _ in 0..MAX_CHAIN_DEPTH {
-                let Some(base) = self.base_class(&cur) else { break };
-                if let Some(pos) = path.iter().position(|&d| d == base) {
-                    for &d in &path[pos..] {
-                        if !cyclic.contains(&d) {
-                            cyclic.push(d);
-                        }
-                    }
-                    break;
-                }
-                path.push(base);
-                chain.push(base);
-                cur = base;
-            }
-            self.closures.insert(class, chain);
-        }
-        self.cycle_classes = cyclic;
-    }
 
     /// 单跳：class → 直接基类（simple 基名 → Class 声明；struct / 未知名 =
     /// None）。原 `resolve_base_class` 更名（C5：命名改祖先链语义）。
@@ -871,14 +817,15 @@ mod tests {
     }
 
     #[test]
-    fn struct_writes_base_but_no_closure() {
-        // 原 index.rs m1_acceptance_struct_no_closure（D16：struct 不建闭包）
+    fn struct_writes_base_but_no_chain() {
+        // 原 index.rs m1_acceptance_struct_no_closure（D16：struct 即使写了
+        // 基类也不走链）
         const SRC: &str = "struct S : T {}\nstruct T { int X; }\nclass K : J {}\nclass J {}\n";
         let ws = ws_build(&[("unique://wsnc/mix.as", SRC)]);
         let s = ws.lookup_type_def(intern_sym("S")).unwrap();
-        assert!(!ws.closures.contains_key(&s), "struct 即使写了基类也不建闭包");
+        assert!(ws.ancestor_chain(&s).is_empty(), "struct 即使写了基类也不走链");
         let k = ws.lookup_type_def(intern_sym("K")).unwrap();
-        assert_eq!(ws.closures.get(&k).unwrap().len(), 1, "class 正常建闭包");
+        assert_eq!(ws.ancestor_chain(&k).len(), 1, "class 正常走链");
     }
 
     #[test]
@@ -996,7 +943,8 @@ mixin void NoParam() {}
     }
 
     #[test]
-    fn closures_and_cycles_match_old_semantics() {
+    fn chain_and_cycles_semantics() {
+        // 原 index.rs 继承语义用例平移（closures → ancestor_chain 现算）
         const SRC: &str = "\
 class ABase {}
 class AMid : ABase {}
@@ -1007,70 +955,52 @@ class Orphan : TMissing {}
 ";
         let ws = ws_build(&[("unique://wsc/a.as", SRC)]);
         let leaf = ws.lookup_type_def(intern_sym("ALeaf")).unwrap();
-        let chain = ws.closures.get(&leaf).unwrap();
-        let names: Vec<&str> = chain.iter().map(|r| sym_str(ws.decl(r).name)).collect();
+        let names: Vec<&str> =
+            ws.ancestor_chain(&leaf).iter().map(|r| sym_str(ws.decl(r).name)).collect();
         assert_eq!(names, vec!["AMid", "ABase"], "近者在前");
-        // 环检测：Bad1/Bad2 入 cycle_classes，链在首次重复处截断
+        // 环检测：Bad1/Bad2 入环集合，链在首次重复处截断
         let bad1 = ws.lookup_type_def(intern_sym("Bad1")).unwrap();
         let bad2 = ws.lookup_type_def(intern_sym("Bad2")).unwrap();
-        assert!(ws.cycle_classes.contains(&bad1) && ws.cycle_classes.contains(&bad2));
-        assert_eq!(ws.closures.get(&bad1).unwrap().len(), 1);
+        let cycles = ws.cyclic_classes();
+        assert!(cycles.contains(&bad1) && cycles.contains(&bad2));
+        assert_eq!(ws.ancestor_chain(&bad1).len(), 1);
         // unresolved base：链为空但不 panic
         let orphan = ws.lookup_type_def(intern_sym("Orphan")).unwrap();
-        assert!(ws.closures.get(&orphan).unwrap().is_empty());
+        assert!(ws.ancestor_chain(&orphan).is_empty());
     }
 
     #[test]
     fn cycle_does_not_affect_side_branch() {
         // 原 index.rs m1_acceptance_inheritance_cycle 的旁支断言：
-        // 环不影响旁支（C : A，A/B 成环，C 的闭包 = [A, B]）
+        // 环不影响旁支（C : A，A/B 成环，C 的链 = [A, B]）
         const SRC: &str = "class A : B {}\nclass B : A {}\nclass C : A {}\n";
         let ws = ws_build(&[("unique://wscyc/side.as", SRC)]);
-        assert_eq!(ws.cycle_classes.len(), 2, "A 与 B 应被标记为环");
+        assert_eq!(ws.cyclic_classes().len(), 2, "A 与 B 应被标记为环");
         let c = ws.lookup_type_def(intern_sym("C")).unwrap();
-        let names: Vec<&str> = ws.closures[&c].iter().map(|r| sym_str(ws.decl(r).name)).collect();
+        let names: Vec<&str> =
+            ws.ancestor_chain(&c).iter().map(|r| sym_str(ws.decl(r).name)).collect();
         assert_eq!(names, vec!["A", "B"], "环不影响旁支");
     }
 
     #[test]
-    fn ancestor_chain_matches_eager_closures() {
-        // 过渡等价性（C6）：对全部 class 断言 ancestor_chain == closures 表值。
-        // Task 3 删 closures 字段后本用例随之删除（语义用例接棒）
-        const SRC: &str = "\
-class ABase {}
-class AMid : ABase {}
-class ALeaf : AMid {}
-class Bad1 : Bad2 {}
-class Bad2 : Bad1 {}
-class Orphan : TMissing {}
-struct S : ABase {}
-";
-        let ws = ws_build(&[("unique://wseq/mix.as", SRC)]);
-        let mut checked = 0;
-        for (&file, e) in &ws.files {
-            for (i, d) in e.summary.decls.iter().enumerate() {
-                if d.kind != DefKind::Class || d.flags.contains(DefFlags::SYNTHETIC) {
-                    continue;
-                }
-                let c = DeclRef { file, local: i as u32 };
-                assert_eq!(ws.ancestor_chain(&c), ws.closures[&c], "链等价: {}", sym_str(d.name));
-                checked += 1;
-            }
-        }
-        assert!(checked >= 6);
-    }
-
-    #[test]
-    fn cyclic_classes_matches_old() {
-        // 过渡等价性：与 eager cycle_classes 对照（Task 3 随字段删除而删除）
-        const SRC: &str = "class A : B {}\nclass B : A {}\nclass C : A {}\n";
-        let ws = ws_build(&[("unique://wcyc/m.as", SRC)]);
-        let mut old = ws.cycle_classes.clone();
-        let mut new = ws.cyclic_classes();
-        old.sort();
-        new.sort();
-        assert_eq!(new, old);
-        assert_eq!(new.len(), 2);
+    fn reindex_reflects_base_change_immediately() {
+        // C6：无缓存 ⇒ reindex 后链立即按新 agg 现算，无「清空→重建」中间态
+        const V1: &str = "class Mid : Top1 {}\nclass Top1 {}\nclass Top2 {}\n";
+        const V2: &str = "class Mid : Top2 {}\nclass Top1 {}\nclass Top2 {}\n";
+        let path = "unique://wsrb/m.as";
+        let mut ws = ws_build(&[(path, V1)]);
+        let names = |ws: &Workspace, c: &DeclRef| -> Vec<String> {
+            ws.ancestor_chain(c)
+                .iter()
+                .map(|r| sym_str(ws.decl(r).name).to_string())
+                .collect()
+        };
+        let mid = ws.lookup_type_def(intern_sym("Mid")).unwrap();
+        assert_eq!(names(&ws, &mid), vec!["Top1".to_string()]);
+        let f = intern_file(path, 0);
+        let _ = ws.reindex_file(f, FileKind::Script, V2.to_string());
+        let mid2 = ws.lookup_type_def(intern_sym("Mid")).unwrap();
+        assert_eq!(names(&ws, &mid2), vec!["Top2".to_string()]);
     }
 
     #[test]
