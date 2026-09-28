@@ -190,135 +190,101 @@ impl<'t> SemCtx<'t> {
                             ctx.fn_def = Some(def);
                         }
                     }
-                    // 形参：函数体全域可见，进最外层局部帧
-                    for p in syntax::param_decls(node, src) {
-                        ctx.locals.push(LocalDecl {
-                            name: p.name,
-                            kind: DefKind::Param,
-                            name_span: p.span,
-                            full_span: p.span,
-                            ty: p.ty,
-                        });
-                    }
-                }
-                "block" => {
-                    collect_block_locals(node, src, byte, ws, &mut ctx);
-                }
-                "for_statement" => {
-                    // classic for 的初始化声明在整条 for 语句内可见
-                    for (_f, child) in syntax::children_with_fields(node) {
-                        if child.kind() == "variable_declaration" {
-                            collect_declarators(&child, src, byte, ws, &mut ctx);
-                        }
-                    }
-                }
-                "for_each_statement" => {
-                    // range-for 迭代变量：整条语句内可见（range 表达式里不可见
-                    // ——声明点之后才入栈）。M4 修正：M3 写的 "range_for_statement"
-                    // 是不存在的节点 kind（死分支），正确 kind 是 for_each_statement。
-                    // M5a：声明类型是 auto 时按引擎双跳协议定型
-                    // （expr::for_each_element，as_compiler.cpp:5745-5873）；
-                    // 失败保留 Auto（宁缺毋假，D14）
-                    if let Some(name_node) = node.child_by_field_name("name") {
-                        let span = syntax::span(name_node);
-                        if span.start <= byte {
-                            let declared = node
-                                .child_by_field_name("type")
-                                .and_then(|t| syntax::parse_syn_type(t, src));
-                            let ty = match &declared {
-                                Some(t) if crate::expr::is_auto_type(t) => {
-                                    crate::expr::for_each_element(ws, &ctx, src, node)
-                                        .map(|e| {
-                                            e.syn
-                                                .clone()
-                                                .unwrap_or_else(|| crate::expr::syn_of_base(ws, e.base))
-                                        })
-                                        .or(declared)
-                                }
-                                _ => declared,
-                            };
-                            ctx.locals.push(LocalDecl {
-                                name: intern_sym(syntax::text(name_node, src)),
-                                kind: DefKind::LocalVar,
-                                name_span: span,
-                                full_span: syntax::span(node),
-                                ty,
-                            });
-                        }
-                    }
                 }
                 _ => {}
             }
+        }
+        // 局部：scope_tree 链（outermost → innermost、scope 内声明序、不去重）
+        // + ty 急切回填（Phase E / E1-E3，取代原 block/for/形参收集臂与
+        // collect_block_locals/collect_declarators）。回填顺序 = 收集顺序
+        // ——先行局部在定型瞬间可见（`Vec A; auto S = A + B;`）。
+        let mut root = node;
+        while let Some(p) = root.parent() {
+            root = p;
+        }
+        for l in ws.files[&file].summary.scope_tree.locals_chain(byte) {
+            let ty = l.ty.clone().or_else(|| backfill_local_ty(ws, &ctx, src, root, l, byte));
+            ctx.locals.push(LocalDecl {
+                name: l.name,
+                kind: match l.kind {
+                    crate::scope::LocalKind::Param => DefKind::Param,
+                    _ => DefKind::LocalVar,
+                },
+                name_span: l.name_span,
+                full_span: l.name_span, // 局部 LocalDecl 的 full_span 无消费方
+                ty,
+            });
         }
         ctx
     }
 }
 
-/// 块内直接子声明语句的 declarator（声明点在 byte 之前才可见）。
-/// **边收集边入栈**：auto 定型要看见同块先行声明（`Vec A; auto S = A + B;`），
-/// 攒批回填会让先行局部在定型瞬间不可见。
-fn collect_block_locals(
-    node: Node<'_>,
-    src: &str,
-    byte: u32,
+/// ty=None 的局部回填（Phase E / E2）：树只有提取期四类预推导
+/// （index-architecture §3.3.1），跨文件形态（`auto X = Func()` /
+/// `auto E : Items`）在此经节点回找 + 既有 expr 管线补全。
+/// 失败保留声明类型（Auto——宁缺毋假，与原收集臂口径一致）。
+fn backfill_local_ty(
     ws: &Workspace,
-    ctx: &mut SemCtx,
-) {
-    for (_f, child) in syntax::children_with_fields(node) {
-        if child.kind() == "variable_declaration" {
-            collect_declarators(&child, src, byte, ws, ctx);
-        }
-    }
-}
-
-fn collect_declarators(
-    decl: &Node<'_>,
+    ctx: &SemCtx,
     src: &str,
+    root: Node<'_>,
+    d: &crate::scope::LocalDecl,
     byte: u32,
-    ws: &Workspace,
-    ctx: &mut SemCtx,
-) {
-    let ty = decl
-        .child_by_field_name("type")
-        .and_then(|t| syntax::parse_syn_type(t, src));
-    for (_f, child) in syntax::children_with_fields(*decl) {
-        if child.kind() != "variable_declarator" {
-            continue;
+) -> Option<SynType> {
+    let name = root.descendant_for_byte_range(
+        d.name_span.start.try_into().unwrap(),
+        d.name_span.end.try_into().unwrap(),
+    )?;
+    match d.kind {
+        crate::scope::LocalKind::IterVar => {
+            // auto 迭代变量：按引擎双跳协议定型（expr::for_each_element）
+            let mut n = name;
+            while n.kind() != "for_each_statement" {
+                n = n.parent()?;
+            }
+            let declared = n
+                .child_by_field_name("type")
+                .and_then(|t| syntax::parse_syn_type(t, src));
+            match &declared {
+                Some(t) if crate::expr::is_auto_type(t) => crate::expr::for_each_element(
+                    ws, ctx, src, n,
+                )
+                .map(|e| e.syn.clone().unwrap_or_else(|| crate::expr::syn_of_base(ws, e.base)))
+                .or(declared),
+                _ => declared,
+            }
         }
-        let Some(name_node) = child.child_by_field_name("name") else { continue };
-        let span = syntax::span(name_node);
-        if span.start > byte {
-            continue; // 声明点在使用点之后：不可见
-        }
-        // auto 定型（M5a，D14）：声明类型 auto + 有初始化式 + 查询点不在自身
-        // 初始化式内 → 取初始化表达式定型（失败保留 Auto——宁缺毋假）。
-        // 查询点在初始化式内时跳过（`auto X = F(|X|)` 的自引用防抖）
-        let ty = match (&ty, child.child_by_field_name("value")) {
-            (Some(t), Some(init)) if crate::expr::is_auto_type(t) => {
-                let inside_init =
-                    (init.start_byte() as u32) <= byte && byte < (init.end_byte() as u32);
-                if inside_init {
-                    ty.clone()
-                } else {
-                    match crate::expr::expr_type(ws, ctx, src, init) {
-                        Some(e) => Some(
-                            e.syn
-                                .clone()
-                                .unwrap_or_else(|| crate::expr::syn_of_base(ws, e.base)),
-                        ),
-                        None => ty.clone(),
+        _ => {
+            // Var（Param 显式类型恒有 ty，不走此路径）：auto + 初始化式定型；
+            // 查询点在自身初始化式内 → 跳过（`auto X = F(|X|)` 自引用防抖）
+            let mut n = name;
+            while n.kind() != "variable_declarator" {
+                n = n.parent()?;
+            }
+            let declared = n
+                .parent()
+                .and_then(|decl| decl.child_by_field_name("type"))
+                .and_then(|t| syntax::parse_syn_type(t, src));
+            match (&declared, n.child_by_field_name("value")) {
+                (Some(t), Some(init)) if crate::expr::is_auto_type(t) => {
+                    let inside_init =
+                        (init.start_byte() as u32) <= byte && byte < (init.end_byte() as u32);
+                    if inside_init {
+                        declared
+                    } else {
+                        match crate::expr::expr_type(ws, ctx, src, init) {
+                            Some(e) => Some(
+                                e.syn
+                                    .clone()
+                                    .unwrap_or_else(|| crate::expr::syn_of_base(ws, e.base)),
+                            ),
+                            None => declared,
+                        }
                     }
                 }
+                _ => declared,
             }
-            _ => ty.clone(),
-        };
-        ctx.locals.push(LocalDecl {
-            name: intern_sym(syntax::text(name_node, src)),
-            kind: DefKind::LocalVar,
-            name_span: span,
-            full_span: syntax::span(*decl),
-            ty,
-        });
+        }
     }
 }
 
@@ -1542,5 +1508,96 @@ void F()
         let r = resolve_at(&ws, file, nth(SRC, "Items", 2)).unwrap();
         assert_eq!(r.level, LEVEL_GLOBAL);
         assert_eq!(first_name(&ws, &r), "Items");
+    }
+
+    // ------------------------------------------------------------------
+    // Phase E / E1-E3：SemCtx 局部源切 scope_tree 的等价用例
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn classic_for_init_scoped_to_statement() {
+        // classic for 的 init 声明在整条 for 语句内可见、循环之后不可见
+        //（树修正 Phase E：for_statement 建专属 scope，init 不泄漏外层块）
+        const SRC: &str = "\
+void F()
+{
+    for (int I = 0; I < 3; I = I + 1) { int A = I; }
+    int Q = 1;
+}
+";
+        let ws = build(&[("unique://res/cfor.as", SRC)]);
+        let file = file_of("unique://res/cfor.as");
+        // 循环条件里的 I → 局部
+        let r = resolve_at(&ws, file, off(SRC, "I < 3")).unwrap();
+        assert_eq!(r.level, LEVEL_LOCAL, "循环头 I 应是局部");
+        // 循环体内的 I（int A = I;）→ 局部
+        let r = resolve_at(&ws, file, off(SRC, "I; }")).unwrap();
+        assert_eq!(r.level, LEVEL_LOCAL, "循环体 I 应是局部");
+    }
+
+    #[test]
+    fn classic_for_init_not_visible_after_loop() {
+        // 循环之后引用 I：for scope 不在查询链上 → 不是局部
+        //（语法接受 ≠ 语义合法——引擎同样拒绝）
+        const SRC: &str = "\
+void F()
+{
+    for (int I = 0; I < 3; I = I + 1) { int A = I; }
+    int Q = I;
+}
+";
+        let ws = build(&[("unique://res/cfor2.as", SRC)]);
+        let file = file_of("unique://res/cfor2.as");
+        let r = resolve_at(&ws, file, off(SRC, "Q = I") + 4);
+        assert!(
+            r.as_ref().map_or(true, |r| r.level != LEVEL_LOCAL),
+            "循环后 I 不应是局部，实际 {:?}",
+            r.as_ref().map(|r| (r.level, first_name(&ws, &r)))
+        );
+    }
+
+    #[test]
+    fn semctx_auto_local_backfills_cross_file_ty() {
+        // auto X = MakeVec()：树里 ty=None（跨文件），SemCtx 回填 FVector
+        const SRC: &str = "\
+struct FVector { float X; }
+FVector MakeVec() { FVector V; return V; }
+void F()
+{
+    auto X = MakeVec();
+    int A = X.X;
+}
+";
+        let ws = build(&[("unique://res/auto.as", SRC)]);
+        let file = file_of("unique://res/auto.as");
+        let r = resolve_at(&ws, file, off(SRC, "X.X")).expect("X 应命中局部");
+        assert_eq!(r.level, LEVEL_LOCAL);
+        match &r.targets[0] {
+            Target::Local(l) => match &l.ty {
+                Some(SynType::Named(n, _)) => {
+                    assert_eq!(crate::intern::sym_str(*n), "FVector", "回填类型")
+                }
+                other => panic!("X 应回填 FVector，实际 {other:?}"),
+            },
+            other => panic!("应是 Target::Local，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bodyless_function_param_resolvable() {
+        // .d.as 无 body 签名：形参可解析（树修正 Phase E：无 body 也建根 scope）
+        const DECL: &str = "struct FVector { float X; }\nvoid SetVec(FVector& InVec);\n";
+        const SRC: &str = "void F()\n{\n    FVector V;\n    SetVec(V);\n}\n";
+        let ws = build(&[
+            ("unique://res/declp.d.as", DECL),
+            ("unique://res/declp.as", SRC),
+        ]);
+        let file = file_of("unique://res/declp.d.as");
+        let r = resolve_at(&ws, file, off(DECL, "InVec")).expect("形参应命中");
+        assert!(
+            matches!(&r.targets[0], Target::Local(_)),
+            "应是 Target::Local，实际 {:?}",
+            r.targets[0]
+        );
     }
 }

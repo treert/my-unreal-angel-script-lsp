@@ -111,36 +111,33 @@ impl ScopeTree {
         }
     }
 
-    /// 查询点可见的全部局部声明（completion 候选）：沿链收集，同名只留
-    /// 最近者；返回序 = 内层在前。
-    pub fn locals_visible(&self, byte: u32) -> Vec<&LocalDecl> {
-        let mut out: Vec<&LocalDecl> = Vec::new();
-        let mut seen: Vec<Sym> = Vec::new();
-        let mut cur = match self.innermost(byte) {
-            Some(c) => c,
-            None => return out,
-        };
+    /// 查询点所在链的全部可见局部（**SemCtx 局部源**，Phase E / E1+E3）：
+    /// **outermost → innermost、scope 内声明序、不去重**——同名重复入栈，
+    /// 遮蔽由查找端 `.rev()` 决定（completion「同名都给」依赖不去重）。
+    /// 可见性过滤 `name_span.start <= byte`（与旧 SemCtx 收集臂同口径）。
+    pub fn locals_chain(&self, byte: u32) -> Vec<&LocalDecl> {
+        let Some(inner) = self.innermost(byte) else { return Vec::new() };
+        let mut chain: Vec<u32> = Vec::new();
+        let mut cur = inner;
         loop {
-            let s = self.scope(cur);
-            // 后声明者优先 ⇒ 倒序扫描，先见者即该 scope 的胜者
-            for d in s.decls.iter().rev() {
-                if d.name_span.start <= byte && !seen.contains(&d.name) {
-                    seen.push(d.name);
-                    out.push(d);
-                }
-            }
-            match s.parent {
+            chain.push(cur);
+            match self.scope(cur).parent {
                 Some(p) => cur = p,
-                None => return out,
+                None => break,
             }
         }
+        let mut out: Vec<&LocalDecl> = Vec::new();
+        for &i in chain.iter().rev() {
+            out.extend(self.scope(i).decls.iter().filter(|d| d.name_span.start <= byte));
+        }
+        out
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intern::{intern_sym, sym_str};
+    use crate::intern::intern_sym;
 
     // 用例源码全部内置（AGENTS.md 硬性规则 / D1）。
     // 手工构造树（提取逻辑在 summary.rs，本模块只测数据结构 + 原语）。
@@ -190,19 +187,25 @@ mod tests {
     }
 
     #[test]
-    fn locals_visible_unions_chain() {
+    fn locals_chain_order_outer_first_no_dedup() {
+        // Phase E / E3：外→内、scope 内声明序、不去重（SemCtx 收集序逐位对齐）
         let t = tree();
-        let mut names: Vec<&str> =
-            t.locals_visible(60).into_iter().map(|d| sym_str(d.name)).collect();
-        names.sort();
-        assert_eq!(names, vec!["A"], "同名遮蔽只留最近者");
+        let chain = t.locals_chain(60);
+        // scope0（外，A@5）先于 scope1（内，A@50）；同名两个都在
+        assert_eq!(chain.len(), 2, "同名不去重");
+        assert_eq!(chain[0].name_span, TextRange::new(5, 6), "外层在前");
+        assert_eq!(chain[1].name_span, TextRange::new(50, 51), "内层在后");
     }
 
     #[test]
-    fn resolve_outside_any_scope_is_none() {
+    fn locals_chain_visibility_and_outside() {
         let t = tree();
-        assert!(t.resolve_local(150, intern_sym("A")).is_none(), "树外查询");
-        assert!(t.locals_visible(150).is_empty(), "树外无可见局部");
+        // byte=45 在内层块内但内层声明（50）未到 → 只见外层
+        let chain = t.locals_chain(45);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].name_span, TextRange::new(5, 6));
+        // 树外查询 → 空
+        assert!(t.locals_chain(150).is_empty(), "树外无可见局部");
     }
 
     #[test]

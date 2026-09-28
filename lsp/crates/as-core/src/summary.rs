@@ -164,31 +164,33 @@ struct ScopeWalker<'a> {
 }
 
 impl<'a> ScopeWalker<'a> {
-    /// 递归找函数体起点（namespace / class 体内均可）。
+    /// 递归找函数声明（namespace / class 体内均可）。
     fn walk_root(&mut self, node: Node<'_>) {
         match node.kind() {
             "function_declaration" | "constructor_declaration" | "destructor_declaration" => {
+                // 根 scope：span = 声明整体（形参在 body 外，必须被覆盖）。
+                // 无 body（`.d.as` 签名）也建——签名形参可解析（Phase E 对齐
+                // 旧 SemCtx：函数声明臂收集形参不依赖 body 存在）。
+                let decls = syntax::param_decls(node, self.src)
+                    .into_iter()
+                    .map(|p| LocalDecl {
+                        name: p.name,
+                        kind: LocalKind::Param,
+                        name_span: p.span,
+                        ty: p.ty,
+                    })
+                    .collect();
+                let idx = self.scopes.len() as u32;
+                self.scopes.push(Scope { parent: None, span: syntax::span(node), decls });
                 if let Some(body) = node.child_by_field_name("body") {
-                    // 根 scope：span = 声明整体（形参在 body 外，必须被覆盖）
-                    let decls = syntax::param_decls(node, self.src)
-                        .into_iter()
-                        .map(|p| LocalDecl {
-                            name: p.name,
-                            kind: LocalKind::Param,
-                            name_span: p.span,
-                            ty: p.ty,
-                        })
-                        .collect();
-                    let idx = self.scopes.len() as u32;
-                    self.scopes.push(Scope { parent: None, span: syntax::span(node), decls });
                     self.walk_stmts(body, idx);
-                    return; // body 已走完，不再整体下潜
                 }
             }
-            _ => {}
-        }
-        for (_f, child) in syntax::children_with_fields(node) {
-            self.walk_root(child);
+            _ => {
+                for (_f, child) in syntax::children_with_fields(node) {
+                    self.walk_root(child);
+                }
+            }
         }
     }
 
@@ -228,6 +230,20 @@ impl<'a> ScopeWalker<'a> {
                 }
                 let idx = self.scopes.len() as u32;
                 self.scopes.push(Scope { parent: Some(scope), span: syntax::span(node), decls });
+                for (_f, child) in syntax::children_with_fields(node) {
+                    self.walk_stmts(child, idx);
+                }
+            }
+            "for_statement" => {
+                // classic for 的初始化声明在整条 for 语句内可见（Phase E 对齐
+                // 旧 SemCtx 收集臂——init 声明不得泄漏进外层块：
+                // 循环之后不可见）。body/条件子节点走同一 scope。
+                let idx = self.scopes.len() as u32;
+                self.scopes.push(Scope {
+                    parent: Some(scope),
+                    span: syntax::span(node),
+                    decls: Vec::new(),
+                });
                 for (_f, child) in syntax::children_with_fields(node) {
                     self.walk_stmts(child, idx);
                 }
