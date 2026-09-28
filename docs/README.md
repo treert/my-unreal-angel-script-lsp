@@ -13,6 +13,7 @@
 | [`实现决策记录.md`](实现决策记录.md) | **定案清单** D1-D24：每条含背景、裁决、理由。已定条目不改写，新决策追加编号；修正既有决策时注明「修正 Dxx」（如 D21 修正 D20、D23 修正 D16、D24 修正 D18） | 遇到「为什么这么定」时查 |
 | [`实现优化.md`](实现优化.md) | **基础设施优化技术**：`FileId` 注册表（含墓碑语义）、`Sym` intern（移植自 mylua，含适配改动） | M0 实现 intern 时 |
 | [`架构设计-引擎内部语法.md`](架构设计-引擎内部语法.md) | 引擎内部构造的 LSP 约定：`?` 通配类型、`auto`、`unresolved_object`、**模板声明头**四件套（§5 总览） | 处理 `.d.as` 奇异形态时 |
+| [`index-architecture.md`](index-architecture.md) | **索引层重构设计**：per-file summary + 薄聚合层 + 按需定型（参考 mylua）；D5/D23/D29 翻案；use-site 查询期化；mixin 名字倒排；实施切分 7 步 | 动索引层（as-core `index.rs` / `references.rs`）前必读 |
 | [`诊断码表.md`](诊断码表.md) | **码号登记处 + 已取证的引擎约束素材库**：编码规则、码号占用总览。诊断规则按需设计，该表**不构成实现承诺**（D22） | 只在做诊断（P5/M6）时 |
 | [`future-work.md`](future-work.md) | **剩余待办汇总**：P5/P6 主线、语义近似、性能收敛、数据源缺陷、扩展侧、文档修缮——各条注明原登记处 | 规划下一步 / 接手时 |
 
@@ -43,6 +44,7 @@ AGENTS.md（仓库说明 + 测试硬性规则）
 | M4 references/rename/workspaceSymbol + 重载消歧 + watched-files | ✅ 完成（uses.rs UseSite 记录 + 引用倒排；references.rs 解析内核——**parent 链上溯**修掉从根下潜的 O(兄弟) 重遍历，全语料首查 163s→0.6s；重载消歧 D28（arity + 可定型实参，失败报全部）；rename 严格匹配；workspaceSymbol D30 过滤；$/progress 长任务；watch.rs DidChangeWatchedFiles 动态注册 + `.as` 增删改名 + `.d.as` 防抖 500ms/5s（D24）；声明面指纹联动失效（D29）。**顺带修 M3 遗留**：expand/mixin 幽灵符号（reindex 后旧 DefId 未过滤 ⇒ 重复合成 namespace 进 main）、range-for 迭代变量死分支（`"range_for_statement"` 节点不存在）。96 单测全绿；语料 ref-stats 68763 站点 99.4% 解析；e2e：FVector 引用 2846 站点/88 文件 + $/progress、watched-files 生命周期（增删复活 + 防抖）。**VSCode 体感验收待人工执行**（EDH：Find All References / Rename / Ctrl+T） |
 | M5 completion/signatureHelp/inlayHint + 表达式定型完整化 | ✅ 完成（`expr.rs` 定型管线——运算符重载消歧/字面量/f-string/range-for 双跳/模板实参替换最小子集（D31-D33），resolve-stats 94.3%→94.9%；`completion.rs` 语境判定——Member/Scoped/CallArg/Plain/Specifier/FNameUFunction 六类 + 错误恢复归约 + InArgN 跳过（复用 M1 UNNAMED_PARAM，D34）；`specifiers.rs` 说明符表（引擎 PP_NAME 消费区间取证）；`signature.rs` 槽位排序 + 命名实参按名定位（D35）；`inlay.rs` auto 推导展示。**顺带修 M3 潜伏 bug**：冷启动 pending_dirty 重放被 indexed_versions 预填短路（didOpen 文本 ≠ 磁盘时 hover 恒 null，M4 e2e 因文本恰等未暴露）。136 单测全绿；e2e 补 Scoped/Member 补全断言。**VSCode 体感验收待人工执行**（EDH：四类补全 + 签名帮助 + auto inlay 截图，规划 §9 M5） |
 | M6 诊断起步 | ✅ 完成（as-core `diag.rs`——`enum DiagCode`（仅收已实现码）+ `Diag`/`DiagSeverity` + 行级抑制解析；as-lsp `diag.rs` 发布管道——didOpen/didChange 后 Ready 时同步推、didClose 清空、Loading 不推 + 快照发布经 diag 通道补推全部已打开文档（AS0902 decl 计数随重建刷新）。两规则生效：`AS0903`（Error，`ERROR`/`MISSING` 节点）/ `AS0902`（Warning，decl 缺失，(0,0)）；抑制注释 `// as-ignore:` 四形态。151 单测全绿；smoke 三段断言（初始 AS0902+AS0903 → 修复 → 抑制空）；双 e2e + 对账 13814/63338 不回归。**VSCode 体感验收待人工执行**（EDH：语法错误红线 + Problems 面板 + 抑制注释生效）。形态定案见 **D36**；具体规则进 P5 按需设计（D22） |
+| 索引层重构 | 📐 设计定稿（[`index-architecture.md`](index-architecture.md)，2026-09-28）：per-file summary + 薄聚合层 + 按需定型；D5/D23/D29 翻案；use-site/references 查询期化（mylua 同构）；mixin 名字倒排简化；DefId → DeclRef 一步到位。实施切分 7 步未开工 |
 
 ### 开工前的已知待办（不阻塞 M0/M1，但须在对应里程碑前处理）
 
