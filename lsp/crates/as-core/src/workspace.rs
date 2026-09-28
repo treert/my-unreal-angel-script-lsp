@@ -28,6 +28,7 @@ use rayon::prelude::*;
 
 use crate::aggregation::{Aggregation, DeclRef};
 use crate::config::IndexConfig;
+use crate::diag::Diag;
 use crate::id::{FileId, Sym};
 use crate::intern::{intern_file, intern_sym, sym_str};
 use crate::range::{LineIndex, TextRange};
@@ -544,6 +545,30 @@ impl Workspace {
         out
     }
 
+    /// AS0907 继承环诊断（Phase D / P2）：`cyclic_classes()` 每个环成员类在
+    /// 其 base 名字区间（`bases[0].span`）产一条 Error。
+    /// **Decl 文件成员跳过**——导出器不产环，腐坏导出不在诊断面（spec P2）。
+    /// 输出未经抑制过滤——消费方（as-lsp）与 script_diags 共用
+    /// `diag::filter_suppressions` 统一滤。
+    pub fn cycle_diags(&self) -> HashMap<FileId, Vec<Diag>> {
+        use crate::diag::{DiagCode, DiagSeverity, AS0907_MESSAGE};
+        let mut out: HashMap<FileId, Vec<Diag>> = HashMap::new();
+        for r in self.cyclic_classes() {
+            if self.files[&r.file].kind == FileKind::Decl {
+                continue;
+            }
+            if let Some(base) = self.decl(&r).bases.first() {
+                out.entry(r.file).or_default().push(Diag {
+                    code: DiagCode::As0907,
+                    range: base.span,
+                    severity: DiagSeverity::Error,
+                    message: AS0907_MESSAGE.to_string(),
+                });
+            }
+        }
+        out
+    }
+
     /// 文件 → 模块名（`local` 函数可见域过滤；模块归属随 FileSummary）。
     pub fn module_of(&self, file: FileId) -> Option<Sym> {
         self.files.get(&file).and_then(|e| e.summary.module)
@@ -601,13 +626,17 @@ fn builtin_summary() -> FileSummary {
     }
 }
 
-fn decl_surface(s: &FileSummary) -> Vec<(Sym, DefKind, Option<Sym>)> {
-    let mut out: Vec<(Sym, DefKind, Option<Sym>)> = s
+fn decl_surface(s: &FileSummary) -> Vec<(Sym, DefKind, Option<Sym>, Vec<Sym>)> {
+    let mut out: Vec<(Sym, DefKind, Option<Sym>, Vec<Sym>)> = s
         .decls
         .iter()
         .map(|d| {
             let parent_name = d.parent.map(|p| s.decls[p as usize].name);
-            (d.name, d.kind, parent_name)
+            // Phase D / P6：bases 入面——「class A : B 改 : C」必须算结构变化
+            // （跨文件环诊断的级联依据）；sorted 保证与声明序无关。
+            let mut bases: Vec<Sym> = d.bases.iter().map(|b| b.name).collect();
+            bases.sort();
+            (d.name, d.kind, parent_name, bases)
         })
         .collect();
     out.sort();
@@ -809,6 +838,71 @@ class Orphan : TMissing {}
         let names: Vec<&str> =
             ws.ancestor_chain(&c).iter().map(|r| sym_str(ws.decl(r).name)).collect();
         assert_eq!(names, vec!["A", "B"], "环不影响旁支");
+    }
+
+    #[test]
+    fn cycle_diags_reports_members_at_base_span() {
+        // 双文件互继承 → 两侧各一条 AS0907，range 落在 base 名字区间
+        let ws = ws_build(&[
+            ("unique://cyc/a.as", "class A : B {}\n"),
+            ("unique://cyc/b.as", "class B : A {}\n"),
+        ]);
+        let diags = ws.cycle_diags();
+        let a = intern_file("unique://cyc/a.as", 0);
+        let b = intern_file("unique://cyc/b.as", 0);
+        assert_eq!(diags.len(), 2, "两个文件各一条");
+        let da = &diags[&a];
+        assert_eq!(da.len(), 1);
+        assert_eq!(da[0].code, crate::diag::DiagCode::As0907);
+        assert_eq!(da[0].severity, crate::diag::DiagSeverity::Error);
+        assert_eq!(
+            &"class A : B {}\n"[da[0].range.start as usize..da[0].range.end as usize],
+            "B"
+        );
+        let db = &diags[&b];
+        assert_eq!(db.len(), 1);
+        assert_eq!(
+            &"class B : A {}\n"[db[0].range.start as usize..db[0].range.end as usize],
+            "A"
+        );
+        // 无环 → 空
+        let ws2 = ws_build(&[("unique://cyc/clean.as", "class C {}\n")]);
+        assert!(ws2.cycle_diags().is_empty());
+    }
+
+    #[test]
+    fn cycle_diags_skips_decl_file_members() {
+        // Decl 文件（.d.as）里的环成员跳过——导出器不产环，腐坏导出不在诊断面
+        let ws = ws_build(&[("unique://cyc/x.d.as", "class A : B {}\nclass B : A {}\n")]);
+        assert!(ws.cycle_diags().is_empty());
+    }
+
+    #[test]
+    fn as0907_suppressible_via_ignore() {
+        // 同套抑制语法：base 行同行尾注释可抑制 AS0907
+        let src_a = "class A : B {} // as-ignore: AS0907\n";
+        let ws = ws_build(&[
+            ("unique://sup/a.as", src_a),
+            ("unique://sup/b.as", "class B : A {}\n"),
+        ]);
+        let a = intern_file("unique://sup/a.as", 0);
+        let diags = crate::diag::filter_suppressions(ws.cycle_diags().remove(&a).unwrap(), src_a);
+        assert!(diags.is_empty(), "同行 as-ignore 应抑制 AS0907");
+    }
+
+    #[test]
+    fn reindex_base_change_is_surface_change() {
+        // P6：改基类（name/kind/parent 不变）必须算结构变化
+        let mut ws = ws_build(&[("unique://surf/a.as", "class A : B {}\nclass B {}\n")]);
+        let file = intern_file("unique://surf/a.as", 0);
+        assert!(
+            ws.reindex_file(file, FileKind::Script, "class A : C {}\nclass B {}\n".to_string()),
+            "改基类应报 surface 变化"
+        );
+        assert!(
+            !ws.reindex_file(file, FileKind::Script, "class A : C {}\nclass B {}\n".to_string()),
+            "内容未变不应报"
+        );
     }
 
     #[test]

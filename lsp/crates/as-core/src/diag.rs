@@ -26,11 +26,14 @@ pub enum DiagCode {
     /// `AS0903`：解析错误（tree-sitter `ERROR`/`MISSING` 节点）——已知文法
     /// 缺口的最小闭环（如 f-string 嵌套格式说明符，grammar/README 偏差 §9）。
     As0903,
+    /// `AS0907`：继承环（`Workspace::cycle_diags` 检出的环成员类，
+    /// range = base 名字区间——Phase D / D40）。
+    As0907,
     // —— 登记位（未实现 / retired，不设变体；码号不复用，码表 §1 纪律）——
     // AS0001-0005 / AS0101-0106 / AS0201-0206 / AS0301-0302：引擎约束素材
     //   （码表 §2，P5 按需设计——不构成实现承诺，D22）
     // AS0107 / AS0901 / AS0904 / AS0905 / AS0906：retired
-    // 下一个可用：AS0907
+    // 下一个可用：AS0908
 }
 
 impl DiagCode {
@@ -40,6 +43,7 @@ impl DiagCode {
         match s {
             "AS0902" => Some(DiagCode::As0902),
             "AS0903" => Some(DiagCode::As0903),
+            "AS0907" => Some(DiagCode::As0907),
             _ => None,
         }
     }
@@ -50,6 +54,7 @@ impl std::fmt::Display for DiagCode {
         let s = match self {
             DiagCode::As0902 => "AS0902",
             DiagCode::As0903 => "AS0903",
+            DiagCode::As0907 => "AS0907",
         };
         f.write_str(s)
     }
@@ -144,6 +149,9 @@ Tools > Angelscript > Export Type Declarations (.d.as)。";
 pub const AS0903_MESSAGE: &str = "语法无法解析。若代码本身正确，\
 可能是已知文法缺口（如 f-string 嵌套格式说明符，grammar/README 偏差 §9）。";
 
+/// AS0907 的措辞（Phase D / D40）。
+pub const AS0907_MESSAGE: &str = "该类的继承链成环（cyclic inheritance），引擎侧无法编译。";
+
 /// 一个脚本文件的诊断全集（M6：AS0903 + 可选 AS0902，经抑制过滤）。
 ///
 /// - `engine_decls_missing`：索引中 `.d.as` 数为 0（工作区级事实）——只对
@@ -171,18 +179,25 @@ pub fn script_diags(tree: &Tree, text: &str, engine_decls_missing: bool) -> Vec<
         });
     }
     out.sort_by_key(|d| d.range.start);
+    filter_suppressions(out, text)
+}
+
+/// 行级抑制过滤（`parse_suppressions` + 诊断 range 起始行命中即丢弃）。
+/// `script_diags` 与 AS0907（`cycle_diags` 的产物）共用同一套抑制语义
+/// （Phase D / D40 抽出；对已过滤集合幂等）。
+pub fn filter_suppressions(mut diags: Vec<Diag>, text: &str) -> Vec<Diag> {
     let sups = parse_suppressions(text);
     if sups.is_empty() {
-        return out;
+        return diags;
     }
     let lines = LineIndex::new(text);
-    out.retain(|d| {
+    diags.retain(|d| {
         let line = lines.line_of(d.range.start) as u32;
         !sups.iter().any(|s| {
             s.line == line && s.codes.as_ref().map_or(true, |c| c.contains(&d.code))
         })
     });
-    out
+    diags
 }
 
 #[cfg(test)]
@@ -338,5 +353,12 @@ mod tests {
         let text = "string s = \"// as-ignore: AS0903\";\n";
         let sups = parse_suppressions(text);
         assert_eq!(sups, vec![Suppression { line: 0, codes: Some(vec![]) }]);
+    }
+
+    #[test]
+    fn diag_code_as0907_display_and_parse() {
+        assert_eq!(DiagCode::As0907.to_string(), "AS0907");
+        assert_eq!(DiagCode::parse("AS0907"), Some(DiagCode::As0907));
+        assert_eq!(DiagCode::parse("AS0908"), None); // 未登记
     }
 }
