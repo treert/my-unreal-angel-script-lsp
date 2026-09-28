@@ -1,6 +1,7 @@
 // LSP server stdio smoke test: initialize -> didOpen -> semanticTokens/full
 // -> documentSymbol -> hover/definition (M3) -> references/prepareRename/
-// rename/workspaceSymbol + $/progress (M4). 用例源码内置（D1）。
+// rename/workspaceSymbol (M4；$/progress 分批已随 Phase B 缓存退役删除).
+// 用例源码内置（D1）。
 // 用法: node tests/lsp-smoke.mjs [path-to-as-lsp.exe]
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -311,14 +312,7 @@ if (!totalHint || totalHint.label !== ': int') {
   fail(`inlayHint line6 expect ': int' for auto Total: ${JSON.stringify(ih.result)}`);
 }
 
-// ---- M4: $/progress（references 长任务）----
-const progressMsgs = notifications.filter((n) => n.method === '$/progress');
-if (progressMsgs.length === 0) fail('no $/progress notifications for references');
-const beginOk = progressMsgs.some((n) => n.params?.value?.kind === 'begin');
-const endOk = progressMsgs.some((n) => n.params?.value?.kind === 'end');
-if (!beginOk || !endOk) {
-  fail(`progress begin/end missing: ${JSON.stringify(progressMsgs.map((n) => n.params?.value))}`);
-}
+// ---- M4: $/progress 已随 Phase B（D38）缓存退役删除，不再断言 ----
 
 // ---- M4 可观测性：myas/indexStatus（索引就绪自定义通知）----
 // 注：冒烟场景 workspace 为空（rootUri null），初始 ready 的 files=0 是
@@ -364,6 +358,6 @@ if ((finalPub.params?.diagnostics ?? []).length !== 0) {
   fail(`final publish after suppression should be empty: ${JSON.stringify(finalPub.params)}`);
 }
 
-console.log(`SMOKE OK: legend ${legend.length} types, ${tokenCount} tokens, symbols OK, didOpen logged=${opened}, hover/definition/references/rename/workspaceSymbol/completion(+specifier)/signatureHelp/inlayHint OK, $/progress msgs=${progressMsgs.length}, indexStatus files=${readyParams.files}, diagnostics pubs=${forDoc.length} (AS0902+AS0903→fix→suppress)`);
+console.log(`SMOKE OK: legend ${legend.length} types, ${tokenCount} tokens, symbols OK, didOpen logged=${opened}, hover/definition/references/rename/workspaceSymbol/completion(+specifier)/signatureHelp/inlayHint OK, indexStatus files=${readyParams.files}, diagnostics pubs=${forDoc.length} (AS0902+AS0903→fix→suppress，D40 防抖调度)`);
 p.kill();
 process.exit(0);
