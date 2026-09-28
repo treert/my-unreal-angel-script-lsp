@@ -413,7 +413,7 @@ fn dump_index(
             if d.bases.iter().any(|b| b.simple) {
                 classes_with_base += 1;
                 let r = DeclRef { file, local: i as u32 };
-                if ws.resolve_base_class(&r).is_none() {
+                if ws.base_class(&r).is_none() {
                     unresolved_bases += 1;
                 }
             }

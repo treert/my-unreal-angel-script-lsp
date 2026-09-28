@@ -84,8 +84,9 @@ const BUILTIN_PRIMITIVES: &[&str] = &[
     "float32", "float64", "double",
 ];
 
-/// 继承闭包深度上限（防环与病态深度；环另有显式检测）。
-const MAX_CLOSURE_DEPTH: usize = 256;
+/// 走链深度上限（防环与病态深度；环另有显式检测）。C6：零缓存走链的
+/// 安全阀，对齐旧 MAX_CLOSURE_DEPTH（B5 eager 时代的闭包构建上限）。
+const MAX_CHAIN_DEPTH: usize = 256;
 
 /// per-file 查询入口（旧 FileSnapshot 的继任）。
 pub struct FileEntry {
@@ -524,8 +525,8 @@ impl Workspace {
             let mut chain: Vec<DeclRef> = Vec::new();
             let mut path: Vec<DeclRef> = vec![class];
             let mut cur = class;
-            for _ in 0..MAX_CLOSURE_DEPTH {
-                let Some(base) = self.resolve_base_class(&cur) else { break };
+            for _ in 0..MAX_CHAIN_DEPTH {
+                let Some(base) = self.base_class(&cur) else { break };
                 if let Some(pos) = path.iter().position(|&d| d == base) {
                     for &d in &path[pos..] {
                         if !cyclic.contains(&d) {
@@ -543,9 +544,10 @@ impl Workspace {
         self.cycle_classes = cyclic;
     }
 
-    /// 基名 → Class 声明（simple 形态才解析；查不到 = 链到此为止）。
-    pub fn resolve_base_class(&self, def: &DeclRef) -> Option<DeclRef> {
-        let d = self.decl(def);
+    /// 单跳：class → 直接基类（simple 基名 → Class 声明；struct / 未知名 =
+    /// None）。原 `resolve_base_class` 更名（C5：命名改祖先链语义）。
+    pub fn base_class(&self, class: &DeclRef) -> Option<DeclRef> {
+        let d = self.decl(class);
         let base = d.bases.iter().find(|b| b.simple)?;
         self.lookup(base.name)
             .iter()
@@ -556,6 +558,57 @@ impl Workspace {
             })
     }
 
+    /// 祖先链（近者在前，不含 self）：逐级 base_class 走链，环在首次重复处
+    /// 截断 + 深度上限。空链 = 无基类 / unresolved base / struct（D16：struct
+    /// 不走链）。
+    /// C6：零缓存——链由 bases 名 + agg 一跳完全推导（AActor 深度 ~10 ≈
+    /// 10 次哈希，µs 级），reindex 后立即按新 agg 现算，无「清空→重建」
+    /// 中间态。
+    pub fn ancestor_chain(&self, class: &DeclRef) -> Vec<DeclRef> {
+        let mut chain = Vec::new();
+        let mut visited: Vec<DeclRef> = vec![*class];
+        let mut cur = *class;
+        for _ in 0..MAX_CHAIN_DEPTH {
+            let Some(base) = self.base_class(&cur) else { break };
+            if visited.contains(&base) {
+                break; // 环：在首次重复处截断（对齐旧 build_closures 语义）
+            }
+            visited.push(base);
+            chain.push(base);
+            cur = base;
+        }
+        chain
+    }
+
+    /// 全扫环检测（诊断素材 / as-cli 统计；C4——旧 `cycle_classes` 字段的
+    /// 查询期继任）：走链中 path 上重复段即环成员，去重收集。
+    pub fn cyclic_classes(&self) -> Vec<DeclRef> {
+        let mut out: Vec<DeclRef> = Vec::new();
+        for (&file, e) in &self.files {
+            for (i, d) in e.summary.decls.iter().enumerate() {
+                if d.kind != DefKind::Class || d.flags.contains(DefFlags::SYNTHETIC) {
+                    continue;
+                }
+                let class = DeclRef { file, local: i as u32 };
+                let mut path = vec![class];
+                let mut cur = class;
+                for _ in 0..MAX_CHAIN_DEPTH {
+                    let Some(base) = self.base_class(&cur) else { break };
+                    if let Some(pos) = path.iter().position(|&d| d == base) {
+                        for &d in &path[pos..] {
+                            if !out.contains(&d) {
+                                out.push(d);
+                            }
+                        }
+                        break;
+                    }
+                    path.push(base);
+                    cur = base;
+                }
+            }
+        }
+        out
+    }
     // 声明类型归一化 + `resolve_syn`（平移自 index.rs；DefId → DeclRef，
     // 消费者 = expr.rs 的 resolved 回落 + Aggregation 之外的 eager 派生）。
     //
@@ -977,6 +1030,47 @@ class Orphan : TMissing {}
         let c = ws.lookup_type_def(intern_sym("C")).unwrap();
         let names: Vec<&str> = ws.closures[&c].iter().map(|r| sym_str(ws.decl(r).name)).collect();
         assert_eq!(names, vec!["A", "B"], "环不影响旁支");
+    }
+
+    #[test]
+    fn ancestor_chain_matches_eager_closures() {
+        // 过渡等价性（C6）：对全部 class 断言 ancestor_chain == closures 表值。
+        // Task 3 删 closures 字段后本用例随之删除（语义用例接棒）
+        const SRC: &str = "\
+class ABase {}
+class AMid : ABase {}
+class ALeaf : AMid {}
+class Bad1 : Bad2 {}
+class Bad2 : Bad1 {}
+class Orphan : TMissing {}
+struct S : ABase {}
+";
+        let ws = ws_build(&[("unique://wseq/mix.as", SRC)]);
+        let mut checked = 0;
+        for (&file, e) in &ws.files {
+            for (i, d) in e.summary.decls.iter().enumerate() {
+                if d.kind != DefKind::Class || d.flags.contains(DefFlags::SYNTHETIC) {
+                    continue;
+                }
+                let c = DeclRef { file, local: i as u32 };
+                assert_eq!(ws.ancestor_chain(&c), ws.closures[&c], "链等价: {}", sym_str(d.name));
+                checked += 1;
+            }
+        }
+        assert!(checked >= 6);
+    }
+
+    #[test]
+    fn cyclic_classes_matches_old() {
+        // 过渡等价性：与 eager cycle_classes 对照（Task 3 随字段删除而删除）
+        const SRC: &str = "class A : B {}\nclass B : A {}\nclass C : A {}\n";
+        let ws = ws_build(&[("unique://wcyc/m.as", SRC)]);
+        let mut old = ws.cycle_classes.clone();
+        let mut new = ws.cyclic_classes();
+        old.sort();
+        new.sort();
+        assert_eq!(new, old);
+        assert_eq!(new.len(), 2);
     }
 
     #[test]
