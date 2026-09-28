@@ -1,6 +1,6 @@
 # 索引架构（per-file summary + 薄聚合层 + 按需定型）
 
-> 版本 v1.4（2026-09-28）
+> 版本 v1.5（2026-09-28）
 >
 > **定位**：索引层的**重构设计稿**。现行架构（三阶段流水线、全局扁平符号 arena、
 > use-site 预收集）的替代方案。驱动因素：冷启动性能（414 `.d.as` ~1s 仍偏慢且
@@ -327,6 +327,13 @@ v1.0 原案设想的「进程级缓存容器 + 统一失效」被实现期证伪
 Loading 期语义请求返回空的设计与本分层自洽（auto 跨文件传播推不出 =
 索引未就位的正确行为）。
 
+> **Phase D 落地状态（v1.5，D40）**：语义诊断行已实施——as-lsp
+> `DiagnosticScheduler`（热文件 300ms 防抖 / **结构变化（`decl_surface`
+> 扩含 bases）触发全量重诊断** / 打开文件在前 / drain 中途新事件即刻插队；
+> D36「同步推无防抖」翻案）。AS0902 发布面扩到全部 Script 文件；AS0907
+> （继承环，`cycle_diags()` = C4 预留素材接口的首个消费方）作为首个
+> 工作区级语义诊断落地。增量更新路径（贡献倒排消费）仍属 Phase E。
+
 ---
 
 ## 6. references / rename 查询期化（D5 翻案）
@@ -452,7 +459,7 @@ append-only 内存单调涨与重映射复杂度——旧设计不迁就（用�
 | 3 | L3 数据后端切换：DeclRef + fetch 访问器替换 DefId 直查（resolve/expr/completion/hover/inlay/outline/tokens/signature） | 全部既有单测绿（这是最大的一步，靠 138+ 单测兜底） |
 | 4 | 闭包/mixin/合成成员/TypeTable 改按需 + 缓存 | 单测：走链等价（含环 / unresolved / struct mixin） |
 | 5 | references/rename/documentHighlight 查询期化 + 删 uses/ref_index/use_cache/D29 | 单测：匹配语义等价；ref-stats 语料对账（99.4% 不回归） |
-| 6 | as-lsp 侧：诊断调度队列（mylua 式）+ 增量更新路径（贡献倒排） | e2e：didChange 增量 / watched-files 生命周期 |
+| 6 | as-lsp 侧：诊断调度队列（mylua 式）+ 增量更新路径（贡献倒排） | e2e：didChange 增量 / watched-files 生命周期。**诊断调度半边 = Phase D（D40）**；增量更新路径 = Phase E |
 | 7 | 文档同步：`架构设计.md` §4、`LSP实现规划.md` §4-§6、决策记录追加 D37+ | 文档治理规则 3/5 |
 
 步骤 3 与 5 可互换；步骤 1-2 无行为变化；步骤 3 后旧 `WorkspaceIndex`
@@ -495,6 +502,7 @@ append-only 内存单调涨与重映射复杂度——旧设计不迁就（用�
 
 | 版本 | 日期 | 内容 |
 |---|---|---|
+| v1.5 | 2026-09-28 | **Phase D 落地同步**（D40）：语义诊断调度——as-lsp `DiagnosticScheduler`（纯数据结构，mylua 同构薄化：热文件表统一 modified/explicit、无 scope 配置）；**D36 翻案**（didOpen/didChange 同步推无防抖 → 300ms 防抖单发布通道）；级联 = `decl_surface` 扩含 bases 的结构变化 → 全量重诊断（打开优先、固定 Full、`.d.as` 剔除）；插队 = 热表 pop 优先；AS0902 发布面扩到全部 Script 文件；AS0907 继承环（`cycle_diags()` C4 素材兑现，base span Error，Decl 成员跳过）。验收：176 单测全绿（160 基线 + 16）、三旗标精确一致 |
 | v1.4 | 2026-09-28 | **Phase C 落地同步**（D39）：最后三个 ⏳ 项收官，结论比原案更激进——**删除与零缓存**而非「按需 + 缓存」。C5（命名改祖先链语义：`base_class`/`ancestor_chain`——`closures` 系图论闭包命名易与 AS 无函数闭包混淆）；C6（继承零缓存：链由 bases 名 + agg 一跳完全推导，原方案的链缓存被否决；reindex 后立即现算无中间态）；C7（TypeId 体系退役：expr resolved 回落经语料取证 0 命中系死路径、活跃定型管线是 DeclRef + SynType 双件套——TypeTable/TypeKind/TypeId/resolve_syn/render_type/named_base 全删，types.rs 只留 SynType/RefKind，**D17/G7 翻案**）；C2（无缓存容器：v1.0 设想的 Mutex 派生缓存整体作废，§5.2/§5.4 重写）。验收：160 单测全绿（162 基线：-2 退休有继任、-3 随 TypeTable 机制消失、+1 reindex 即时反映、+2 expr 继任）、三旗标精确一致（resolve-stats 1028/1083=94.9%、ref-stats 25505 hits 逐位、decls 101322）、expr 死回落 441 文件语料取证 0 命中、as-lsp 零改动。代码净删 ~470 行 |
 | v1.3 | 2026-09-28 | **Phase B 落地同步**（D38）：L3 后端切换 DefId → DeclRef 完成——B1-B7 实施裁决落入 §8/§11（references 查询期唯一路径；builtin 合成伪文件（B2，agg.main +15 内建键为预期差）；类直接兼任 namespace（B3，origin_fallback/合成 namespace 删除）；合成成员查询期 synthetic_members + Target::Synthetic/RefTarget::Synthetic（B4，D10 origin 以 DeclRef 保留）；closures/resolved/TypeTable 保持 eager 到 Phase C（B5）；members = by_parent + namespace 聚合（B7））。§8 生死清单标注落地状态；§11 补 Phase A/B 执行映射（步骤 5 提前并入 B1、步骤 3+5 合并于 B3 原子切换）。旧 WorkspaceIndex/DefId/DefData/SymbolTable/index.rs/expand.rs/uses.rs 全删。验收：162 单测全绿、resolve-stats 94.9% 精确一致、ref-stats 25505 hits 逐位一致（~305ms）、--new-arch decls 101134 一致 |
 | v1.2 | 2026-09-28 | **Phase A 落地同步**（实现期三处裁决）：① LocalKind 无 LocalFn（AS 无嵌套函数，v1.1 笔误）；② auto 预推导不做构造调用（`auto X = Ident(args)` 与函数调用无法语法区分，宁缺毋假）+ 显式声明保留裸 `float` / 字面量给规范名的双层口径（§3.3.1）；③ 聚合层模块映射改成员表 + `module_file` 访问器（删除时接替者自动重选，§4.1）。Phase A 验收：414 `.d.as` 双轨对账零差异（decls 101134 / main keys 53711），新架构 531ms vs 旧 956ms（-44%） |
