@@ -27,12 +27,51 @@ use rayon::prelude::*;
 use crate::aggregation::{Aggregation, DeclRef};
 use crate::config::IndexConfig;
 use crate::id::{FileId, Sym, TypeId};
-use crate::index::FileInput;
 use crate::intern::{intern_file, intern_sym, sym_str};
 use crate::range::{LineIndex, TextRange};
 use crate::summary::{extract_summary, FileSummary, RawDecl, RawExtra};
-use crate::symbol::{BaseRef, DefFlags, DefKind, ParamDecl};
+use crate::symbol::{DefFlags, DefKind, ParamDecl};
 use crate::types::{RefKind, SynType, TypeKind, TypeTable};
+
+/// 文件类别（Phase 0 的实质产出之一：两类失效粒度与允许构造不同，D19）。
+/// （Phase B 从 index.rs 挪入——index.rs 删除后本模块是 FileInput 的家。）
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum FileKind {
+    /// 用户脚本
+    Script,
+    /// UE 导出声明（`Saved/AS-Cache` / `TypeDecls`）
+    Decl,
+}
+
+impl FileKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            FileKind::Script => "script",
+            FileKind::Decl => "decl",
+        }
+    }
+}
+
+pub struct FileInput {
+    pub file: FileId,
+    pub kind: FileKind,
+    pub source: String,
+    /// 模块名（引擎 `FilenameToModuleName`，相对收集根计算——Phase 0 产出，
+    /// 规划 §4：决定 `local` 符号的可见域）。`.d.as` 侧可不给（无 local 函数）。
+    pub module: Option<Sym>,
+}
+
+/// 引擎 `FilenameToModuleName`：去 `.as` / `.d.as` 扩展、`/` / `\` → `.`。
+/// 输入应是相对模块根的路径（根的确定是 Phase 0 的事，本函数不感知）。
+pub fn filename_to_module_name(rel_path: &str) -> String {
+    let stem = rel_path
+        .strip_suffix(".d.as")
+        .or_else(|| rel_path.strip_suffix(".as"))
+        .unwrap_or(rel_path);
+    stem.chars()
+        .map(|c| if c == '/' || c == '\\' { '.' } else { c })
+        .collect()
+}
 
 /// builtin 伪文件路径（`intern_file` 一次；FileId 进程级复用）。
 pub const BUILTIN_FILE_PATH: &str = "<as-core:builtin>";
@@ -50,7 +89,7 @@ const MAX_CLOSURE_DEPTH: usize = 256;
 
 /// per-file 查询入口（旧 FileSnapshot 的继任）。
 pub struct FileEntry {
-    pub kind: crate::index::FileKind,
+    pub kind: FileKind,
     pub source: String,
     pub tree: as_syntax::tree_sitter::Tree,
     pub lines: LineIndex,
@@ -69,8 +108,10 @@ pub struct SyntheticMember {
     /// 签名（Callable 形态；StaticClass 是零参函数）
     pub return_type: Option<SynType>,
     pub params: Vec<ParamDecl>,
-    /// 锚点复用源头声明（hover/definition 落点）
+    /// 锚点 = 源头声明的名字 token（hover/definition 落点）
     pub name_span: TextRange,
+    /// 源头声明（D10 origin 的 DeclRef 形态——definition/rename 语义锚）
+    pub origin: DeclRef,
 }
 
 /// L3 数据后端。
@@ -127,7 +168,7 @@ impl Workspace {
         files.insert(
             builtin_file,
             FileEntry {
-                kind: crate::index::FileKind::Decl,
+                kind: FileKind::Decl,
                 source: String::new(),
                 tree: as_syntax::parse("", None),
                 lines: LineIndex::new(""),
@@ -150,9 +191,7 @@ impl Workspace {
             types: TypeTable::new(),
         };
         ws.build_closures();
-        // resolve_decl_types：Task 3 与 types.rs 的 TypeKind::Named 切
-        // DeclRef 一起落地（消费者 expr.rs 同批；孤立切换编译不过——
-        // 旧 index.rs 仍持 DefId 版 TypeKind 共存期）
+        ws.resolve_decl_types();
         crate::as_log!(
             "workspace: built {} files | parse+summary {:?} | aggregation {:?} | derived {:?}",
             ws.files.len(),
@@ -219,6 +258,13 @@ impl Workspace {
             })
     }
 
+    /// 是否存在真实 `.d.as` 声明文件（builtin 伪文件不算——诊断 AS0902 的
+    /// 「decl 计数」口径与旧架构对齐）。
+    pub fn has_decl_files(&self) -> bool {
+        let builtin = intern_file(BUILTIN_FILE_PATH, u32::MAX);
+        self.files.iter().any(|(&f, e)| f != builtin && e.kind == FileKind::Decl)
+    }
+
     /// 同名 namespace 聚合（B3：Namespace ∪ class/struct——类直接兼任
     /// namespace，取代旧合成 namespace + origin_fallback 归一）。
     pub fn namespaces_named(&self, name: Sym) -> Vec<DeclRef> {
@@ -232,11 +278,23 @@ impl Workspace {
             .collect()
     }
 
-    /// 查询期合成成员（B4，expand.rs 的继任；引擎取证见原文件头注释）：
+    /// 查询期合成成员（B4，expand.rs 预计算的继任）：
     /// - delegate（单播）：N() / N(const N&) / opAssign / Execute /
     ///   ExecuteIfBound / BindUFunction / 绑定构造
     /// - event（多播）：公共集 + Broadcast / AddUFunction
     /// - class：StaticClass()（struct 无 UClass，不合成）
+    ///
+    /// 引擎侧真值（原 expand.rs 头注释取证，文件随 Phase B 删除）：
+    /// - delegate/event 的成员集来自预处理器 `ProcessDelegates` 的生成模板
+    ///   （[ENGINE] AngelscriptPreprocessor.cpp:534-695，逐行核对）；
+    /// - `C.StaticClass()` 是绑定层给每个 **UClass** 注册的命名空间全局函数
+    ///   （Bind_BlueprintType.cpp:661-680，`UClass StaticClass()`，经
+    ///   `PreviousBindPassScriptFunctionAsFirstParam` 把类作为隐藏首参——脚本侧
+    ///   签名就是零参）。struct 不绑定（无 UClass）。
+    ///   同处的 `__StaticType_<TypeName>` 全局变量是 `__` 前缀内部符号，
+    ///   「类名直接作值」由 resolve 层的语境判定处理，不在此合成；
+    /// - `_Inner` 字段（`__` 前缀）不展开——架构设计 §4.4 成员表未列，
+    ///   展开它只会污染补全。
     pub fn synthetic_members(&self, r: &DeclRef) -> Vec<SyntheticMember> {
         let d = self.decl(r);
         let span = d.name_span;
@@ -258,6 +316,7 @@ impl Workspace {
                         return_type: rt,
                         params,
                         name_span: span,
+                        origin: *r,
                     }
                 };
                 let param = |pname: &str, ty: SynType| ParamDecl {
@@ -336,6 +395,7 @@ impl Workspace {
                     return_type: Some(SynType::Named(intern_sym("UClass"), span)),
                     params: vec![],
                     name_span: span,
+                    origin: *r,
                 });
             }
             _ => {}
@@ -382,7 +442,7 @@ impl Workspace {
     /// 单文件重索引（模块名沿用）。返回 = 声明面是否变化（D29 继任：
     /// 新旧 summary 的 (name, kind, parent 名) 集 diff——消费方据此失效
     /// 派生缓存；Phase E 接 as-lsp）。
-    pub fn reindex_file(&mut self, file: FileId, kind: crate::index::FileKind, source: String) -> bool {
+    pub fn reindex_file(&mut self, file: FileId, kind: FileKind, source: String) -> bool {
         let module = self.files.get(&file).and_then(|e| e.summary.module);
         self.reindex_file_full(file, kind, module, source)
     }
@@ -391,7 +451,7 @@ impl Workspace {
     pub fn reindex_file_full(
         &mut self,
         file: FileId,
-        kind: crate::index::FileKind,
+        kind: FileKind,
         module: Option<Sym>,
         source: String,
     ) -> bool {
@@ -413,11 +473,13 @@ impl Workspace {
                 self.resolved.retain(|r, _| r.file != file);
                 self.files.insert(file, entry);
                 self.build_closures();
+                self.resolve_decl_types_in(Some(file));
             }
             None => {
                 self.agg.replace_file(file, &crate::summary::FileSummary::default_for(kind), &entry.summary);
                 self.files.insert(file, entry);
                 self.build_closures();
+                self.resolve_decl_types_in(Some(file));
             }
         }
         let new_surface = decl_surface(&self.files[&file].summary);
@@ -494,9 +556,131 @@ impl Workspace {
             })
     }
 
-    // 声明类型归一化 + `resolve_syn`：Task 3 与 types.rs 的
-    // `TypeKind::Named.def` 切 DeclRef 一起落地（旧 index.rs 仍持
-    // DefId 版 TypeKind 共存期，孤立切换编译不过；消费者 expr.rs 同批）。
+    // 声明类型归一化 + `resolve_syn`（平移自 index.rs；DefId → DeclRef，
+    // 消费者 = expr.rs 的 resolved 回落 + Aggregation 之外的 eager 派生）。
+    //
+    // -----------------------------------------------------------------------
+    // 声明类型归一化（B5 eager）
+    // -----------------------------------------------------------------------
+
+    /// 字段/全局变量/asset 的声明类型 → 归一化 TypeId。
+    /// 解析失败（未知名/qualified/模板实参未解析）不报错、不入表（宁缺毋假）。
+    fn resolve_decl_types(&mut self) {
+        self.resolve_decl_types_in(None);
+    }
+
+    /// 同上，可限定单文件（reindex 后的局部重建，避免全量重跑）。
+    fn resolve_decl_types_in(&mut self, file: Option<FileId>) {
+        let jobs: Vec<(DeclRef, SynType)> = self
+            .files
+            .iter()
+            .filter(|(&f, _)| file.map_or(true, |x| f == x))
+            .flat_map(|(&f, e)| {
+                e.summary
+                    .decls
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| {
+                        matches!(
+                            d.kind,
+                            DefKind::Field
+                                | DefKind::GlobalVar
+                                | DefKind::AssetDecl
+                                | DefKind::VirtualProperty
+                        )
+                    })
+                    .filter_map(|(i, d)| {
+                        let RawExtra::Variable { ty: Some(t) } = &d.extra else { return None };
+                        Some((DeclRef { file: f, local: i as u32 }, t.clone()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for (def, syn) in jobs {
+            if let Some(t) = self.resolve_syn(&syn) {
+                self.resolved.insert(def, t);
+            }
+        }
+    }
+
+    /// 语法层类型 → 归一化 TypeId。名字解析走 agg.main（类型声明 + 内建）。
+    pub fn resolve_syn(&mut self, syn: &SynType) -> Option<TypeId> {
+        match syn {
+            SynType::Primitive(name, _) => {
+                // 裸 float：按配置归一化（架构设计 §2.5，D25）
+                let target = if sym_str(*name) == "float" {
+                    if self.config.float_is_float64 { "float64" } else { "float32" }
+                } else {
+                    sym_str(*name)
+                };
+                let def = self
+                    .lookup(intern_sym(target))
+                    .iter()
+                    .copied()
+                    .find(|&r| self.decl(&r).flags.contains(DefFlags::SYNTHETIC))?;
+                Some(self.types.intern(TypeKind::Named { def, args: vec![] }))
+            }
+            SynType::Named(name, _) => {
+                let def = self.lookup_type_def(*name)?;
+                Some(self.types.intern(TypeKind::Named { def, args: vec![] }))
+            }
+            SynType::Template { name, args, .. } => {
+                let def = self.lookup_type_def(*name)?;
+                let mut resolved_args = Vec::with_capacity(args.len());
+                for a in args {
+                    resolved_args.push(self.resolve_syn(a)?);
+                }
+                Some(self.types.intern(TypeKind::Named { def, args: resolved_args }))
+            }
+            SynType::Qualified(_) => None, // M1 不解析（M3 查找链第 5 级的活）
+            SynType::Array(inner) => {
+                let t = self.resolve_syn(inner)?;
+                Some(self.types.intern(TypeKind::Array(t)))
+            }
+            SynType::Const(inner) => {
+                let t = self.resolve_syn(inner)?;
+                Some(self.types.intern(TypeKind::Const(t)))
+            }
+            SynType::Ref(inner, k) => {
+                let t = self.resolve_syn(inner)?;
+                Some(self.types.intern(TypeKind::Ref(t, *k)))
+            }
+            SynType::UnresolvedObject(inner) => self.resolve_syn(inner), // D8：按基类型
+            SynType::Auto => Some(self.types.intern(TypeKind::Auto)),
+            SynType::Wildcard => Some(self.types.intern(TypeKind::Wildcard)),
+        }
+    }
+
+    /// 文件 → 模块名（`local` 函数可见域过滤；模块归属随 FileSummary）。
+    pub fn module_of(&self, file: FileId) -> Option<Sym> {
+        self.files.get(&file).and_then(|e| e.summary.module)
+    }
+
+    /// 声明的父声明（文件内局部 id → DeclRef）。
+    pub fn parent_of(&self, r: &DeclRef) -> Option<DeclRef> {
+        self.decl(r).parent.map(|p| DeclRef { file: r.file, local: p })
+    }
+
+    /// 类型渲染（dump/调试用）。
+    pub fn render_type(&self, t: TypeId) -> String {
+        match self.types.get(t) {
+            TypeKind::Named { def, args } => {
+                let name = sym_str(self.decl(def).name).to_string();
+                if args.is_empty() {
+                    name
+                } else {
+                    let inner: Vec<String> = args.iter().map(|&a| self.render_type(a)).collect();
+                    format!("{name}<{}>", inner.join(", "))
+                }
+            }
+            TypeKind::Array(inner) => format!("{}[]", self.render_type(*inner)),
+            TypeKind::Const(inner) => format!("const {}", self.render_type(*inner)),
+            TypeKind::Ref(inner, k) => format!("{}{}", self.render_type(*inner), k.label()),
+            TypeKind::Param(i) => format!("$T{i}"),
+            TypeKind::Wildcard => "?".into(),
+            TypeKind::Auto => "auto".into(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -535,7 +719,7 @@ fn builtin_summary() -> FileSummary {
         by_name.entry(sym).or_insert_with(|| Vec::new()).push(i as u32);
     }
     FileSummary {
-        kind: crate::index::FileKind::Decl,
+        kind: FileKind::Decl,
         module: None,
         group: None,
         cache_format: None,
@@ -572,7 +756,7 @@ fn fname() -> Sym {
 
 impl FileSummary {
     /// 空 summary（remove 场景的占位；不进聚合）。
-    fn default_for(kind: crate::index::FileKind) -> FileSummary {
+    fn default_for(kind: FileKind) -> FileSummary {
         FileSummary {
             kind,
             module: None,
@@ -587,14 +771,13 @@ impl FileSummary {
 
 impl Default for FileSummary {
     fn default() -> Self {
-        Self::default_for(crate::index::FileKind::Script)
+        Self::default_for(FileKind::Script)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{FileKind, WorkspaceIndex};
 
     // 用例源码全部内置（AGENTS.md 硬性规则 / D1）。
 
@@ -609,6 +792,141 @@ mod tests {
             })
             .collect();
         Workspace::build(IndexConfig::default(), inputs)
+    }
+
+    #[test]
+    fn float_dual_config_normalization() {
+        // 原 index.rs m1_acceptance_float_dual_config（裸 float 归一化双配置）
+        const SRC: &str = "struct FVector { float X; float32 Y; }\n";
+        for (config, expect) in [(true, "float64"), (false, "float32")] {
+            let inputs = vec![FileInput {
+                file: intern_file("unique://wsfd/v.d.as", 0),
+                kind: FileKind::Decl,
+                source: SRC.to_string(),
+                module: None,
+            }];
+            let ws = Workspace::build(IndexConfig { float_is_float64: config }, inputs);
+            let fvector = ws.lookup_type_def(intern_sym("FVector")).unwrap();
+            let ms = ws.members(&fvector);
+            assert_eq!(ms.len(), 2);
+            let (x, y) = (ms[0], ms[1]);
+            let tx = ws.resolved[&x];
+            let ty = ws.resolved[&y];
+            assert_eq!(ws.render_type(tx), expect, "裸 float 应归一化为 {expect}");
+            assert_eq!(ws.render_type(ty), "float32", "显式 float32 不受配置影响");
+        }
+    }
+
+    #[test]
+    fn struct_writes_base_but_no_closure() {
+        // 原 index.rs m1_acceptance_struct_no_closure（D16：struct 不建闭包）
+        const SRC: &str = "struct S : T {}\nstruct T { int X; }\nclass K : J {}\nclass J {}\n";
+        let ws = ws_build(&[("unique://wsnc/mix.as", SRC)]);
+        let s = ws.lookup_type_def(intern_sym("S")).unwrap();
+        assert!(!ws.closures.contains_key(&s), "struct 即使写了基类也不建闭包");
+        let k = ws.lookup_type_def(intern_sym("K")).unwrap();
+        assert_eq!(ws.closures.get(&k).unwrap().len(), 1, "class 正常建闭包");
+    }
+
+    #[test]
+    fn mixin_reverse_index_and_reindex_rebuild() {
+        // 原 index.rs m3_mixin_reverse_index + m3_reindex_rebuilds_mixin_index
+        //（Phase B：mixin_pending 概念删除——名字键天然容错，未解析类型也是
+        // 有效键；agg.mixin_by_name 增量维护）
+        const A: &str = "\
+struct FVector {}
+mixin void Heal(FVector& V) {}
+void AlsoMixin(const FVector&in V) mixin {}
+mixin void Unresolvable(TMissing M) {}
+mixin void NoParam() {}
+";
+        const V1: &str = "class T {}\n";
+        const V2: &str = "class T {}\nmixin void M(T X) {}\n";
+        let path = "unique://wsmix/r.as";
+        let mut ws = ws_build(&[("unique://wsmix/a.as", A), (path, V1)]);
+        let f = intern_file(path, 0);
+
+        // 前置 / 后置两种声明形式都进倒排（首参剥壳：FVector& / const&in）
+        let hits = ws.agg.mixin_by_name.get(&intern_sym("FVector")).unwrap();
+        assert_eq!(hits.len(), 2);
+        // 未解析基名也是有效键（名字键天然容错）
+        assert!(ws.agg.mixin_by_name.get(&intern_sym("TMissing")).is_some());
+
+        // 重索引后新增 mixin 进倒排
+        let _ = ws.reindex_file(f, FileKind::Script, V2.to_string());
+        let t = ws.lookup_type_def(intern_sym("T")).unwrap();
+        let hits = ws.agg.mixin_by_name.get(&ws.decl(&t).name).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(sym_str(ws.decl(&hits[0]).name), "M");
+    }
+
+    #[test]
+    fn delegate_synthetic_member_set_details() {
+        // 原 expand.rs delegate_expansion_member_set（成员集细节：ctor×3 /
+        // origin / Execute 的 const + 形参克隆 / 拷贝构造形参形态）
+        const SRC: &str = "delegate void FMyDelegate(int X, float Y);\n";
+        let ws = ws_build(&[("unique://wsdmd/del.as", SRC)]);
+        let d = ws.lookup_type_def(intern_sym("FMyDelegate")).unwrap();
+        let ms = ws.synthetic_members(&d);
+        // 单播：ctor×3 + opAssign + Execute + ExecuteIfBound + BindUFunction
+        let names: Vec<&str> = ms.iter().map(|m| sym_str(m.name)).collect();
+        assert_eq!(ms.len(), 7, "成员集：{names:?}");
+        for m in &ms {
+            assert_eq!(m.origin, d, "origin 回落源头声明（D10）");
+            assert!(m.flags.contains(DefFlags::SYNTHETIC));
+        }
+        // Execute 的形参从委托声明克隆 + const 方法
+        let exec = ms.iter().find(|m| sym_str(m.name) == "Execute").unwrap();
+        assert!(exec.flags.contains(DefFlags::CONST));
+        assert_eq!(exec.params.len(), 2);
+        assert_eq!(sym_str(exec.params[0].name), "X");
+        // 拷贝构造 + 绑定构造（带参 ctor×2）
+        let ctors: Vec<_> = ms.iter().filter(|m| m.kind == DefKind::Constructor).collect();
+        assert_eq!(ctors.len(), 3);
+        assert_eq!(ctors.iter().filter(|m| !m.params.is_empty()).count(), 2, "拷贝构造 + 绑定构造");
+    }
+
+    #[test]
+    fn template_field_type_resolution() {
+        // 原 index.rs template_field_type_resolution（resolve_decl_types 的
+        // 模板实例使用位：TArray<FVector> 字段 → Named{def=TArray, args=[FVector]}）
+        const SRC: &str = "struct TArray<T> { }\nstruct FVector { }\nstruct Holder { TArray<FVector> Arr; }\n";
+        let ws = ws_build(&[("unique://wstpl/tpl.d.as", SRC)]);
+        let holder = ws.lookup_type_def(intern_sym("Holder")).unwrap();
+        let arr = ws.members(&holder).into_iter().find(|&r| sym_str(ws.decl(&r).name) == "Arr").unwrap();
+        let t = ws.resolved[&arr];
+        match ws.types.get(t) {
+            TypeKind::Named { def, args } => {
+                assert_eq!(sym_str(ws.decl(def).name), "TArray");
+                assert_eq!(args.len(), 1);
+                assert_eq!(ws.render_type(args[0]), "FVector");
+            }
+            other => panic!("应为 Named，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builtin_primitives_synthetic() {
+        // 原 index.rs builtin_primitives_synthetic（15 个内建 SYNTHETIC、
+        // 不进真实文件声明统计；int 变量定型到 int）
+        const SRC: &str = "int A;\nvoid F(bool B) {}\n";
+        let ws = ws_build(&[("unique://wsb2/b.as", SRC)]);
+        let a = ws.lookup(intern_sym("A"))[0];
+        let t = ws.resolved[&a];
+        assert_eq!(ws.render_type(t), "int");
+        let builtin = intern_file(BUILTIN_FILE_PATH, u32::MAX);
+        let b = &ws.files[&builtin];
+        assert_eq!(b.summary.decls.len(), BUILTIN_PRIMITIVES.len());
+        assert!(b.summary.decls.iter().all(|d| d.flags.contains(DefFlags::SYNTHETIC)));
+    }
+
+    #[test]
+    fn module_names() {
+        // 平移自 index.rs（引擎 FilenameToModuleName 语义）
+        assert_eq!(filename_to_module_name("MyDir/MyFile.as"), "MyDir.MyFile");
+        assert_eq!(filename_to_module_name("X.d.as"), "X");
+        assert_eq!(filename_to_module_name("a\\b\\c.as"), "a.b.c");
+        assert_eq!(filename_to_module_name("plain.as"), "plain");
     }
 
     #[test]
@@ -647,6 +965,18 @@ class Orphan : TMissing {}
         // unresolved base：链为空但不 panic
         let orphan = ws.lookup_type_def(intern_sym("Orphan")).unwrap();
         assert!(ws.closures.get(&orphan).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cycle_does_not_affect_side_branch() {
+        // 原 index.rs m1_acceptance_inheritance_cycle 的旁支断言：
+        // 环不影响旁支（C : A，A/B 成环，C 的闭包 = [A, B]）
+        const SRC: &str = "class A : B {}\nclass B : A {}\nclass C : A {}\n";
+        let ws = ws_build(&[("unique://wscyc/side.as", SRC)]);
+        assert_eq!(ws.cycle_classes.len(), 2, "A 与 B 应被标记为环");
+        let c = ws.lookup_type_def(intern_sym("C")).unwrap();
+        let names: Vec<&str> = ws.closures[&c].iter().map(|r| sym_str(ws.decl(r).name)).collect();
+        assert_eq!(names, vec!["A", "B"], "环不影响旁支");
     }
 
     #[test]
@@ -728,8 +1058,10 @@ struct S2 {}
     }
 
     #[test]
-    fn decl_counts_match_old_index() {
-        // 与旧架构的声明对账（同源同配置）
+    fn decl_counts_and_resolved_types() {
+        // 声明计数 + 声明类型归一化（B5 eager：原与旧架构对账的断言
+        // 随 WorkspaceIndex 删除改为纯新架构断言；跨架构对账由
+        // as-cli --new-arch 语料级承担）
         const SRC: &str = "\
 class AActor2 : UObject2
 {
@@ -739,27 +1071,27 @@ class AActor2 : UObject2
 enum EColor { Red, Green }
 void Overload(int A) {}
 void Overload(float B) {}
+int Counter = 0;
 ";
         let ws = ws_build(&[("unique://wsd/a.d.as", SRC)]);
-        let inputs = vec![FileInput {
-            file: intern_file("unique://wsd/a.d.as", 0),
-            kind: FileKind::Decl,
-            source: SRC.to_string(),
-            module: None,
-        }];
-        let old = WorkspaceIndex::build(IndexConfig::default(), inputs);
-        let old_real = old
-            .symbols
-            .iter()
-            .filter(|(_, d)| !d.flags.contains(DefFlags::SYNTHETIC))
-            .count();
-        // 新侧不含 builtin（15 个）与合成展开成员
+        let f = intern_file("unique://wsd/a.d.as", 0);
+        let real = ws.files[&f].summary.decls.len();
+        assert_eq!(real, 9, "class + field + method + enum + 2 枚举值 + 2 重载 + 全局变量");
+        // 非合成声明数 = 全部 decls（builtin 在独立伪文件）
         let new_real: usize = ws
             .files
             .values()
             .map(|e| e.summary.decls.len())
             .sum::<usize>()
             - builtin_summary().decls.len();
-        assert_eq!(new_real, old_real, "非合成声明数一致");
+        assert_eq!(new_real, real);
+        // 声明类型归一化：Health（裸 float → float64）与 Counter（int）
+        let actor = ws.lookup_type_def(intern_sym("AActor2")).unwrap();
+        let health = ws.members(&actor).into_iter().find(|&r| sym_str(ws.decl(&r).name) == "Health").unwrap();
+        let t = ws.resolved[&health];
+        assert_eq!(ws.render_type(t), "float64", "裸 float 归一化（默认 float64）");
+        let counter = ws.lookup(intern_sym("Counter"))[0];
+        let t = ws.resolved[&counter];
+        assert_eq!(ws.render_type(t), "int");
     }
 }

@@ -22,13 +22,13 @@ use crate::decl_tags::{parse_comment_texts, SemanticTag, TagKind, TagValue};
 use crate::config::IndexConfig;
 use crate::expr::{is_auto_type, number_base_name};
 use crate::id::Sym;
-use crate::index::FileKind;
 use crate::intern::intern_sym;
 use crate::range::TextRange;
 use crate::scope::{LocalDecl, LocalKind, Scope, ScopeTree};
 use crate::symbol::{BaseRef, DefFlags, DefKind, ParamDecl};
 use crate::syntax::{self, DeclCtx};
 use crate::types::SynType;
+use crate::workspace::FileKind;
 
 /// 每文件摘要：声明表 + 文件内名字倒排 + 局部作用域树 + 文件头 tag。
 #[derive(Debug, Clone)]
@@ -668,11 +668,11 @@ impl SummaryBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{FileInput, WorkspaceIndex};
-    use crate::intern::{intern_file, sym_str};
+    use crate::intern::{intern_sym, sym_str};
 
     // 用例源码全部内置（AGENTS.md 硬性规则 / D1）。
-    // 等价性骨架：同一批内置源码，旧 WorkspaceIndex 与新 summary 对照。
+    // 等价性骨架：内置源码的声明提取断言（原与旧 WorkspaceIndex 双轨对账，
+    // Phase B 切换后旧侧删除——跨架构对账由 as-cli --new-arch 语料级承担）。
 
     /// 覆盖形态：class 继承 + 成员（字段/方法/构造 + UPROPERTY tag）、
     /// enum（含赋值）、namespace、delegate、函数重载组、全局变量、
@@ -700,7 +700,11 @@ void AlsoMixin2(const FVector2&in V) mixin {}
 
     #[test]
     fn summary_matches_old_index() {
-        let path = "unique://summix/a.d.as";
+        // 原「新旧对账」断言随 WorkspaceIndex 删除改为纯新架构断言
+        //（Phase A 双轨使命完成；跨架构对账由 as-cli --new-arch 语料级承担）。
+        // 覆盖形态不变：class 继承 + 成员（字段/方法/构造 + UPROPERTY tag）、
+        // enum（含赋值）、namespace、delegate、函数重载组、全局变量、
+        // mixin 两种形式、`.d.as` 文件头 tag。
         let tree = as_syntax::parse(SRC_MIX, None);
         let summary = extract_summary(
             &tree,
@@ -710,43 +714,32 @@ void AlsoMixin2(const FVector2&in V) mixin {}
             &IndexConfig::default(),
         );
 
-        let inputs = vec![FileInput {
-            file: intern_file(path, 0),
-            kind: FileKind::Decl,
-            module: None,
-            source: SRC_MIX.to_string(),
-        }];
-        let old = WorkspaceIndex::build(IndexConfig::default(), inputs);
+        // ① 声明数 = 手工期望（NS / NFunc / AActor2 / Health / Tick / ctor /
+        //    FVector2 / X / EColor / Red / Green / Blue / FOnHit2 / GlobalCounter /
+        //    Overload×2 / Heal2 / AlsoMixin2）
+        assert_eq!(summary.decls.len(), 18, "decls: {:?}", {
+            summary.decls.iter().map(|d| sym_str(d.name)).collect::<Vec<_>>()
+        });
 
-        // ① 非合成声明数一致（SYNTHETIC = 内建 + delegate 展开 + namespace 合成，
-        //    均为旧侧索引期产物，新侧不迁移）
-        let old_real: Vec<_> = old
-            .symbols
+        // ② (name, kind) 多重集一致——重载组同 (name, kind) 不可逐个 find
+        let mut keys: Vec<(&str, &str)> = summary
+            .decls
             .iter()
-            .filter(|(_, d)| !d.flags.contains(DefFlags::SYNTHETIC))
+            .map(|d| (sym_str(d.name), d.kind.label()))
             .collect();
-        assert_eq!(
-            summary.decls.len(),
-            old_real.len(),
-            "非合成声明数：new {} vs old {}",
-            summary.decls.len(),
-            old_real.len()
-        );
-
-        // ② + ③ (name, kind, name_span) 多重集一致——重载组同 (name, kind)
-        // 不可逐个 find（恒命中第一个），排序后成对对照
-        let key = |name: Sym, kind: DefKind, span: TextRange| {
-            (sym_str(name).to_string(), kind.label(), span.start, span.end)
-        };
-        let mut new_keys: Vec<_> =
-            summary.decls.iter().map(|d| key(d.name, d.kind, d.name_span)).collect();
-        let mut old_keys: Vec<_> = old_real
-            .iter()
-            .map(|(_, d)| key(d.name, d.kind, d.name_span))
-            .collect();
-        new_keys.sort();
-        old_keys.sort();
-        assert_eq!(new_keys, old_keys, "(name, kind, span) 多重集");
+        keys.sort();
+        let mut expect = vec![
+            ("NS", "namespace"), ("NFunc", "function"),
+            ("AActor2", "class"), ("Health", "field"), ("Tick", "method"), ("AActor2", "constructor"),
+            ("FVector2", "struct"), ("X", "field"),
+            ("EColor", "enum"), ("Red", "enum_value"), ("Green", "enum_value"), ("Blue", "enum_value"),
+            ("FOnHit2", "delegate"),
+            ("GlobalCounter", "global_var"),
+            ("Overload", "function"), ("Overload", "function"),
+            ("Heal2", "function"), ("AlsoMixin2", "function"),
+        ];
+        expect.sort();
+        assert_eq!(keys, expect, "(name, kind) 多重集");
 
         // ④ parent 链等价：类成员的 parent 指向类声明（文件内局部 id）
         let actor = *summary.by_name.get(&intern_sym("AActor2")).unwrap().first().unwrap();
@@ -774,6 +767,133 @@ void AlsoMixin2(const FVector2&in V) mixin {}
         // ⑧ bases 只记名字（TypeDecl 上提字段）
         assert_eq!(summary.decls[actor as usize].bases.len(), 1);
         assert_eq!(sym_str(summary.decls[actor as usize].bases[0].name), "UObject2");
+    }
+
+    // ------------------------------------------------------------------
+    // 平移自 index.rs（机制存活于 extract_summary，测试不得随旧架构消失）
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn corpus_tags_and_doc_split() {
+        // 原 m1_acceptance_four_zero_corpus_tags + doc_tags_split_on_members：
+        // 4 个语料零出现 tag 的行为 + doc 在前、tag 在后紧邻出现的分流
+        const SRC: &str = "\
+// @keywords MoveTo;Teleport
+// @defaultsOnly
+void SetX(int X);
+
+// @template_inherit_specializations
+// @template_covariant
+struct TBox<T> { T Value; }
+
+// @templateSpecialization
+class TArray<FVector> { void SortByLength(); }
+
+// @outputTypeIndex abc
+int Bad();
+
+// @meta Key=Value
+// @editable
+// @notCallable
+float Field;
+
+class A
+{
+    // Returns the location.
+    // @see bGenerateOverlapEvents, ...
+    // @editable
+    EActorUpdateOverlapsMethod UpdateOverlapsMethodDuringLevelStreaming;
+}
+";
+        let tree = as_syntax::parse(SRC, None);
+        let s = extract_summary(&tree, SRC, FileKind::Decl, None, &IndexConfig::default());
+        let find = |name: &str| {
+            let id = *s.by_name.get(&intern_sym(name)).unwrap().first().unwrap();
+            &s.decls[id as usize]
+        };
+
+        let set_x = find("SetX");
+        assert!(set_x.tags.iter().any(|t| t.kind == TagKind::Keywords));
+        assert!(set_x.tags.iter().any(|t| t.kind == TagKind::DefaultsOnly));
+
+        let tbox = find("TBox");
+        assert!(tbox.tags.iter().any(|t| t.kind == TagKind::TemplateInheritSpecializations));
+        assert!(tbox.tags.iter().any(|t| t.kind == TagKind::TemplateCovariant));
+        assert_eq!(tbox.template_params.len(), 1);
+        assert_eq!(sym_str(tbox.template_params[0]), "T");
+
+        let tarray = find("TArray");
+        assert!(tarray.tags.iter().any(|t| t.kind == TagKind::TemplateSpecialization));
+
+        // value 解析失败 → tag 丢弃（§2.4.4 规则 4）
+        let bad = find("Bad");
+        assert!(!bad.tags.iter().any(|t| t.kind == TagKind::OutputTypeIndex));
+
+        // doxygen 噪声与 doc 分流 + flag 镜像
+        let field = find("Field");
+        assert!(field.flags.contains(DefFlags::EDITABLE));
+        assert!(field.flags.contains(DefFlags::NOT_CALLABLE));
+        assert!(field.tags.iter().any(|t| t.kind == TagKind::Meta));
+
+        let upd = find("UpdateOverlapsMethodDuringLevelStreaming");
+        assert!(upd.flags.contains(DefFlags::EDITABLE));
+        let doc = upd.doc.as_deref().unwrap();
+        assert!(doc.contains("Returns the location."));
+        assert!(doc.contains("@see bGenerateOverlapEvents, ..."), "doxygen tag 留在 doc 正文");
+    }
+
+    #[test]
+    fn params_extraction_and_unnamed_flag() {
+        // 原 m3_params_extraction_and_unnamed_flag（形参提取 + InArgN 占位标记）
+        const SRC: &str = "\
+void F(float64 InX, int8 InArg0, const FVector&in V) {}
+class A
+{
+    A(int InArg2, bool B) {}
+}
+struct FVector {}
+";
+        let tree = as_syntax::parse(SRC, None);
+        let s = extract_summary(&tree, SRC, FileKind::Script, None, &IndexConfig::default());
+        let f = *s.by_name.get(&intern_sym("F")).unwrap().first().unwrap();
+        let RawExtra::Callable { params, .. } = &s.decls[f as usize].extra else {
+            panic!("F 应有 Callable extra")
+        };
+        assert_eq!(params.len(), 3);
+        assert_eq!(sym_str(params[0].name), "InX");
+        assert!(!params[0].flags.contains(DefFlags::UNNAMED_PARAM));
+        assert!(params[1].flags.contains(DefFlags::UNNAMED_PARAM), "InArg0 是占位名");
+        // 语法层类型形态保留（const &in 包装）
+        assert!(matches!(&params[2].ty, Some(SynType::Ref(..))));
+
+        // 构造函数形参同样提取
+        let ctor = *s
+            .by_name
+            .get(&intern_sym("A"))
+            .unwrap()
+            .iter()
+            .find(|&&id| s.decls[id as usize].kind == DefKind::Constructor)
+            .unwrap();
+        let RawExtra::Callable { params, .. } = &s.decls[ctor as usize].extra else {
+            panic!("构造函数应有 Callable extra")
+        };
+        assert_eq!(params.len(), 2);
+        assert!(params[0].flags.contains(DefFlags::UNNAMED_PARAM));
+        assert_eq!(sym_str(params[1].name), "B");
+    }
+
+    #[test]
+    fn module_field_populated() {
+        // 原 m3_modules_table_populated（模块归属随 FileSummary 落地）
+        let tree = as_syntax::parse("void F() {}\n", None);
+        let s = extract_summary(
+            &tree,
+            "void F() {}\n",
+            FileKind::Script,
+            Some(intern_sym("MyDir.MyFile")),
+            &IndexConfig::default(),
+        );
+        assert_eq!(sym_str(s.module.unwrap()), "MyDir.MyFile");
     }
 
     #[test]

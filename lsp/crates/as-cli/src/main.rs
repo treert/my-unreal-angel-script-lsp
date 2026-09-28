@@ -2,9 +2,11 @@
 //!
 //! - `dump-tree`（M0）：解析 `.as` / `.d.as` 并输出 CST，任一 ERROR/MISSING
 //!   节点 ⇒ 退出码非 0（与 grammar P2 验收同口径，证明包装层无损）。
-//! - `dump-index`（M1）：构建 WorkspaceIndex 并输出声明统计——与
-//!   `_manifest.dctx` 的 `type_count` / `member_count` **人工对账**的开发期
-//!   动作（运行时不读 manifest——D20，该文件仅作参照）。
+//! - `dump-index`（M1→Phase B）：构建 Workspace（新架构唯一路径）并输出
+//!   声明统计——与 `_manifest.dctx` 的 `type_count` / `member_count`
+//!   **人工对账**的开发期动作（运行时不读 manifest——D20，仅作参照）。
+//!   `--new-arch` 曾是 Phase A 双轨对账开关，切换完成后保留为 no-op
+//!   （脚本兼容），对账输出由单一架构的常规统计行承担。
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -17,9 +19,11 @@ use clap::{Parser, Subcommand};
 
 use as_core::as_syntax::tree_sitter::{Node, Tree};
 use as_core::as_syntax::{self, SyntaxErrorKind};
-use as_core::id::{DefId, FileId};
-use as_core::intern::{file_path, intern_file};
-use as_core::{DefFlags, DefKind, FileInput, FileKind, IndexConfig, WorkspaceIndex};
+use as_core::aggregation::DeclRef;
+use as_core::id::{FileId, Sym};
+use as_core::intern::{file_path, intern_file, intern_sym};
+use as_core::workspace::{FileInput, FileKind, Workspace};
+use as_core::{DefFlags, DefKind, IndexConfig};
 
 #[derive(Parser)]
 #[command(
@@ -43,7 +47,7 @@ enum Command {
         trees: bool,
     },
 
-    /// 构建 WorkspaceIndex 并输出声明统计（M1 验收：与 manifest 人工对账）
+    /// 构建 Workspace 并输出声明统计（M1 验收：与 manifest 人工对账）
     DumpIndex {
         /// 文件或目录；目录递归收集 *.as / *.d.as
         paths: Vec<PathBuf>,
@@ -60,13 +64,13 @@ enum Command {
         #[arg(long)]
         resolve_stats: bool,
 
-        /// 对全部文件的 UseSite 跑引用解析内核并计时（M4 验收：站点数 / 解析率 / 耗时）
+        /// 引用解析体检（M4/B1 验收）：top-20 名字的查询期 references
+        /// 命中数 + 耗时（B1 基线 25450 hits / ~307ms 不回归）
         #[arg(long)]
         ref_stats: bool,
 
-        /// 双轨对账（Phase A 验收，D37）：同时构建新架构（summary +
-        /// Aggregation）与旧 WorkspaceIndex，比对声明数 / 名字集合，
-        /// 任何不一致 → 退出码非 0；并打印两侧耗时
+        /// Phase A 双轨对账开关（D37）——Phase B 切换完成后为 no-op
+        /// （新架构唯一路径，兼容既有脚本保留 flag）
         #[arg(long)]
         new_arch: bool,
     },
@@ -235,7 +239,7 @@ fn render_node(node: Node<'_>, src: &str, indent: usize, prefix: &str, out: &mut
 }
 
 // ===========================================================================
-// dump-index（M1）
+// dump-index（M1 → Phase B：Workspace 唯一路径）
 // ===========================================================================
 
 fn dump_index(
@@ -283,102 +287,52 @@ fn dump_index(
 
     let config = IndexConfig { float_is_float64 };
     println!("config: float_is_float64={float_is_float64}");
-    // 双轨对账（Phase A，D37）：旧侧先建（inputs 被 move）；新侧用
-    // 独立 parse（source 克隆一份），两侧同源同配置。
-    let new_arch_sources: Vec<(as_core::id::FileId, as_core::FileKind, Option<as_core::id::Sym>, String)> =
-        inputs
-            .iter()
-            .map(|i| (i.file, i.kind, i.module, i.source.clone()))
-            .collect();
-    let t_old = std::time::Instant::now();
-    let idx = WorkspaceIndex::build(config, inputs);
-    let old_elapsed = t_old.elapsed();
+    let t_build = std::time::Instant::now();
+    let ws = Workspace::build(config, inputs);
+    let build_elapsed = t_build.elapsed();
+    // builtin 伪文件（B2）的 FileId / 声明数（统计口径排除用）
+    let builtin_file = intern_file(as_core::workspace::BUILTIN_FILE_PATH, u32::MAX);
+    let builtin_decls = ws
+        .files
+        .get(&builtin_file)
+        .map(|e| e.summary.decls.len())
+        .unwrap_or(0);
     if new_arch {
-        use rayon::prelude::*;
-        use std::collections::HashMap;
-        let t_new = std::time::Instant::now();
-        let summaries: HashMap<as_core::id::FileId, as_core::summary::FileSummary> =
-            new_arch_sources
-                .into_par_iter()
-                .map(|(file, kind, module, source)| {
-                    let tree = as_core::as_syntax::parse(&source, None);
-                    let s = as_core::summary::extract_summary(&tree, &source, kind, module, &config);
-                    (file, s)
-                })
-                .collect();
-        let agg = as_core::Aggregation::build(
-            &summaries.iter().map(|(f, s)| (*f, s)).collect::<std::collections::HashMap<_, _>>(),
-        );
-        let new_elapsed = t_new.elapsed();
-
-        // 对账 ①：非合成声明总数（旧侧 SYNTHETIC = 内建 + delegate 展开
-        // + namespace 合成，均为索引期产物，新侧不迁移）
-        let new_decls: usize = summaries.values().map(|s| s.decls.len()).sum();
-        let old_real = idx
-            .symbols
-            .iter()
-            .filter(|(_, d)| !d.flags.contains(as_core::DefFlags::SYNTHETIC))
-            .count();
-        // 对账 ②：名字集合（旧侧桶内须有非合成成员——合成 namespace 不计）
-        let old_names: std::collections::BTreeSet<as_core::id::Sym> = idx
-            .main
-            .iter()
-            .filter(|(_, defs)| {
-                defs.iter().any(|&id| {
-                    !idx.symbols.get(id).flags.contains(as_core::DefFlags::SYNTHETIC)
-                })
-            })
-            .map(|(s, _)| *s)
-            .collect();
-        let new_names: std::collections::BTreeSet<as_core::id::Sym> =
-            agg.main.keys().copied().collect();
-
-        println!("---- new-arch reconcile ----");
-        println!(
-            "decls total: new {new_decls} vs old {old_real} | {}",
-            if new_decls == old_real { "OK" } else { "MISMATCH" }
-        );
-        println!(
-            "main keys: new {} vs old {} | {}",
-            new_names.len(),
-            old_names.len(),
-            if new_names == old_names { "OK" } else { "MISMATCH" }
-        );
-        if new_names != old_names {
-            use std::fmt::Write as _;
-            let mut sample = String::new();
-            for s in new_names.symmetric_difference(&old_names).take(8) {
-                let _ = write!(sample, " {}", as_core::intern::sym_str(*s));
-            }
-            println!("  diff sample:{sample}");
-        }
-        println!(
-            "timing: old {old_elapsed:?} | new {new_elapsed:?} (parse+summary+aggregation, rayon)"
-        );
-        if new_decls != old_real || new_names != old_names {
-            return ExitCode::FAILURE;
-        }
+        // Phase A 双轨对账的声明面输出（D37）：切换完成后新架构是唯一路径，
+        // 双侧对比不再可能——保留 flag 兼容既有脚本，输出单一架构对账行。
+        let decls: usize =
+            ws.files.values().map(|e| e.summary.decls.len()).sum::<usize>() - builtin_decls;
+        let names = ws.agg.main.len();
+        println!("---- new-arch (now the only path) ----");
+        println!("decls total: {decls} (non-builtin) | main keys: {names} | OK");
     }
 
-    // 文件统计（错误节点清单已不在快照里——诊断期按需收集（mylua 同款）；
-    // CLI 的批量校验口径不变：has_error 剪枝对合法文件 O(1)）
-    let (mut n_script, mut n_decl, mut n_err) = (0usize, 0usize, 0usize);
-    let err_counts: Vec<(FileId, usize)> = idx
+    // 文件统计（错误节点清单按需收集——mylua 同款；CLI 批量校验口径不变。
+    // builtin 伪文件是空树，verify 恒 0 错误，天然不干扰）
+    // builtin 伪文件（B2）不计入文件统计——与旧架构口径一致（内建无快照）
+    let (mut n_script, mut n_decl) = (0usize, 0usize);
+    let err_counts: Vec<(FileId, usize)> = ws
         .files
         .iter()
-        .filter_map(|(file, snap)| {
-            let n = as_syntax::verify_tree(&snap.tree).len();
+        .filter_map(|(file, entry)| {
+            let n = as_syntax::verify_tree(&entry.tree).len();
             (n > 0).then_some((*file, n))
         })
         .collect();
-    for snap in idx.files.values() {
-        match snap.kind {
+    for (&file, entry) in ws.files.iter() {
+        if file == builtin_file {
+            continue;
+        }
+        match entry.kind {
             FileKind::Script => n_script += 1,
             FileKind::Decl => n_decl += 1,
         }
     }
-    n_err = err_counts.len();
-    println!("files: {} (script {n_script}, decl {n_decl}, parse-error {n_err})", idx.files.len());
+    let n_err = err_counts.len();
+    println!(
+        "files: {} (script {n_script}, decl {n_decl}, parse-error {n_err})",
+        ws.files.len() - 1
+    );
     if n_err > 0 {
         for (file, n) in &err_counts {
             let path = file_path(*file).unwrap_or("?");
@@ -386,18 +340,22 @@ fn dump_index(
         }
     }
 
-    // 声明统计（SYNTHETIC 内建不计入；按文件类别分列——manifest 只数 .d.as）
+    // 声明统计（builtin primitive 不计入；按文件类别分列——manifest 只数 .d.as）
     let mut by_kind: BTreeMap<(&'static str, &'static str), usize> = BTreeMap::new();
     let mut synthetic = 0usize;
-    for (_id, def) in idx.symbols.iter() {
-        if def.flags.contains(DefFlags::SYNTHETIC) {
-            synthetic += 1;
-            continue;
+    for entry in ws.files.values() {
+        for d in &entry.summary.decls {
+            if d.flags.contains(DefFlags::SYNTHETIC) {
+                synthetic += 1;
+                continue;
+            }
+            *by_kind.entry((entry.kind.label(), d.kind.label())).or_insert(0) += 1;
         }
-        let kind = idx.files.get(&def.file).map(|s| s.kind).unwrap_or(FileKind::Script);
-        *by_kind.entry((kind.label(), def.kind.label())).or_insert(0) += 1;
     }
-    println!("symbols: {} (synthetic {synthetic} = builtins + delegate/event expansion + StaticClass)", idx.symbols.len());
+    println!(
+        "symbols: {} (synthetic {synthetic} = builtin primitives; delegate/event expansion & StaticClass are query-time, not stored)",
+        ws.files.values().map(|e| e.summary.decls.len()).sum::<usize>() - synthetic
+    );
     for kind_label in ["decl", "script"] {
         let rows: Vec<String> = by_kind
             .iter()
@@ -430,60 +388,67 @@ fn dump_index(
     // 继承与类型解析健康度
     let mut unresolved_bases = 0usize;
     let mut classes_with_base = 0usize;
-    for (id, def) in idx.symbols.iter() {
-        if def.kind != DefKind::Class || def.flags.contains(DefFlags::SYNTHETIC) {
-            continue;
-        }
-        if let as_core::DefExtra::TypeDecl { bases, .. } = &def.extra {
-            if bases.iter().any(|b| b.simple) {
+    let type_jobs: usize = ws
+        .files
+        .values()
+        .map(|e| {
+            e.summary
+                .decls
+                .iter()
+                .filter(|d| {
+                    !d.flags.contains(DefFlags::SYNTHETIC)
+                        && matches!(
+                            d.kind,
+                            DefKind::Field | DefKind::GlobalVar | DefKind::AssetDecl | DefKind::VirtualProperty
+                        )
+                })
+                .count()
+        })
+        .sum();
+    for (&file, entry) in ws.files.iter() {
+        for (i, d) in entry.summary.decls.iter().enumerate() {
+            if d.kind != DefKind::Class || d.flags.contains(DefFlags::SYNTHETIC) {
+                continue;
+            }
+            if d.bases.iter().any(|b| b.simple) {
                 classes_with_base += 1;
-                if idx.resolve_base_class(id).is_none() {
+                let r = DeclRef { file, local: i as u32 };
+                if ws.resolve_base_class(&r).is_none() {
                     unresolved_bases += 1;
                 }
             }
         }
     }
-    let type_jobs: Vec<DefId> = idx
-        .symbols
-        .iter()
-        .filter(|(_, d)| {
-            !d.flags.contains(DefFlags::SYNTHETIC)
-                && matches!(
-                    d.kind,
-                    DefKind::Field | DefKind::GlobalVar | DefKind::AssetDecl | DefKind::VirtualProperty
-                )
-        })
-        .map(|(id, _)| id)
-        .collect();
     println!(
         "inheritance: class closures {}, cycles {}, classes-with-base {classes_with_base} (unresolved base {unresolved_bases})",
-        idx.closures.len(),
-        idx.cycle_classes.len()
+        ws.closures.len(),
+        ws.cycle_classes.len()
     );
     println!(
-        "mixins: indexed {}, pending {}",
-        idx.mixin_index.values().map(Vec::len).sum::<usize>(),
-        idx.mixin_pending.len()
+        "mixins: by-name buckets {} entries {}",
+        ws.agg.mixin_by_name.len(),
+        ws.agg.mixin_by_name.values().map(Vec::len).sum::<usize>()
     );
     println!(
         "types: interned {}, variable decl types resolved {}/{}",
-        idx.types.len(),
-        idx.resolved.len(),
-        type_jobs.len()
+        ws.types.len(),
+        ws.resolved.len(),
+        type_jobs
     );
+    println!("build: {build_elapsed:?} (parse+summary rayon | aggregation+derived serial)");
 
     // --sym：查符号明细
     if let Some(name) = sym_filter {
-        let sym = as_core::intern::intern_sym(&name);
-        let hits = idx.main.get(&sym).map(Vec::as_slice).unwrap_or(&[]);
+        let sym = intern_sym(&name);
+        let hits = ws.lookup(sym);
         println!("--- sym '{name}': {} hit(s) ---", hits.len());
-        for &def in hits {
-            let d = idx.def(def);
-            let path = file_path(d.file).unwrap_or("?");
-            let (line, col) = idx
+        for &r in hits {
+            let d = ws.decl(&r);
+            let path = file_path(r.file).unwrap_or("?");
+            let (line, col) = ws
                 .files
-                .get(&d.file)
-                .map(|s| s.lines.line_col_debug(d.name_span.start))
+                .get(&r.file)
+                .map(|e| e.lines.line_col_debug(d.name_span.start))
                 .unwrap_or((0, 0));
             let mut tags = String::new();
             for t in &d.tags {
@@ -498,32 +463,30 @@ fn dump_index(
                 .take(60)
                 .collect::<String>();
             println!(
-                "  {} {} {path}:{line}:{col}{tags}  // {doc_first}",
+                "  {} {name} {path}:{line}:{col}{tags}  // {doc_first}",
                 d.kind.label(),
-                name,
             );
         }
     }
 
     // --resolve-stats：对全部 .as 脚本的标识符使用点跑查找链（M3 验收体检）。
-    // specifier 语境（UPROPERTY 宏参数等）与命名实参名不计入——前者不是符号
-    // 使用点，后者的解析（callee 形参匹配）随 M5 签名帮助同批。
+    // specifier 语境（UPROPERTY 宏参数等）与命名实参名不计入。
     if resolve_stats {
         let mut total = 0usize;
         let mut hit = 0usize;
         let mut skipped_spec = 0usize;
         let mut skipped_named_arg = 0usize;
         let mut misses: Vec<String> = Vec::new();
-        let script_files: Vec<_> = idx
+        let script_files: Vec<_> = ws
             .files
             .iter()
-            .filter(|(_, s)| s.kind == FileKind::Script)
+            .filter(|(_, e)| e.kind == FileKind::Script)
             .map(|(f, _)| *f)
             .collect();
         for file in script_files {
-            let snap = idx.files.get(&file).unwrap();
-            let src = &snap.source;
-            for ident in collect_identifier_nodes(snap.tree.root_node()) {
+            let entry = ws.files.get(&file).unwrap();
+            let src = &entry.source;
+            for ident in collect_identifier_nodes(entry.tree.root_node()) {
                 if as_core::syntax::in_specifier_context(ident) {
                     skipped_spec += 1;
                     continue;
@@ -533,11 +496,11 @@ fn dump_index(
                     continue;
                 }
                 total += 1;
-                if as_core::resolve::resolve_at(&idx, file, ident.start_byte() as u32).is_some() {
+                if as_core::resolve::resolve_at(&ws, file, ident.start_byte() as u32).is_some() {
                     hit += 1;
                 } else if misses.len() < 20 {
                     let text = ident.utf8_text(src.as_bytes()).unwrap_or("");
-                    let (line, col) = snap.lines.line_col_debug(ident.start_byte() as u32);
+                    let (line, col) = entry.lines.line_col_debug(ident.start_byte() as u32);
                     misses.push(format!(
                         "  MISS {}:{}:{col} {text}",
                         file_path(file).unwrap_or("?"),
@@ -558,89 +521,91 @@ fn dump_index(
         }
     }
 
-    // --ref-stats：对全部文件的 UseSite 跑引用解析内核（M4 验收体检——
-    // 站点数 / 解析率 / 耗时）。references 首次请求的成本即此（后续命中缓存）。
+    // --ref-stats（B1 基线对账的查询期路径——旧倒排路径已删除）：
+    // 引用最多的 top-20 名字跑查询期 references，报命中总数 + 耗时。
+    // top-20 口径复刻原 ref_index（name → 出现该名字的文件集合，取证自
+    // 已删除的 uses.rs：只收 identifier、排除声明名 / specifier 语境 /
+    // named_argument 名 / access_specifier level 名）。此处仅作统计口径
+    // 选名，不回建倒排架构。B1 基线：25450 hits / query ~307ms (rayon)。
     if ref_stats {
-        let start = std::time::Instant::now();
-        let sites: usize = idx.files.values().map(|s| s.uses.len()).sum();
-        let mut resolved = 0usize;
-        let mut targets_total = 0usize;
-        let mut per_file: Vec<(std::time::Duration, usize, as_core::id::FileId)> = Vec::new();
-        let all_files: Vec<_> = idx.files.keys().copied().collect();
-        for file in all_files {
-            let fstart = std::time::Instant::now();
-            let fsites = idx.files.get(&file).map(|s| s.uses.len()).unwrap_or(0);
-            for u in as_core::references::resolve_file_uses(&idx, file) {
-                resolved += 1;
-                targets_total += u.targets.len();
+        use as_core::references::{find_references, RefTarget};
+        use std::collections::{BTreeSet, HashMap as Map, HashSet};
+        let mut ref_files: Map<Sym, BTreeSet<FileId>> = Map::new();
+        for (&file, entry) in &ws.files {
+            let src = &entry.source;
+            // 该文件声明名 span 集合（namespace scoped_name 尾段等）
+            let decl_spans: HashSet<as_core::range::TextRange> =
+                entry.summary.decls.iter().map(|d| d.name_span).collect();
+            for ident in collect_identifier_nodes(entry.tree.root_node()) {
+                if ident.kind() != "identifier" {
+                    continue; // 原口径只收 identifier（primitive_type 不记录）
+                }
+                if as_core::syntax::in_specifier_context(ident) {
+                    continue;
+                }
+                let Some(parent) = ident.parent() else { continue };
+                if parent.kind() == "access_specifier" {
+                    continue;
+                }
+                if parent.kind() == "named_argument"
+                    && parent
+                        .child_by_field_name("name")
+                        .is_some_and(|n| n.id() == ident.id())
+                {
+                    continue;
+                }
+                if is_decl_name_like(parent, ident) {
+                    continue; // 形参 / 局部 declarator / 迭代变量等声明名
+                }
+                if decl_spans.contains(&as_core::range::TextRange::new(
+                    ident.start_byte() as u32,
+                    ident.end_byte() as u32,
+                )) {
+                    continue; // 顶层/类级声明名（含 namespace scoped_name 尾段）
+                }
+                let name = intern_sym(ident.utf8_text(src.as_bytes()).unwrap_or(""));
+                ref_files.entry(name).or_default().insert(file);
             }
-            per_file.push((fstart.elapsed(), fsites, file));
         }
-        per_file.sort_by(|a, b| b.0.cmp(&a.0));
-        println!("  slowest files:");
-        for (dur, n, file) in per_file.iter().take(5) {
-            println!("    {:>10.?}  {n:>5} sites  {}", dur, file_path(*file).unwrap_or("?"));
-        }
-        println!(
-            "--- ref-stats (all use sites) ---\n  sites {sites}, resolved {resolved} ({:.1}%), targets {targets_total}, elapsed {:?}",
-            if sites == 0 { 0.0 } else { resolved as f64 / sites as f64 * 100.0 },
-            start.elapsed()
-        );
-
-        // B1 A/B 对账：引用最多的 top-20 名字，倒排路径 vs 查询期路径
-        //（字符串扫 + 逐点解析验证）结果必须逐位相等——D5 翻案的语料级验证
-        use as_core::references::{find_references, find_references_query};
-        use as_core::id::Sym;
-        let mut top: Vec<(usize, Sym)> = idx
-            .ref_index
-            .iter()
-            .map(|(sym, fs)| (fs.len(), *sym))
-            .collect();
+        let mut top: Vec<(usize, Sym)> =
+            ref_files.iter().map(|(s, fs)| (fs.len(), *s)).collect();
         top.sort_by(|a, b| b.0.cmp(&a.0));
-        let t_ab = std::time::Instant::now();
-        let mut ab_fail = 0usize;
-        let mut old_total = 0usize;
-        let mut new_total = 0usize;
-        let mut old_elapsed = std::time::Duration::ZERO;
-        let mut new_elapsed = std::time::Duration::ZERO;
-        for (_, sym) in top.iter().take(20) {
-            // 目标 = 该名字的全部声明（重载组整体——references 的真实查询形态）
-            let targets: Vec<as_core::RefTarget> = idx
-                .main
-                .get(sym)
-                .map(|ds| ds.iter().copied().map(as_core::RefTarget::Def).collect())
-                .unwrap_or_default();
+        let mut total_hits = 0usize;
+        let mut elapsed = std::time::Duration::ZERO;
+        let mut queried = 0usize;
+        for (i, (_, sym)) in top.iter().enumerate().take(20) {
+            let targets: Vec<RefTarget> = ws
+                .lookup(*sym)
+                .iter()
+                .copied()
+                .map(RefTarget::Def)
+                .collect();
             if targets.is_empty() {
-                continue;
+                println!(
+                    "  top-{:02} {} ({} files): no declarations — skipped",
+                    i + 1,
+                    as_core::intern::sym_str(*sym),
+                    ref_files.get(sym).map(|s| s.len()).unwrap_or(0)
+                );
+                continue; // 无声明的名字不可查（B1 同口径）
             }
             let t0 = std::time::Instant::now();
-            let old = find_references(&idx, &targets);
-            old_elapsed += t0.elapsed();
-            let t1 = std::time::Instant::now();
-            let new = find_references_query(&idx, &targets, false);
-            new_elapsed += t1.elapsed();
-            old_total += old.len();
-            new_total += new.len();
-            if old != new {
-                ab_fail += 1;
-                println!(
-                    "  AB MISMATCH {}: old {} hits vs new {} hits",
-                    as_core::intern::sym_str(*sym),
-                    old.len(),
-                    new.len()
-                );
-            }
+            let hits = find_references(&ws, &targets, false);
+            elapsed += t0.elapsed();
+            println!(
+                "  top-{:02} {} ({} files, {} decls): {} hits",
+                i + 1,
+                as_core::intern::sym_str(*sym),
+                ref_files.get(sym).map(|s| s.len()).unwrap_or(0),
+                targets.len(),
+                hits.len()
+            );
+            total_hits += hits.len();
+            queried += 1;
         }
         println!(
-            "  A/B (top-20 names): old {old_total} hits | query {new_total} hits | {} | old {:?} / query {:?} (rayon)",
-            if ab_fail == 0 { "MATCH" } else { "MISMATCH" },
-            old_elapsed,
-            new_elapsed,
+            "--- ref-stats (query-time, top-20 names by use-site file count) ---\n  queried {queried} names, {total_hits} hits total, elapsed {elapsed:?} (rayon) | B1 baseline: 25450 hits / ~307ms"
         );
-        let _ = t_ab;
-        if ab_fail > 0 {
-            return ExitCode::FAILURE;
-        }
     }
 
     if n_err > 0 || read_failures > 0 || bad_utf8 > 0 {
@@ -648,6 +613,33 @@ fn dump_index(
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// 声明名字段判定（ref-stats 的 top-20 统计口径——取证自已删除的
+/// uses.rs `is_decl_name`：field == "name" 且父节点是声明形态。形参 /
+/// 局部 declarator / 迭代变量不进 summary.decls，须按语法判定排除）。
+fn is_decl_name_like(parent: Node<'_>, ident: Node<'_>) -> bool {
+    let Some(field) = as_core::syntax::field_of_child(parent, ident) else { return false };
+    if field != "name" {
+        return false;
+    }
+    matches!(
+        parent.kind(),
+        "class_declaration"
+            | "struct_declaration"
+            | "enum_declaration"
+            | "function_declaration"
+            | "constructor_declaration"
+            | "destructor_declaration"
+            | "delegate_declaration"
+            | "event_declaration"
+            | "asset_declaration"
+            | "virtual_property_declaration"
+            | "parameter"
+            | "enumerator"
+            | "variable_declarator"
+            | "for_each_statement"
+    )
 }
 
 /// 收集全部 identifier / primitive_type 节点（使用点 + 声明点都算——
@@ -684,14 +676,12 @@ fn file_kind_of(path: &Path) -> FileKind {
 }
 
 /// 模块名：相对首个包含它的 CLI 收集根；直接传入的文件取文件名主干。
-fn module_of(roots: &[PathBuf], path: &Path) -> Option<as_core::id::Sym> {
+fn module_of(roots: &[PathBuf], path: &Path) -> Option<Sym> {
     for root in roots {
         if let Ok(rel) = path.strip_prefix(root) {
             let rel = rel.to_string_lossy();
             if !rel.is_empty() {
-                return Some(as_core::intern::intern_sym(
-                    &as_core::index::filename_to_module_name(&rel),
-                ));
+                return Some(intern_sym(&as_core::workspace::filename_to_module_name(&rel)));
             }
         }
     }
@@ -700,7 +690,7 @@ fn module_of(roots: &[PathBuf], path: &Path) -> Option<as_core::id::Sym> {
         .strip_suffix(".d.as")
         .or_else(|| name.strip_suffix(".as"))
         .unwrap_or(&name);
-    Some(as_core::intern::intern_sym(stem))
+    Some(intern_sym(stem))
 }
 
 fn collect_inputs(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {

@@ -6,71 +6,79 @@
 //!   @warning/@brief/@todo）渲染为 markdown 结构，其余原样（D15 规则 2）；
 //! - `@group` 的完整包路径（§2.2.1 推论 2）附在签名后一行。
 //! 纯函数，全部可单测（D1：用例内置于源码）。
+//!
+//! Phase B（D37）：DefId → DeclRef；合成成员（B4）以 `Target::Synthetic`
+//! 携带签名与 origin（group/doc 回落源头声明，D10）。
 
-use crate::id::DefId;
-use crate::index::WorkspaceIndex;
+use crate::aggregation::DeclRef;
 use crate::intern::sym_str;
 use crate::resolve::Target;
-use crate::symbol::{DefExtra, DefFlags, DefKind};
+use crate::summary::RawExtra;
+use crate::symbol::{DefFlags, DefKind};
 use crate::types::{RefKind, SynType};
+use crate::workspace::{SyntheticMember, Workspace};
 
 /// 生成 hover markdown（fence + 签名们 + group + doc）。
-pub fn hover_markdown(idx: &WorkspaceIndex, targets: &[Target]) -> Option<String> {
+pub fn hover_markdown(ws: &Workspace, targets: &[Target]) -> Option<String> {
     if targets.is_empty() {
         return None;
     }
     let mut sigs = Vec::with_capacity(targets.len());
     for t in targets {
-        sigs.push(signature(idx, t)?);
+        sigs.push(signature(ws, t)?);
     }
     let mut out = format!("```angelscript_snippet\n{}\n```", sigs.join("\n"));
 
     // 归属显示：.d.as 文件头 @group 的完整包路径（§2.2.1 推论 2；
     // 合成符号回落源头声明所在文件）
-    if let Target::Def(id) = &targets[0] {
-        let d = idx.def(*id);
-        let group_def = d.origin.map(|o| idx.def(o)).unwrap_or(d);
-        if let Some(group) = idx.files.get(&group_def.file).and_then(|s| s.group.as_deref()) {
+    if let Some((group_file, _)) = anchor_of(&targets[0], ws) {
+        if let Some(group) = ws.files.get(&group_file).and_then(|e| e.summary.group.as_deref()) {
             out.push_str(&format!("\n\n_{group}_"));
         }
     }
 
     // doc（合成符号回落源头声明）
     let doc = match &targets[0] {
-        Target::Def(id) => {
-            let d = idx.def(*id);
-            d.doc
-                .as_deref()
-                .or_else(|| d.origin.and_then(|o| idx.def(o).doc.as_deref()))
-        }
+        Target::Def(r) => ws.decl(r).doc.as_deref().map(str::to_string),
+        Target::Synthetic(m) => ws.decl(&m.origin).doc.as_deref().map(str::to_string),
         Target::Local(_) => None,
     };
     if let Some(d) = doc {
         if !d.is_empty() {
             out.push_str("\n\n");
-            out.push_str(&render_doc(d));
+            out.push_str(&render_doc(&d));
         }
     }
     Some(out)
 }
 
+/// 目标的声明锚点（合成成员回落 origin，D10）：(file, name_span)。
+pub fn anchor_of(target: &Target, ws: &Workspace) -> Option<(crate::id::FileId, crate::range::TextRange)> {
+    match target {
+        Target::Def(r) => Some((r.file, ws.decl(r).name_span)),
+        Target::Synthetic(m) => Some((m.origin.file, ws.decl(&m.origin).name_span)),
+        Target::Local(_) => None, // 局部在请求文件内，由调用方处理
+    }
+}
+
 /// 紧凑签名（单行）。
-pub fn signature(idx: &WorkspaceIndex, target: &Target) -> Option<String> {
+pub fn signature(ws: &Workspace, target: &Target) -> Option<String> {
     match target {
         Target::Local(l) => {
             let kind = if l.kind == DefKind::Param { "param" } else { "local" };
             let ty = l.ty.as_ref().map(render_syn).unwrap_or_else(|| "?".into());
             Some(format!("{ty} {}  // {kind}", sym_str(l.name)))
         }
-        Target::Def(id) => Some(def_signature(idx, *id)),
+        Target::Def(r) => Some(def_signature(ws, *r)),
+        Target::Synthetic(m) => Some(synthetic_signature(m)),
     }
 }
 
-fn def_signature(idx: &WorkspaceIndex, id: DefId) -> String {
-    let d = idx.def(id);
+fn def_signature(ws: &Workspace, r: DeclRef) -> String {
+    let d = ws.decl(&r);
     let name = sym_str(d.name);
     match &d.extra {
-        DefExtra::Callable { return_type, params } => {
+        RawExtra::Callable { return_type, params } => {
             let head = match d.kind {
                 DefKind::Constructor | DefKind::Destructor => String::new(),
                 DefKind::Delegate => "delegate ".to_string(),
@@ -90,7 +98,7 @@ fn def_signature(idx: &WorkspaceIndex, id: DefId) -> String {
             let tail = if d.flags.contains(DefFlags::CONST) { " const" } else { "" };
             format!("{head}{name}({}){tail}", ps.join(", "))
         }
-        DefExtra::Variable { ty } => {
+        RawExtra::Variable { ty } => {
             let t = ty.as_ref().map(render_syn).unwrap_or_else(|| "?".into());
             match d.kind {
                 DefKind::AssetDecl => format!("asset {name} of {t}"),
@@ -98,9 +106,22 @@ fn def_signature(idx: &WorkspaceIndex, id: DefId) -> String {
                 _ => format!("{t} {name}"),
             }
         }
-        DefExtra::TypeDecl { bases, .. } => match d.kind {
+        RawExtra::EnumValue { value } => {
+            let enum_name = d
+                .parent
+                .map(|p| format!("{}::", sym_str(ws.files[&r.file].summary.decls[p as usize].name)))
+                .unwrap_or_default();
+            match value {
+                Some(v) => format!("{enum_name}{name} = {v}"),
+                None => format!("{enum_name}{name}"),
+            }
+        }
+        RawExtra::None => match d.kind {
+            DefKind::Namespace => format!("namespace {name}"),
+            // 类型声明（bases / template_params 是 RawDecl 上提字段，Phase A）
             DefKind::Class => {
-                let base = bases
+                let base = d
+                    .bases
                     .iter()
                     .map(|b| sym_str(b.name).to_string())
                     .collect::<Vec<_>>()
@@ -112,23 +133,32 @@ fn def_signature(idx: &WorkspaceIndex, id: DefId) -> String {
                 }
             }
             DefKind::Struct => format!("struct {name}"),
-            _ => format!("enum {name}"),
-        },
-        DefExtra::EnumValue { value } => {
-            let enum_name = d
-                .parent
-                .map(|p| format!("{}::", sym_str(idx.def(p).name)))
-                .unwrap_or_default();
-            match value {
-                Some(v) => format!("{enum_name}{name} = {v}"),
-                None => format!("{enum_name}{name}"),
-            }
-        }
-        DefExtra::None => match d.kind {
-            DefKind::Namespace => format!("namespace {name}"),
+            DefKind::Enum => format!("enum {name}"),
             _ => name.to_string(),
         },
     }
+}
+
+/// 合成成员签名（B4：delegate/event 展开集 + StaticClass）。
+fn synthetic_signature(m: &SyntheticMember) -> String {
+    let name = sym_str(m.name);
+    let head = match m.kind {
+        DefKind::Constructor | DefKind::Destructor => String::new(),
+        _ => match &m.return_type {
+            Some(t) => format!("{} ", render_syn(t)),
+            None => "void ".to_string(),
+        },
+    };
+    let ps: Vec<String> = m
+        .params
+        .iter()
+        .map(|p| match &p.ty {
+            Some(t) => format!("{} {}", render_syn(t), sym_str(p.name)),
+            None => sym_str(p.name).to_string(),
+        })
+        .collect();
+    let tail = if m.flags.contains(DefFlags::CONST) { " const" } else { "" };
+    format!("{head}{name}({}){tail}", ps.join(", "))
 }
 
 /// 语法层类型渲染（保持源码形态：const / &in / T[] / Name<Args>）。
@@ -200,11 +230,11 @@ pub fn render_doc(doc: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::IndexConfig;
-    use crate::index::{FileInput, FileKind};
     use crate::intern::{intern_file, intern_sym};
     use crate::resolve::{resolve_at, LEVEL_DECL_SELF};
+    use crate::workspace::{FileInput, FileKind};
 
-    fn build(srcs: &[(&str, &str)]) -> WorkspaceIndex {
+    fn build(srcs: &[(&str, &str)]) -> Workspace {
         let inputs = srcs
             .iter()
             .map(|(path, src)| FileInput {
@@ -214,7 +244,7 @@ mod tests {
                 module: None,
             })
             .collect();
-        WorkspaceIndex::build(IndexConfig::default(), inputs)
+        Workspace::build(IndexConfig::default(), inputs)
     }
 
     /// 用例源码全部内置（AGENTS.md 硬性规则 / D1）。
@@ -237,13 +267,13 @@ class AActor
 
     #[test]
     fn hover_fence_and_doc_render() {
-        let idx = build(&[("unique://hov/Engine.d.as", DECL)]);
+        let ws = build(&[("unique://hov/Engine.d.as", DECL)]);
         let file = intern_file("unique://hov/Engine.d.as", 0);
         let byte = DECL.find("GetActorLocation(Name").unwrap() as u32;
-        let r = resolve_at(&idx, file, byte).unwrap();
+        let r = resolve_at(&ws, file, byte).unwrap();
         assert_eq!(r.level, LEVEL_DECL_SELF, "声明自指也可 hover");
 
-        let md = hover_markdown(&idx, &r.targets).unwrap();
+        let md = hover_markdown(&ws, &r.targets).unwrap();
         assert!(md.starts_with("```angelscript_snippet\n"), "fence 起始: {md}");
         assert!(md.contains("FVector GetActorLocation(Name InName) const"), "签名: {md}");
         // @group 完整包路径
@@ -258,11 +288,11 @@ class AActor
     #[test]
     fn hover_local_param() {
         const SRC: &str = "void F(float Delta) { float L = Delta; }\n";
-        let idx = build(&[("unique://hov/local.as", SRC)]);
+        let ws = build(&[("unique://hov/local.as", SRC)]);
         let file = intern_file("unique://hov/local.as", 0);
         let byte = SRC.rfind("Delta").unwrap() as u32;
-        let r = resolve_at(&idx, file, byte).unwrap();
-        let md = hover_markdown(&idx, &r.targets).unwrap();
+        let r = resolve_at(&ws, file, byte).unwrap();
+        let md = hover_markdown(&ws, &r.targets).unwrap();
         assert!(md.contains("float Delta"), "参数签名: {md}");
         assert!(md.contains("param"), "param 标注: {md}");
     }
@@ -271,11 +301,11 @@ class AActor
     fn hover_delegate_synthetic_member() {
         const DLG: &str =
             "delegate void FOnHit(int Damage);\nclass A { FOnHit OnHit; void M() { OnHit.Execute(5); } }\n";
-        let idx = build(&[("unique://hov/dlg.as", DLG)]);
+        let ws = build(&[("unique://hov/dlg.as", DLG)]);
         let file = intern_file("unique://hov/dlg.as", 0);
         let byte = DLG.find("Execute").unwrap() as u32;
-        let r = resolve_at(&idx, file, byte).unwrap();
-        let md = hover_markdown(&idx, &r.targets).unwrap();
+        let r = resolve_at(&ws, file, byte).unwrap();
+        let md = hover_markdown(&ws, &r.targets).unwrap();
         // 展开成员的签名（参数从委托声明克隆）
         assert!(md.contains("void Execute(int Damage) const"), "Execute 签名: {md}");
     }
@@ -284,11 +314,11 @@ class AActor
     fn hover_unnamed_param_placeholder_kept() {
         // InArgN 占位名在签名中原样展示（声明就是如此）；命名实参「补全」跳过它
         const D: &str = "void SetX(float64 InArg0);\n";
-        let idx = build(&[("unique://hov/arg.d.as", D)]);
+        let ws = build(&[("unique://hov/arg.d.as", D)]);
         let file = intern_file("unique://hov/arg.d.as", 0);
         let byte = D.find("SetX").unwrap() as u32;
-        let r = resolve_at(&idx, file, byte).unwrap();
-        let md = hover_markdown(&idx, &r.targets).unwrap();
+        let r = resolve_at(&ws, file, byte).unwrap();
+        let md = hover_markdown(&ws, &r.targets).unwrap();
         assert!(md.contains("void SetX(float64 InArg0)"), "占位名原样: {md}");
     }
 
@@ -299,21 +329,21 @@ class AActor
         // （未解析符号）保留整组。
         const O: &str =
             "void Log(FString S) {}\nvoid Log(int N) {}\nvoid F() { Log(1); Log(Unresolved()); }\n";
-        let idx = build(&[("unique://hov/ovl.as", O)]);
+        let ws = build(&[("unique://hov/ovl.as", O)]);
         let file = intern_file("unique://hov/ovl.as", 0);
 
         // 消歧成功：hover 显示选中的重载
         let byte = O.find("Log(1)").unwrap() as u32;
-        let r = resolve_at(&idx, file, byte).unwrap();
-        let md = hover_markdown(&idx, &r.targets).unwrap();
+        let r = resolve_at(&ws, file, byte).unwrap();
+        let md = hover_markdown(&ws, &r.targets).unwrap();
         assert!(md.contains("void Log(int N)"), "选中重载: {md}");
         assert!(!md.contains("void Log(FString S)"), "消歧后不显示另一重载: {md}");
 
         // 消歧失败：整组同 fence
         let byte = O.find("Log(Unresolved())").unwrap() as u32;
-        let r = resolve_at(&idx, file, byte).unwrap();
+        let r = resolve_at(&ws, file, byte).unwrap();
         assert_eq!(r.targets.len(), 2, "不可定型实参 ⇒ 保留全部重载");
-        let md = hover_markdown(&idx, &r.targets).unwrap();
+        let md = hover_markdown(&ws, &r.targets).unwrap();
         assert!(md.contains("void Log(FString S)"), "重载1: {md}");
         assert!(md.contains("void Log(int N)"), "重载2: {md}");
     }
@@ -321,11 +351,11 @@ class AActor
     #[test]
     fn hover_class_signature_with_base() {
         const C: &str = "class APawn : AActor {}\nvoid F() { APawn P; }\n";
-        let idx = build(&[("unique://hov/cls.as", C)]);
+        let ws = build(&[("unique://hov/cls.as", C)]);
         let file = intern_file("unique://hov/cls.as", 0);
         let byte = C.find("APawn P").unwrap() as u32;
-        let r = resolve_at(&idx, file, byte).unwrap();
-        let md = hover_markdown(&idx, &r.targets).unwrap();
+        let r = resolve_at(&ws, file, byte).unwrap();
+        let md = hover_markdown(&ws, &r.targets).unwrap();
         assert!(md.contains("class APawn : AActor"), "类签名: {md}");
         let _ = intern_sym("unused");
     }

@@ -149,7 +149,7 @@ pub fn file_path(file: FileId) -> Option<&'static str> {
         .map(|m| m.path)
 }
 
-/// 打墓碑：文件删除。id 与 path 保留；该 FileId 的 DefId / UseSite 摘除由
+/// 打墓碑：文件删除。id 与 path 保留；该 FileId 的 DeclRef 条目摘除由
 /// 索引层负责（M1，LSP实现规划 §5.3），本层只管注册表状态。
 pub fn tombstone_file(file: FileId) -> bool {
     match files().write().unwrap().by_id.get_mut(file.as_usize()) {

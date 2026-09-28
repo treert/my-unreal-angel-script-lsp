@@ -7,6 +7,11 @@
 //! CST 访问辅助（`syntax`）、TextRange/行首表（`range`）。
 //! `resolve` / `overload` / `expand` 随 M3 落地。
 //!
+//! **Phase B（D37）**：L3 数据后端切换为 `workspace`（FileEntry +
+//! Aggregation + DeclRef）——旧 `index`（WorkspaceIndex / DefId arena）、
+//! `expand`（合成成员预计算，改为查询期 `Workspace::synthetic_members`）、
+//! `uses`（UseSite 收集，references 改查询期字符串扫）全部删除。
+//!
 //! 纯库边界：**无 IO、无 async、允许只增 intern 表**（实现优化 §2.4）。
 //! 依赖方向：as-core → as-syntax；服务壳（as-lsp）与工具（as-cli）一律经
 //! `pub use as_syntax` 取语法能力，不直连 as-syntax。
@@ -16,12 +21,10 @@ pub mod config;
 pub mod completion;
 pub mod decl_tags;
 pub mod diag;
-pub mod expand;
 pub mod expr;
 pub mod hover;
 pub mod id;
 pub mod inlay;
-pub mod index;
 pub mod intern;
 pub mod logger;
 pub mod outline;
@@ -38,7 +41,6 @@ pub mod symbol;
 pub mod syntax;
 pub mod tokens;
 pub mod types;
-pub mod uses;
 pub mod workspace;
 
 pub use as_syntax;
@@ -46,23 +48,21 @@ pub use as_syntax;
 pub use decl_tags::{DocBlock, SemanticTag, TagKind, TagValue};
 pub use diag::{script_diags, Diag, DiagCode, DiagSeverity, Suppression};
 pub use hover::{hover_markdown, render_doc, render_syn, signature};
-pub use id::{DefId, FileId, Sym, TypeId};
+pub use id::{FileId, Sym, TypeId};
 pub use aggregation::{Aggregation, DeclRef};
 pub use config::IndexConfig;
-pub use index::{filename_to_module_name, FileInput, FileKind, WorkspaceIndex};
 pub use outline::{document_symbols, folding_ranges, Fold, FoldKind, OutlineKind, OutlineSymbol};
 pub use overload::{disambiguate, OverloadScore, Ranked};
 pub use range::{LineIndex, TextRange};
-pub use references::{
-    candidate_files, find_references, match_uses, match_uses_strict, resolve_file_uses, RefTarget,
-    UseResolution,
-};
+pub use references::{find_references, find_word_occurrences, RefTarget};
 pub use search::{query_symbols, MAX_RESULTS};
 pub use resolve::{
     resolve_at, LocalDecl, Resolution, Target, LEVEL_ACCESSOR, LEVEL_DECL_SELF, LEVEL_GLOBAL,
     LEVEL_LOCAL, LEVEL_MEMBER, LEVEL_MIXIN, LEVEL_NAMESPACE, LEVEL_THIS_SUPER,
 };
-pub use symbol::{BaseRef, DefData, DefExtra, DefFlags, DefKind, ParamDecl, SymbolTable};
+pub use symbol::{BaseRef, DefFlags, DefKind, ParamDecl};
 pub use tokens::{semantic_tokens, SemanticToken, LEGEND};
 pub use types::{RefKind, SynType, TypeKind, TypeTable};
-pub use uses::{UseRole, UseSite};
+pub use workspace::{
+    filename_to_module_name, FileInput, FileKind, SyntheticMember, Workspace,
+};

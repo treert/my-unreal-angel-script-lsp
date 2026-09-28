@@ -3,30 +3,38 @@
 //! ```text
 //! 0. this / super（语境限定：类/struct 方法体内）
 //! 1. 局部变量（作用域链上溯；形参属最外层局部帧）
-//! 2. 当前类成员（class 沿继承闭包上溯；struct 单层——D16）
+//! 2. 当前类成员（class 沿继承闭包上溯；struct 单层——D16）∪ 查询期合成
+//!    成员（delegate/event 展开集，B4）
 //! 3. 属性访问器模拟（Get<X>/Set<X>，反向默认：不带 NOT_PROPERTY 即候选，§2.4.5）
 //! 4. mixin 函数（fallback：2/3 级全空 + 对象上下文 + 无 scope 限定才查，§4.5.1）
-//! 5. 命名空间链（逐级回退父命名空间；同名 namespace 跨文件按 Sym 聚合）
+//! 5. 命名空间链（逐级回退父命名空间；同名 namespace 跨文件按 Sym 聚合；
+//!    B3：class/struct 直接兼任 namespace，合成 namespace 机制消失）
 //! 6. 全局符号 / 类型本身（local 函数按模块归属过滤；type/namespace 按语境择一）
 //! ```
 //!
 //! 参数是**字节偏移**而非 Pos——as-core 不引入行列概念（规划 §3.2.1）。
-//! 查询基于 `idx.files[file]` 的 CST 快照（server 侧保证 open 文件先重索引）。
+//! 查询基于 `ws.files[file]` 的 CST 快照（server 侧保证 open 文件先重索引）。
 //!
 //! 表达式定型管线在 `crate::expr`（M5a 从本模块迁出并完整化：字面量 /
 //! 运算符重载 / f-string / range-for 双跳 / 模板实参替换——D14/D28 欠账
 //! 清偿）。auto 局部与 range-for 迭代变量在 SemCtx 构建期惰性定型
 //!（请求驱动，扫描阶段仍不碰定型，D14）。
+//!
+//! Phase B（D37）：后端从旧 `WorkspaceIndex`（全局 DefId arena）切换到
+//! `Workspace`（FileEntry + Aggregation + DeclRef）。合成成员（B4）以
+//! [`Target::Synthetic`] 携带 [`crate::workspace::SyntheticMember`]（锚点
+//! 复用源头声明，D10 origin 的 DeclRef 形态）。
 
 use as_syntax::tree_sitter::Node;
 
-use crate::id::{DefId, FileId, Sym};
-use crate::index::WorkspaceIndex;
+use crate::aggregation::DeclRef;
+use crate::id::{FileId, Sym};
 use crate::intern::{intern_sym, sym_str};
 use crate::range::TextRange;
-use crate::symbol::{DefData, DefFlags, DefKind};
+use crate::symbol::{DefFlags, DefKind};
 use crate::syntax;
 use crate::types::SynType;
+use crate::workspace::{SyntheticMember, Workspace};
 
 /// 查找链命中级数（§4.5 的 0-6）。
 pub const LEVEL_THIS_SUPER: u8 = 0;
@@ -54,14 +62,18 @@ pub struct LocalDecl {
 /// 查找链的落点。
 #[derive(Clone, Debug)]
 pub enum Target {
-    Def(DefId),
+    Def(DeclRef),
+    /// 查询期合成成员（B4：delegate/event 展开 / StaticClass）——锚点复用
+    /// 源头声明（`m.origin`），hover/definition 落到源头。
+    Synthetic(SyntheticMember),
     Local(LocalDecl),
 }
 
 impl Target {
-    pub fn name<'a>(&self, idx: &'a WorkspaceIndex) -> &'a str {
+    pub fn name<'a>(&self, ws: &'a Workspace) -> &'a str {
         match self {
-            Target::Def(id) => sym_str(idx.def(*id).name),
+            Target::Def(r) => sym_str(ws.decl(r).name),
+            Target::Synthetic(m) => sym_str(m.name),
             Target::Local(l) => sym_str(l.name),
         }
     }
@@ -81,10 +93,10 @@ pub struct Resolution {
 /// 光标处的语义语境：沿根→叶路径收集 namespace 链 / 所在类型 / 所在函数 /
 /// 可见局部。
 pub(crate) struct SemCtx<'t> {
-    pub(crate) ns_defs: Vec<DefId>, // innermost → outermost
+    pub(crate) ns_defs: Vec<DeclRef>, // innermost → outermost
     pub(crate) ns_syms: Vec<Sym>,
-    pub(crate) type_def: Option<DefId>,
-    pub(crate) fn_def: Option<DefId>,
+    pub(crate) type_def: Option<DeclRef>,
+    pub(crate) fn_def: Option<DeclRef>,
     /// 参数 + 块内局部（入栈序：参数 → 外块 → 内块；查找**逆序** = 内层优先）
     pub(crate) locals: Vec<LocalDecl>,
     pub(crate) file: FileId,
@@ -103,17 +115,17 @@ impl<'t> SemCtx<'t> {
     fn from_ancestors(
         ident: Node<'t>,
         src: &str,
-        idx: &WorkspaceIndex,
+        ws: &Workspace,
         file: FileId,
     ) -> SemCtx<'t> {
-        Self::at_byte(idx, file, src, ident.start_byte() as u32, ident)
+        Self::at_byte(ws, file, src, ident.start_byte() as u32, ident)
     }
 
     /// 任意字节位置建语境（M5b 补全入口）：`node` 是光标处最深节点
     /// （identifier / 运算符 token / ERROR 均可——上溯只看祖先种类），
     /// `byte` 是可见性锚点（声明点在其后的局部不可见）。
     pub(crate) fn at_byte(
-        idx: &WorkspaceIndex,
+        ws: &Workspace,
         file: FileId,
         src: &str,
         byte: u32,
@@ -141,7 +153,7 @@ impl<'t> SemCtx<'t> {
                     if let Some(name_node) = syntax::decl_name_node(node) {
                         let span = syntax::span(name_node);
                         let sym = intern_sym(syntax::text(name_node, src));
-                        if let Some(def) = def_id_at(idx, file, span, sym, &[DefKind::Namespace]) {
+                        if let Some(def) = decl_at(ws, file, span, sym, &[DefKind::Namespace]) {
                             ctx.ns_defs.push(def);
                             ctx.ns_syms.push(sym);
                         }
@@ -152,7 +164,7 @@ impl<'t> SemCtx<'t> {
                         let span = syntax::span(name_node);
                         let sym = intern_sym(syntax::text(name_node, src));
                         if let Some(def) =
-                            def_id_at(idx, file, span, sym, &[DefKind::Class, DefKind::Struct])
+                            decl_at(ws, file, span, sym, &[DefKind::Class, DefKind::Struct])
                         {
                             ctx.type_def = Some(def);
                         }
@@ -162,8 +174,8 @@ impl<'t> SemCtx<'t> {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         let span = syntax::span(name_node);
                         let sym = intern_sym(syntax::text(name_node, src));
-                        if let Some(def) = def_id_at(
-                            idx,
+                        if let Some(def) = decl_at(
+                            ws,
                             file,
                             span,
                             sym,
@@ -190,13 +202,13 @@ impl<'t> SemCtx<'t> {
                     }
                 }
                 "block" => {
-                    collect_block_locals(node, src, byte, idx, &mut ctx);
+                    collect_block_locals(node, src, byte, ws, &mut ctx);
                 }
                 "for_statement" => {
                     // classic for 的初始化声明在整条 for 语句内可见
                     for (_f, child) in syntax::children_with_fields(node) {
                         if child.kind() == "variable_declaration" {
-                            collect_declarators(&child, src, byte, idx, &mut ctx);
+                            collect_declarators(&child, src, byte, ws, &mut ctx);
                         }
                     }
                 }
@@ -215,11 +227,11 @@ impl<'t> SemCtx<'t> {
                                 .and_then(|t| syntax::parse_syn_type(t, src));
                             let ty = match &declared {
                                 Some(t) if crate::expr::is_auto_type(t) => {
-                                    crate::expr::for_each_element(idx, &ctx, src, node)
+                                    crate::expr::for_each_element(ws, &ctx, src, node)
                                         .map(|e| {
                                             e.syn
                                                 .clone()
-                                                .unwrap_or_else(|| crate::expr::syn_of_base(idx, e.base))
+                                                .unwrap_or_else(|| crate::expr::syn_of_base(ws, e.base))
                                         })
                                         .or(declared)
                                 }
@@ -249,12 +261,12 @@ fn collect_block_locals(
     node: Node<'_>,
     src: &str,
     byte: u32,
-    idx: &WorkspaceIndex,
+    ws: &Workspace,
     ctx: &mut SemCtx,
 ) {
     for (_f, child) in syntax::children_with_fields(node) {
         if child.kind() == "variable_declaration" {
-            collect_declarators(&child, src, byte, idx, ctx);
+            collect_declarators(&child, src, byte, ws, ctx);
         }
     }
 }
@@ -263,7 +275,7 @@ fn collect_declarators(
     decl: &Node<'_>,
     src: &str,
     byte: u32,
-    idx: &WorkspaceIndex,
+    ws: &Workspace,
     ctx: &mut SemCtx,
 ) {
     let ty = decl
@@ -288,11 +300,11 @@ fn collect_declarators(
                 if inside_init {
                     ty.clone()
                 } else {
-                    match crate::expr::expr_type(idx, ctx, src, init) {
+                    match crate::expr::expr_type(ws, ctx, src, init) {
                         Some(e) => Some(
                             e.syn
                                 .clone()
-                                .unwrap_or_else(|| crate::expr::syn_of_base(idx, e.base)),
+                                .unwrap_or_else(|| crate::expr::syn_of_base(ws, e.base)),
                         ),
                         None => ty.clone(),
                     }
@@ -310,19 +322,19 @@ fn collect_declarators(
     }
 }
 
-/// (file, name_span) → DefId（同一文件的声明锚点匹配；SYNTHETIC 排除——
+/// (file, name_span) → DeclRef（同一文件的声明锚点匹配；SYNTHETIC 排除——
 /// 合成符号 name_span 与源头同名同位，声明自指须回落真实声明）。
-fn def_id_at(
-    idx: &WorkspaceIndex,
+fn decl_at(
+    ws: &Workspace,
     file: FileId,
     span: TextRange,
     name: Sym,
     kinds: &[DefKind],
-) -> Option<DefId> {
-    idx.main.get(&name)?.iter().copied().find(|&id| {
-        let d = idx.def(id);
+) -> Option<DeclRef> {
+    ws.lookup(name).iter().copied().find(|&r| {
+        let d = ws.decl(&r);
         !d.flags.contains(DefFlags::SYNTHETIC)
-            && d.file == file
+            && r.file == file
             && d.name_span == span
             && kinds.contains(&d.kind)
     })
@@ -367,21 +379,21 @@ pub(crate) fn role_of<'t>(parent: Node<'t>, field: Option<&str>) -> Role<'t> {
 // ---------------------------------------------------------------------------
 
 /// 在 offset 处解析一个名字（规划 §7.1；字节偏移）。
-pub fn resolve_at(idx: &WorkspaceIndex, file: FileId, byte: u32) -> Option<Resolution> {
-    let snap = idx.files.get(&file)?;
-    let src = &snap.source;
-    let root = snap.tree.root_node();
+pub fn resolve_at(ws: &Workspace, file: FileId, byte: u32) -> Option<Resolution> {
+    let entry = ws.files.get(&file)?;
+    let src = &entry.source;
+    let root = entry.tree.root_node();
     if byte < root.start_byte() as u32 || byte >= root.end_byte() as u32 {
         return None;
     }
     let ident = identifier_at(root, byte)?;
-    resolve_at_node(idx, file, src, ident)
+    resolve_at_node(ws, file, src, ident)
 }
 
-/// 在**已知** identifier 节点处解析（批量 UseSite 解析入口——节点已知，
+/// 在**已知** identifier 节点处解析（批量使用点解析入口——节点已知，
 /// 免从根下潜的 O(路径兄弟节点数) 重遍历，见 `SemCtx::from_ancestors`）。
 pub fn resolve_at_node(
-    idx: &WorkspaceIndex,
+    ws: &Workspace,
     file: FileId,
     src: &str,
     ident: Node<'_>,
@@ -396,10 +408,10 @@ pub fn resolve_at_node(
     }
     let name = intern_sym(syntax::text(ident, src));
     let ident_span = syntax::span(ident);
-    let ctx = SemCtx::from_ancestors(ident, src, idx, file);
+    let ctx = SemCtx::from_ancestors(ident, src, ws, file);
 
     // 声明自身（名字即锚点）：类/函数/字段声明名、局部/形参声明名
-    if let Some(def) = def_id_at_decl(idx, file, ident_span, name) {
+    if let Some(def) = decl_at_decl(ws, file, ident_span, name) {
         return Some(Resolution { targets: vec![Target::Def(def)], level: LEVEL_DECL_SELF });
     }
     if let Some(l) = ctx.locals.iter().find(|l| l.name_span == ident_span).cloned() {
@@ -409,31 +421,31 @@ pub fn resolve_at_node(
     let parent = ident.parent()?;
     let field = syntax::field_of_child(parent, ident);
     let mut res = match role_of(parent, field) {
-        Role::TypeUse => resolve_type_use(idx, &ctx, name),
+        Role::TypeUse => resolve_type_use(ws, &ctx, name),
         Role::ScopedFirst => {
             // `Super::` 首段 = 显式父类（§4.5 第 0 级）
             let s = sym_str(name);
             if s == "Super" || s == "super" {
                 return ctx
                     .type_def
-                    .and_then(|t| idx.closures.get(&t).and_then(|c| c.first().copied()))
+                    .and_then(|t| ws.closures.get(&t).and_then(|c| c.first().copied()))
                     .map(|b| Resolution { targets: vec![Target::Def(b)], level: LEVEL_THIS_SUPER });
             }
-            resolve_scoped_first(idx, name)
+            resolve_scoped_first(ws, name)
         }
         Role::ScopedLast { scope } => {
             let scope_name = intern_sym(syntax::text(scope, src));
-            resolve_scoped_last(idx, &ctx, scope_name, name)
+            resolve_scoped_last(ws, &ctx, scope_name, name)
         }
         Role::MemberProperty { object } => {
-            let recv = crate::expr::expr_type(idx, &ctx, src, object).map(|t| t.base);
-            resolve_member(idx, &ctx, recv, name, /*scoped=*/false)
+            let recv = crate::expr::expr_type(ws, &ctx, src, object).map(|t| t.base);
+            resolve_member(ws, &ctx, recv, name, /*scoped=*/false)
         }
         Role::Callee { call } => {
             let argc = argument_count(call);
-            resolve_callee(idx, &ctx, name, argc)
+            resolve_callee(ws, &ctx, name, argc)
         }
-        Role::Plain => resolve_plain(idx, &ctx, name),
+        Role::Plain => resolve_plain(ws, &ctx, name),
     };
     // M4 消歧（架构设计 §4.6）：调用点上的重载组——arity + 可定型实参
     // （字面量 / 标识符 / 链式成员）能唯一命中时收敛为单目标；不能则原样
@@ -442,7 +454,7 @@ pub fn resolve_at_node(
     if let Some(r) = res.as_mut() {
         if r.targets.len() > 1 {
             if let Some(call) = enclosing_call(ident) {
-                disambiguate_in_call(idx, &ctx, src, call, r);
+                disambiguate_in_call(ws, &ctx, src, call, r);
             }
         }
     }
@@ -468,10 +480,10 @@ fn identifier_at<'t>(root: Node<'t>, byte: u32) -> Option<Node<'t>> {
 }
 
 /// 声明自指（不限 kind，但排除合成）。
-fn def_id_at_decl(idx: &WorkspaceIndex, file: FileId, span: TextRange, name: Sym) -> Option<DefId> {
-    idx.main.get(&name)?.iter().copied().find(|&id| {
-        let d = idx.def(id);
-        !d.flags.contains(DefFlags::SYNTHETIC) && d.file == file && d.name_span == span
+fn decl_at_decl(ws: &Workspace, file: FileId, span: TextRange, name: Sym) -> Option<DeclRef> {
+    ws.lookup(name).iter().copied().find(|&r| {
+        let d = ws.decl(&r);
+        !d.flags.contains(DefFlags::SYNTHETIC) && r.file == file && d.name_span == span
     })
 }
 
@@ -516,24 +528,24 @@ fn enclosing_call<'t>(ident: Node<'t>) -> Option<Node<'t>> {
 /// 调用点重载消歧：只在「全部候选是可调用 Def」时尝试；结果不能唯一确定
 /// 就不动（保留整组——「报全部重载」）。排序判定在 `overload::disambiguate`。
 fn disambiguate_in_call(
-    idx: &WorkspaceIndex,
+    ws: &Workspace,
     ctx: &SemCtx<'_>,
     src: &str,
     call: Node<'_>,
     r: &mut Resolution,
 ) {
-    let defs: Option<Vec<DefId>> = r
+    let defs: Option<Vec<DeclRef>> = r
         .targets
         .iter()
         .map(|t| match t {
             Target::Def(id) => Some(*id),
-            Target::Local(_) => None,
+            Target::Synthetic(_) | Target::Local(_) => None,
         })
         .collect();
     let Some(defs) = defs else { return };
     if !defs.iter().all(|&id| {
         matches!(
-            idx.def(id).kind,
+            ws.decl(&id).kind,
             DefKind::Function
                 | DefKind::Method
                 | DefKind::Constructor
@@ -543,18 +555,18 @@ fn disambiguate_in_call(
     }) {
         return;
     }
-    let arg_bases = arg_type_bases(idx, ctx, src, call);
-    if let Some(winner) = crate::overload::disambiguate(idx, &defs, &arg_bases) {
+    let arg_bases = arg_type_bases(ws, ctx, src, call);
+    if let Some(winner) = crate::overload::disambiguate(ws, &defs, &arg_bases) {
         r.targets = vec![Target::Def(winner)];
     }
 }
 
 fn arg_type_bases(
-    idx: &WorkspaceIndex,
+    ws: &Workspace,
     ctx: &SemCtx<'_>,
     src: &str,
     call: Node<'_>,
-) -> Vec<Option<DefId>> {
+) -> Vec<Option<DeclRef>> {
     // M5a：实参定型统一走 expr::expr_type（字面量 / 运算符 / f-string /
     // 链式成员 / 调用返回……全量子集，D28 欠账清偿）
     call.child_by_field_name("arguments")
@@ -562,7 +574,7 @@ fn arg_type_bases(
             syntax::children_with_fields(args)
                 .into_iter()
                 .filter(|(_, c)| c.kind() == "argument")
-                .map(|(_, a)| crate::expr::expr_type(idx, ctx, src, a).map(|t| t.base))
+                .map(|(_, a)| crate::expr::expr_type(ws, ctx, src, a).map(|t| t.base))
                 .collect()
         })
         .unwrap_or_default()
@@ -573,21 +585,21 @@ fn arg_type_bases(
 // ---------------------------------------------------------------------------
 
 /// 类型位置的名字：内建 primitive（含 float 归一化）→ ns 链类型成员 → 全局类型。
-fn resolve_type_use(idx: &WorkspaceIndex, ctx: &SemCtx, name: Sym) -> Option<Resolution> {
-    // float 归一化（D25：从不落到名为 float 的 DefId）
+fn resolve_type_use(ws: &Workspace, ctx: &SemCtx, name: Sym) -> Option<Resolution> {
+    // float 归一化（D25：从不落到名为 float 的声明）
     let key = if sym_str(name) == "float" {
-        intern_sym(if idx.config.float_is_float64 { "float64" } else { "float32" })
+        intern_sym(if ws.config.float_is_float64 { "float64" } else { "float32" })
     } else {
         name
     };
-    if let Some(t) = builtin_target(idx, key) {
+    if let Some(t) = builtin_target(ws, key) {
         return Some(Resolution { targets: vec![t], level: LEVEL_GLOBAL });
     }
     // ns 链上的类型成员（namespace 内声明的 class/struct/enum）
     for &ns in ctx.ns_defs.iter().rev() {
-        let sym = idx.def(ns).name;
-        for nsdef in namespaces_named(idx, sym) {
-            let hits = members_named(idx, &[nsdef], name, |d| d.kind.is_type_decl());
+        let sym = ws.decl(&ns).name;
+        for nsdef in ws.namespaces_named(sym) {
+            let hits = ws.members_named(&[nsdef], name, |d| d.kind.is_type_decl());
             if !hits.is_empty() {
                 return Some(Resolution {
                     targets: hits.into_iter().map(Target::Def).collect(),
@@ -597,13 +609,13 @@ fn resolve_type_use(idx: &WorkspaceIndex, ctx: &SemCtx, name: Sym) -> Option<Res
         }
     }
     // 全局类型
-    let hits: Vec<DefId> = idx
-        .main
-        .get(&name)?
+    let hits: Vec<DeclRef> = ws
+        .lookup(name)
         .iter()
         .copied()
-        .filter(|&id| {
-            idx.def(id).kind.is_type_like() && !idx.def(id).flags.contains(DefFlags::SYNTHETIC)
+        .filter(|&r| {
+            let d = ws.decl(&r);
+            d.kind.is_type_like() && !d.flags.contains(DefFlags::SYNTHETIC)
         })
         .collect();
     (!hits.is_empty()).then(|| Resolution {
@@ -613,8 +625,9 @@ fn resolve_type_use(idx: &WorkspaceIndex, ctx: &SemCtx, name: Sym) -> Option<Res
 }
 
 /// `A::B` 的 A：namespace 优先（§2.2.1 推论 1 的语境择一：`X::` 限定 → namespace）。
-fn resolve_scoped_first(idx: &WorkspaceIndex, name: Sym) -> Option<Resolution> {
-    let nss = namespaces_named(idx, name);
+/// B3：class/struct 兼任 namespace（`namespaces_named` 直接命中类型声明）。
+fn resolve_scoped_first(ws: &Workspace, name: Sym) -> Option<Resolution> {
+    let nss = ws.namespaces_named(name);
     if !nss.is_empty() {
         return Some(Resolution {
             targets: nss.into_iter().map(Target::Def).collect(),
@@ -622,13 +635,13 @@ fn resolve_scoped_first(idx: &WorkspaceIndex, name: Sym) -> Option<Resolution> {
         });
     }
     // 无同名 namespace 时回落类型（enum：`EColor::Red`）
-    let hits: Vec<DefId> = idx
-        .main
-        .get(&name)?
+    let hits: Vec<DeclRef> = ws
+        .lookup(name)
         .iter()
         .copied()
-        .filter(|&id| {
-            idx.def(id).kind.is_type_like() && !idx.def(id).flags.contains(DefFlags::SYNTHETIC)
+        .filter(|&r| {
+            let d = ws.decl(&r);
+            d.kind.is_type_like() && !d.flags.contains(DefFlags::SYNTHETIC)
         })
         .collect();
     (!hits.is_empty()).then(|| Resolution {
@@ -639,7 +652,7 @@ fn resolve_scoped_first(idx: &WorkspaceIndex, name: Sym) -> Option<Resolution> {
 
 /// `A::B` 的 B。
 fn resolve_scoped_last(
-    idx: &WorkspaceIndex,
+    ws: &Workspace,
     ctx: &SemCtx,
     scope_name: Sym,
     name: Sym,
@@ -649,57 +662,74 @@ fn resolve_scoped_last(
     if scope_str == "Super" || scope_str == "super" {
         let base = ctx
             .type_def
-            .and_then(|t| idx.closures.get(&t).and_then(|c| c.first().copied()))?;
-        let space = member_search_space(idx, base);
-        let hits = members_named(idx, &space, name, |_| true);
+            .and_then(|t| ws.closures.get(&t).and_then(|c| c.first().copied()))?;
+        let space = member_search_space(ws, base);
+        let hits = members_named(ws, &space, name, |_| true);
         return (!hits.is_empty()).then(|| Resolution {
             targets: hits.into_iter().map(Target::Def).collect(),
             level: LEVEL_THIS_SUPER,
         });
     }
 
-    // namespace 成员（同名聚合，含合成 StaticClass 命名空间）
-    let nss = namespaces_named(idx, scope_name);
+    // namespace / 类型兼任 namespace（B3）成员：
+    // - 真 namespace：跨文件聚合成员（§4.2 语义不变）；
+    // - class：合成成员 StaticClass（B4——唯一以 `类名::` 形态消费的合成成员）；
+    // - struct：无合成成员（无 UClass）；
+    // - enum：枚举值（裸值不可用，asEP_REQUIRE_ENUM_SCOPE=1）——从旧代码
+    //   的独立分支并入（namespaces_named 现直接命中 enum）。
+    let nss = ws.namespaces_named(scope_name);
     if !nss.is_empty() {
-        let hits: Vec<DefId> = nss
-            .iter()
-            .flat_map(|&ns| idx.members.get(&ns).map(|ms| ms.iter().copied()).unwrap_or_default())
-            .filter(|&m| idx.def(m).name == name)
-            .collect();
-        if !hits.is_empty() {
+        let mut def_hits: Vec<DeclRef> = Vec::new();
+        let mut syn_hits: Vec<SyntheticMember> = Vec::new();
+        let mut enum_hits: Vec<DeclRef> = Vec::new();
+        for &ns in &nss {
+            match ws.decl(&ns).kind {
+                DefKind::Namespace => {
+                    def_hits.extend(
+                        ws.members(&ns).into_iter().filter(|&m| ws.decl(&m).name == name),
+                    );
+                }
+                DefKind::Enum => {
+                    enum_hits.extend(members_named(ws, &[ns], name, |d| {
+                        d.kind == DefKind::EnumValue
+                    }));
+                }
+                _ => {
+                    // class / struct：合成成员（StaticClass）
+                    syn_hits.extend(ws.synthetic_named(&[ns], name));
+                }
+            }
+        }
+        if !def_hits.is_empty() {
             return Some(Resolution {
-                targets: hits.into_iter().map(Target::Def).collect(),
+                targets: def_hits.into_iter().map(Target::Def).collect(),
                 level: LEVEL_NAMESPACE,
             });
         }
+        if !syn_hits.is_empty() {
+            return Some(Resolution {
+                targets: syn_hits.into_iter().map(Target::Synthetic).collect(),
+                level: LEVEL_NAMESPACE,
+            });
+        }
+        if !enum_hits.is_empty() {
+            return Some(Resolution {
+                targets: enum_hits.into_iter().map(Target::Def).collect(),
+                level: LEVEL_GLOBAL,
+            });
+        }
         return None;
-    }
-
-    // enum 成员（`EColor::Red`——裸值不可用，asEP_REQUIRE_ENUM_SCOPE=1）
-    if let Some(enm) = idx
-        .main
-        .get(&scope_name)?
-        .iter()
-        .copied()
-        .find(|&id| {
-            idx.def(id).kind == DefKind::Enum && !idx.def(id).flags.contains(DefFlags::SYNTHETIC)
-        })
-    {
-        let hits = members_named(idx, &[enm], name, |d| d.kind == DefKind::EnumValue);
-        return (!hits.is_empty()).then(|| Resolution {
-            targets: hits.into_iter().map(Target::Def).collect(),
-            level: LEVEL_GLOBAL,
-        });
     }
     None
 }
 
 /// 成员访问（`recv.Name` 或隐式 this 的裸 Name）：
-/// 2 成员 → 3 访问器 → 4 mixin（显式接收者或隐式 this 皆可走 mixin，§4.5.1 条 2）。
+/// 2 成员（∪ 合成成员 B4）→ 3 访问器 → 4 mixin（显式接收者或隐式 this 皆可
+/// 走 mixin，§4.5.1 条 2）。
 fn resolve_member(
-    idx: &WorkspaceIndex,
+    ws: &Workspace,
     ctx: &SemCtx,
-    recv: Option<DefId>,
+    recv: Option<DeclRef>,
     name: Sym,
     scoped: bool,
 ) -> Option<Resolution> {
@@ -707,18 +737,26 @@ fn resolve_member(
     // 语境**（type_def 即够——引擎在 default 语句里同样按类成员解析）；
     // 全局函数体内 type_def 为 None → 无对象上下文（mixin 准入条件 2）
     let recv = recv.or_else(|| ctx.type_def)?;
-    let space = member_search_space(idx, recv);
+    let space = member_search_space(ws, recv);
 
-    // 2. 成员（class 沿闭包 / struct 单层 / delegate·event 展开集）
-    let hits = members_named(idx, &space, name, |_| true);
+    // 2. 成员（class 沿闭包 / struct 单层 / delegate·event 合成成员集 B4）
+    let hits = members_named(ws, &space, name, |_| true);
     if !hits.is_empty() {
         return Some(Resolution {
             targets: hits.into_iter().map(Target::Def).collect(),
             level: LEVEL_MEMBER,
         });
     }
+    // 合成成员（delegate/event 展开：Execute / Broadcast / ctor / opAssign）
+    let syns = ws.synthetic_named(&space, name);
+    if !syns.is_empty() {
+        return Some(Resolution {
+            targets: syns.into_iter().map(Target::Synthetic).collect(),
+            level: LEVEL_MEMBER,
+        });
+    }
     // 3. 属性访问器（反向默认：不带 NOT_PROPERTY 即候选；读写侧区分留给 M5）
-    let acc = find_accessors(idx, &space, name);
+    let acc = find_accessors(ws, &space, name);
     if !acc.is_empty() {
         return Some(Resolution {
             targets: acc.into_iter().map(Target::Def).collect(),
@@ -727,7 +765,7 @@ fn resolve_member(
     }
     // 4. mixin fallback（条件 3：带 `::` 限定不走）
     if !scoped {
-        let mixins = mixin_candidates(idx, recv, name, &ctx.ns_syms);
+        let mixins = mixin_candidates(ws, recv, name, &ctx.ns_syms);
         if !mixins.is_empty() {
             return Some(Resolution {
                 targets: mixins.into_iter().map(Target::Def).collect(),
@@ -739,7 +777,7 @@ fn resolve_member(
 }
 
 /// 裸标识符（非调用）：0 this/super → 1 局部 → 2/3 成员(隐式 this) → 5/6。
-pub(crate) fn resolve_plain(idx: &WorkspaceIndex, ctx: &SemCtx, name: Sym) -> Option<Resolution> {
+pub(crate) fn resolve_plain(ws: &Workspace, ctx: &SemCtx, name: Sym) -> Option<Resolution> {
     let name_str = sym_str(name);
 
     // 0. this / super（仅类/struct 方法体内；this 在静态/命名空间函数中不存在）
@@ -752,7 +790,7 @@ pub(crate) fn resolve_plain(idx: &WorkspaceIndex, ctx: &SemCtx, name: Sym) -> Op
     if name_str == "Super" || name_str == "super" {
         let base = ctx
             .type_def
-            .and_then(|t| idx.closures.get(&t).and_then(|c| c.first().copied()))?;
+            .and_then(|t| ws.closures.get(&t).and_then(|c| c.first().copied()))?;
         return Some(Resolution { targets: vec![Target::Def(base)], level: LEVEL_THIS_SUPER });
     }
 
@@ -764,7 +802,7 @@ pub(crate) fn resolve_plain(idx: &WorkspaceIndex, ctx: &SemCtx, name: Sym) -> Op
     // 2/3. 成员 + 访问器（隐式 this；mixin 不在裸标识符路径——引擎 mixin 块
     // 在函数调用编译路径，非调用的裸标识符不查）
     if ctx.type_def.is_some() {
-        if let Some(r) = resolve_member(idx, ctx, None, name, false) {
+        if let Some(r) = resolve_member(ws, ctx, None, name, false) {
             if r.level == LEVEL_MEMBER || r.level == LEVEL_ACCESSOR {
                 return Some(r);
             }
@@ -773,9 +811,9 @@ pub(crate) fn resolve_plain(idx: &WorkspaceIndex, ctx: &SemCtx, name: Sym) -> Op
 
     // 5. 命名空间链（ns 里的函数/变量可无限定使用）
     for &ns in ctx.ns_defs.iter().rev() {
-        let sym = idx.def(ns).name;
-        for nsdef in namespaces_named(idx, sym) {
-            let hits = members_named(idx, &[nsdef], name, |d| {
+        let sym = ws.decl(&ns).name;
+        for nsdef in ws.namespaces_named(sym) {
+            let hits = ws.members_named(&[nsdef], name, |d| {
                 matches!(d.kind, DefKind::Function | DefKind::GlobalVar)
             });
             if !hits.is_empty() {
@@ -788,12 +826,11 @@ pub(crate) fn resolve_plain(idx: &WorkspaceIndex, ctx: &SemCtx, name: Sym) -> Op
     }
 
     // 6. 全局符号 / 类型本身
-    let hits: Vec<DefId> = idx
-        .main
-        .get(&name)?
+    let hits: Vec<DeclRef> = ws
+        .lookup(name)
         .iter()
         .copied()
-        .filter(|&id| visible_global(idx, id, ctx))
+        .filter(|&r| visible_global(ws, r, ctx))
         .collect();
     (!hits.is_empty()).then(|| Resolution {
         targets: hits.into_iter().map(Target::Def).collect(),
@@ -804,7 +841,7 @@ pub(crate) fn resolve_plain(idx: &WorkspaceIndex, ctx: &SemCtx, name: Sym) -> Op
 /// 调用 callee（裸标识符）：1 局部 → 2/3 方法(隐式 this) → 4 mixin → 5/6。
 /// 与 plain 的差别：mixin 生效（引擎 :13436-13449——方法体内隐式压 this）。
 pub(crate) fn resolve_callee(
-    idx: &WorkspaceIndex,
+    ws: &Workspace,
     ctx: &SemCtx,
     name: Sym,
     _argc: usize,
@@ -812,7 +849,7 @@ pub(crate) fn resolve_callee(
     let name_str = sym_str(name);
 
     if name_str == "this" || name_str == "Super" || name_str == "super" {
-        return resolve_plain(idx, ctx, name);
+        return resolve_plain(ws, ctx, name);
     }
 
     // 1. 局部（delegate 局部变量的调用）
@@ -822,7 +859,7 @@ pub(crate) fn resolve_callee(
 
     // 2/3/4. 成员 → 访问器 → mixin（隐式 this 场景）
     if ctx.type_def.is_some() {
-        if let Some(r) = resolve_member(idx, ctx, None, name, false) {
+        if let Some(r) = resolve_member(ws, ctx, None, name, false) {
             if r.level <= LEVEL_MIXIN {
                 return Some(r);
             }
@@ -831,9 +868,9 @@ pub(crate) fn resolve_callee(
 
     // 5. 命名空间链
     for &ns in ctx.ns_defs.iter().rev() {
-        let sym = idx.def(ns).name;
-        for nsdef in namespaces_named(idx, sym) {
-            let hits = members_named(idx, &[nsdef], name, |d| d.kind == DefKind::Function);
+        let sym = ws.decl(&ns).name;
+        for nsdef in ws.namespaces_named(sym) {
+            let hits = ws.members_named(&[nsdef], name, |d| d.kind == DefKind::Function);
             if !hits.is_empty() {
                 return Some(Resolution {
                     targets: hits.into_iter().map(Target::Def).collect(),
@@ -844,15 +881,14 @@ pub(crate) fn resolve_callee(
     }
 
     // 6. 全局函数 / 类型（构造调用 `FVector(1,2,3)` 落到类型本身）
-    let hits: Vec<DefId> = idx
-        .main
-        .get(&name)?
+    let hits: Vec<DeclRef> = ws
+        .lookup(name)
         .iter()
         .copied()
-        .filter(|&id| visible_global(idx, id, ctx))
-        .filter(|&id| {
+        .filter(|&r| visible_global(ws, r, ctx))
+        .filter(|&r| {
             matches!(
-                idx.def(id).kind,
+                ws.decl(&r).kind,
                 DefKind::Function
                     | DefKind::GlobalVar
                     | DefKind::Delegate
@@ -870,15 +906,15 @@ pub(crate) fn resolve_callee(
 }
 
 /// 全局可见性过滤：顶层（parent None）+ local 模块隔离 + 排除合成。
-fn visible_global(idx: &WorkspaceIndex, id: DefId, ctx: &SemCtx) -> bool {
-    let d = idx.def(id);
+fn visible_global(ws: &Workspace, r: DeclRef, ctx: &SemCtx) -> bool {
+    let d = ws.decl(&r);
     if d.flags.contains(DefFlags::SYNTHETIC) || d.parent.is_some() {
         return false;
     }
     if d.flags.contains(DefFlags::LOCAL) {
         // local 函数：仅声明所在模块可见（BNF §2.6）。模块信息缺失时不过滤
         // （单测/无 Phase 0 场景），两侧都有模块且不同才隐藏
-        match (idx.modules.get(&d.file), idx.modules.get(&ctx.file)) {
+        match (ws.module_of(r.file), ws.module_of(ctx.file)) {
             (Some(a), Some(b)) => a == b,
             _ => true,
         }
@@ -892,16 +928,16 @@ fn visible_global(idx: &WorkspaceIndex, id: DefId, ctx: &SemCtx) -> bool {
 // ---------------------------------------------------------------------------
 
 /// 成员查找的逐层序列（近者在前）：class = self + 继承闭包；struct 单层（D16）；
-/// delegate/event = 展开成员集（M3b）。内建 primitive 无成员。
-pub(crate) fn member_search_space(idx: &WorkspaceIndex, def: DefId) -> Vec<DefId> {
-    let d = idx.def(def);
+/// 内建 primitive 无成员。
+pub(crate) fn member_search_space(ws: &Workspace, def: DeclRef) -> Vec<DeclRef> {
+    let d = ws.decl(&def);
     if d.flags.contains(DefFlags::SYNTHETIC) {
         return vec![def];
     }
     match d.kind {
         DefKind::Class => {
             let mut space = vec![def];
-            if let Some(chain) = idx.closures.get(&def) {
+            if let Some(chain) = ws.closures.get(&def) {
                 space.extend(chain.iter().copied());
             }
             space
@@ -911,16 +947,16 @@ pub(crate) fn member_search_space(idx: &WorkspaceIndex, def: DefId) -> Vec<DefId
 }
 
 pub(crate) fn members_named(
-    idx: &WorkspaceIndex,
-    space: &[DefId],
+    ws: &Workspace,
+    space: &[DeclRef],
     name: Sym,
-    pred: impl Fn(&DefData) -> bool,
-) -> Vec<DefId> {
+    pred: impl Fn(&crate::summary::RawDecl) -> bool,
+) -> Vec<DeclRef> {
     space
         .iter()
-        .flat_map(|&t| idx.members.get(&t).map(|ms| ms.iter().copied()).unwrap_or_default())
+        .flat_map(|&t| ws.members(&t))
         .filter(|&m| {
-            let d = idx.def(m);
+            let d = ws.decl(&m);
             d.name == name && pred(d)
         })
         .collect()
@@ -929,7 +965,7 @@ pub(crate) fn members_named(
 /// 属性访问器模拟（§4.5 第 3 级）：Get<Name>/Set<Name>。
 /// 反向默认——不带 NOT_PROPERTY 即候选（§2.4.5）。
 /// 命名匹配两种拼写：`Get` + 原名 / `Get` + 首字母大写。
-pub(crate) fn find_accessors(idx: &WorkspaceIndex, space: &[DefId], name: Sym) -> Vec<DefId> {
+pub(crate) fn find_accessors(ws: &Workspace, space: &[DeclRef], name: Sym) -> Vec<DeclRef> {
     let name_str = sym_str(name);
     let mut keys: Vec<Sym> = Vec::with_capacity(4);
     for prefix in ["Get", "Set"] {
@@ -942,8 +978,8 @@ pub(crate) fn find_accessors(idx: &WorkspaceIndex, space: &[DefId], name: Sym) -
     }
     let mut out = Vec::new();
     for key in keys {
-        for m in members_named(idx, space, key, |_| true) {
-            let d = idx.def(m);
+        for m in members_named(ws, space, key, |_| true) {
+            let d = ws.decl(&m);
             if !d.flags.contains(DefFlags::NOT_PROPERTY)
                 && matches!(d.kind, DefKind::Method | DefKind::Function)
                 && !out.contains(&m)
@@ -955,55 +991,43 @@ pub(crate) fn find_accessors(idx: &WorkspaceIndex, space: &[DefId], name: Sym) -
     out
 }
 
-/// mixin 倒排查询（D23）：沿接收者的继承闭包逐级查（键不预展开到子类），
-/// 且必须**同名**（引擎 `as_compiler.cpp:13387-13450` 查的是该名字的 mixin）。
+/// mixin 倒排查询（D23 翻案 / Phase B：`Aggregation::mixin_by_name` 名字键）：
+/// 沿接收者的继承闭包逐级按**类名**查（键不预展开到子类），且必须**同名**
+/// （引擎 `as_compiler.cpp:13387-13450` 查的是该名字的 mixin）。
 /// 准入条件 4：mixin 自身所在命名空间须在当前位置的命名空间链上（或全局）。
 /// shadow 语义（AS 脚本类 shadow C++ 类）M3 不建模——继承侧已覆盖脚本语料。
-fn mixin_candidates(idx: &WorkspaceIndex, recv: DefId, name: Sym, ns_syms: &[Sym]) -> Vec<DefId> {
+fn mixin_candidates(ws: &Workspace, recv: DeclRef, name: Sym, ns_syms: &[Sym]) -> Vec<DeclRef> {
     let mut chain = vec![recv];
-    if let Some(cl) = idx.closures.get(&recv) {
+    if let Some(cl) = ws.closures.get(&recv) {
         chain.extend(cl.iter().copied());
     }
     let mut out = Vec::new();
     for base in chain {
-        if let Some(ms) = idx.mixin_index.get(&base) {
-            for &m in ms {
-                if idx.def(m).name != name {
-                    continue;
-                }
-                let ns_ok = match idx.def(m).parent {
-                    None => true, // 全局 mixin：任何命名空间链终点都查到
-                    Some(ns) => ns_syms.contains(&idx.def(ns).name),
-                };
-                if ns_ok && !out.contains(&m) {
-                    out.push(m);
-                }
+        let base_name = ws.decl(&base).name;
+        let Some(ms) = ws.agg.mixin_by_name.get(&base_name) else { continue };
+        for &m in ms {
+            if ws.decl(&m).name != name {
+                continue;
+            }
+            let ns_ok = match ws.parent_of(&m) {
+                None => true, // 全局 mixin：任何命名空间链终点都查到
+                Some(ns) => ns_syms.contains(&ws.decl(&ns).name),
+            };
+            if ns_ok && !out.contains(&m) {
+                out.push(m);
             }
         }
     }
     out
 }
 
-/// 同名 namespace 聚合（跨文件 + 合成 StaticClass 命名空间）。
-pub(crate) fn namespaces_named(idx: &WorkspaceIndex, name: Sym) -> Vec<DefId> {
-    idx.main
-        .get(&name)
-        .map(|ds| {
-            ds.iter()
-                .copied()
-                .filter(|&id| idx.def(id).kind == DefKind::Namespace)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-pub(crate) fn builtin_target(idx: &WorkspaceIndex, name: Sym) -> Option<Target> {
-    idx.main
-        .get(&name)?
+/// 内建 primitive（B2：builtin 伪文件的 SYNTHETIC decl）→ Target。
+pub(crate) fn builtin_target(ws: &Workspace, name: Sym) -> Option<Target> {
+    ws.lookup(name)
         .iter()
         .copied()
-        .find(|&id| {
-            let d = idx.def(id);
+        .find(|&r| {
+            let d = ws.decl(&r);
             d.flags.contains(DefFlags::SYNTHETIC) && d.kind == DefKind::Struct
         })
         .map(Target::Def)
@@ -1018,10 +1042,10 @@ pub(crate) fn builtin_target(idx: &WorkspaceIndex, name: Sym) -> Option<Target> 
 mod tests {
     use super::*;
     use crate::config::IndexConfig;
-    use crate::index::{FileInput, FileKind};
     use crate::intern::intern_file;
+    use crate::workspace::{FileInput, FileKind};
 
-    fn build(srcs: &[(&str, &str)]) -> WorkspaceIndex {
+    fn build(srcs: &[(&str, &str)]) -> Workspace {
         let inputs = srcs
             .iter()
             .map(|(path, src)| FileInput {
@@ -1031,7 +1055,7 @@ mod tests {
                 module: None,
             })
             .collect();
-        WorkspaceIndex::build(IndexConfig::default(), inputs)
+        Workspace::build(IndexConfig::default(), inputs)
     }
 
     /// 用例源码全部内置（AGENTS.md 硬性规则 / D1）。
@@ -1052,8 +1076,8 @@ mod tests {
         intern_file(path, 0)
     }
 
-    fn first_name(idx: &WorkspaceIndex, r: &Resolution) -> String {
-        r.targets[0].name(idx).to_string()
+    fn first_name(ws: &Workspace, r: &Resolution) -> String {
+        r.targets[0].name(ws).to_string()
     }
 
     // ------------------------------------------------------------------
@@ -1089,13 +1113,13 @@ int GlobalVar;
 
     #[test]
     fn chain_level_ordering() {
-        let idx = build(&[("unique://res/chain.as", CHAIN)]);
+        let ws = build(&[("unique://res/chain.as", CHAIN)]);
         let file = file_of("unique://res/chain.as");
 
         let case_at = |byte: u32, want_level: u8, want_name: &str| {
-            let r = resolve_at(&idx, file, byte).expect("应命中");
+            let r = resolve_at(&ws, file, byte).expect("应命中");
             assert_eq!(r.level, want_level, "级数");
-            assert_eq!(first_name(&idx, &r), want_name, "命中名");
+            assert_eq!(first_name(&ws, &r), want_name, "命中名");
         };
 
         // 1：同名局部遮蔽全局（"Shadow;" 首次出现 = 使用点；声明在文件尾）
@@ -1129,13 +1153,13 @@ void F()
     int B = S.BaseField;
 }
 ";
-        let idx = build(&[("unique://res/struct.as", SRC)]);
+        let ws = build(&[("unique://res/struct.as", SRC)]);
         let file = file_of("unique://res/struct.as");
-        let r = resolve_at(&idx, file, nth(SRC, "ChildField", 2)).unwrap();
+        let r = resolve_at(&ws, file, nth(SRC, "ChildField", 2)).unwrap();
         assert_eq!(r.level, LEVEL_MEMBER);
-        assert_eq!(first_name(&idx, &r), "ChildField");
+        assert_eq!(first_name(&ws, &r), "ChildField");
         assert!(
-            resolve_at(&idx, file, nth(SRC, "BaseField", 2)).is_none(),
+            resolve_at(&ws, file, nth(SRC, "BaseField", 2)).is_none(),
             "struct 成员查找单层，父 struct 不可达"
         );
     }
@@ -1152,14 +1176,14 @@ class A
     void M() { int A = X; int B = Y; }
 }
 ";
-        let idx = build(&[("unique://res/acc.d.as", SRC)]);
+        let ws = build(&[("unique://res/acc.d.as", SRC)]);
         let file = file_of("unique://res/acc.d.as");
         // Y → GetY（无 tag，默认是访问器）
-        let r = resolve_at(&idx, file, off(SRC, "Y;")).unwrap();
+        let r = resolve_at(&ws, file, off(SRC, "Y;")).unwrap();
         assert_eq!(r.level, LEVEL_ACCESSOR);
-        assert_eq!(first_name(&idx, &r), "GetY");
+        assert_eq!(first_name(&ws, &r), "GetY");
         // X → GetX 带 @notProperty，不是访问器 → 不命中
-        assert!(resolve_at(&idx, file, off(SRC, "X;")).is_none());
+        assert!(resolve_at(&ws, file, off(SRC, "X;")).is_none());
     }
 
     // ------------------------------------------------------------------
@@ -1206,51 +1230,51 @@ void GlobalFn() { Heal(null); }
 
     #[test]
     fn mixin_five_admission_conditions() {
-        let idx = build(&[("unique://res/mixin.as", MIXIN)]);
+        let ws = build(&[("unique://res/mixin.as", MIXIN)]);
         let file = file_of("unique://res/mixin.as");
 
         // ① 真实成员优先于 mixin（短路，绝不合并候选）
-        let r = resolve_at(&idx, file, off(MIXIN, "RealHeal(1.0);")).unwrap();
+        let r = resolve_at(&ws, file, off(MIXIN, "RealHeal(1.0);")).unwrap();
         assert_eq!(r.level, LEVEL_MEMBER, "真实成员命中，绝不查 mixin");
-        assert_eq!(first_name(&idx, &r), "RealHeal");
+        assert_eq!(first_name(&ws, &r), "RealHeal");
 
         // ②+⑤：方法体内隐式 this；全局 mixin 首参 AActor 是 C1 祖先 → 命中
-        let r = resolve_at(&idx, file, off(MIXIN, "Heal(1.0);")).unwrap();
+        let r = resolve_at(&ws, file, off(MIXIN, "Heal(1.0);")).unwrap();
         assert_eq!(r.level, LEVEL_MIXIN, "隐式 this + 首参 AActor ∈ C1 闭包");
-        assert_eq!(first_name(&idx, &r), "Heal");
+        assert_eq!(first_name(&ws, &r), "Heal");
 
         // ④ 反例 A：NS 的 mixin 不在 C1 的（空）命名空间链上 → 不命中
         assert!(
-            resolve_at(&idx, file, off(MIXIN, "NSMixin(1.0)")).is_none(),
+            resolve_at(&ws, file, off(MIXIN, "NSMixin(1.0)")).is_none(),
             "NS 的 mixin 不对全局位置可见"
         );
         // ④ 反例 B：NSInner 的 mixin 同理
         assert!(
-            resolve_at(&idx, file, off(MIXIN, "InnerHeal(1.0)")).is_none(),
+            resolve_at(&ws, file, off(MIXIN, "InnerHeal(1.0)")).is_none(),
             "NSInner 的 mixin 不对全局位置可见"
         );
 
         // ⑤ 反例：GlobalHeal 首参 APawn 不是 C1（祖先链 AActor）的祖先 →
         // 不落在 MIXIN 级；mixin 本身是全局函数（D23），落到 GLOBAL 级
-        let r = resolve_at(&idx, file, off(MIXIN, "GlobalHeal(1.0)")).unwrap();
+        let r = resolve_at(&ws, file, off(MIXIN, "GlobalHeal(1.0)")).unwrap();
         assert_eq!(r.level, LEVEL_GLOBAL, "首参不是接收者祖先 → 非 mixin 命中");
-        assert_eq!(first_name(&idx, &r), "GlobalHeal");
+        assert_eq!(first_name(&ws, &r), "GlobalHeal");
         // ⑤ 正例：C3 : APawn，GlobalHeal 首参 APawn 是 C3 直接父类 → 命中（第 2 次出现）
-        let r = resolve_at(&idx, file, nth(MIXIN, "GlobalHeal(1.0);", 2)).unwrap();
+        let r = resolve_at(&ws, file, nth(MIXIN, "GlobalHeal(1.0);", 2)).unwrap();
         assert_eq!(r.level, LEVEL_MIXIN);
-        assert_eq!(first_name(&idx, &r), "GlobalHeal");
+        assert_eq!(first_name(&ws, &r), "GlobalHeal");
 
         // ③ scope 限定不走 mixin：`NS::Heal` 是 namespace 成员查找
-        let r = resolve_at(&idx, file, off(MIXIN, "Heal(this")).unwrap();
+        let r = resolve_at(&ws, file, off(MIXIN, "Heal(this")).unwrap();
         assert_eq!(r.level, LEVEL_NAMESPACE, "带 :: 限定走 namespace 成员");
-        assert_eq!(first_name(&idx, &r), "Heal");
+        assert_eq!(first_name(&ws, &r), "Heal");
 
         // ⑤ 反例：首参 AActor 不是 C2 的祖先 → 非 mixin，落到 GLOBAL（全局函数本体）
-        let r = resolve_at(&idx, file, off(MIXIN, "Heal(2.0)")).unwrap();
+        let r = resolve_at(&ws, file, off(MIXIN, "Heal(2.0)")).unwrap();
         assert_eq!(r.level, LEVEL_GLOBAL, "首参不是接收者祖先 → 非 mixin 命中");
 
         // ② 反例：全局函数体内无 this → 不查 mixin（同样落到 GLOBAL）
-        let r = resolve_at(&idx, file, off(MIXIN, "Heal(null")).unwrap();
+        let r = resolve_at(&ws, file, off(MIXIN, "Heal(null")).unwrap();
         assert_eq!(r.level, LEVEL_GLOBAL, "全局函数体内无对象上下文 → 非 mixin 命中");
     }
 
@@ -1266,11 +1290,11 @@ class C : APawn
     void M() { Heal(1.0); }
 }
 ";
-        let idx = build(&[("unique://res/mixanc.as", SRC)]);
+        let ws = build(&[("unique://res/mixanc.as", SRC)]);
         let file = file_of("unique://res/mixanc.as");
-        let r = resolve_at(&idx, file, off(SRC, "Heal(1.0)")).unwrap();
+        let r = resolve_at(&ws, file, off(SRC, "Heal(1.0)")).unwrap();
         assert_eq!(r.level, LEVEL_MIXIN);
-        assert_eq!(first_name(&idx, &r), "Heal");
+        assert_eq!(first_name(&ws, &r), "Heal");
     }
 
     #[test]
@@ -1288,14 +1312,14 @@ namespace Lib
     }
 }
 ";
-        let idx = build(&[("unique://res/mixns.as", SRC)]);
+        let ws = build(&[("unique://res/mixns.as", SRC)]);
         let file = file_of("unique://res/mixns.as");
         // 显式接收者：A.Boost() → mixin（AActor 上无 Boost 成员；第 2 次 = 使用点）
-        let r = resolve_at(&idx, file, nth(SRC, "Boost(", 2)).unwrap();
+        let r = resolve_at(&ws, file, nth(SRC, "Boost(", 2)).unwrap();
         assert_eq!(r.level, LEVEL_MIXIN);
-        assert_eq!(first_name(&idx, &r), "Boost");
+        assert_eq!(first_name(&ws, &r), "Boost");
         // Lib 内类的方法体：ns 链含 Lib → 隐式 this 的 Boost 命中
-        let r = resolve_at(&idx, file, off(SRC, "Boost(null")).unwrap();
+        let r = resolve_at(&ws, file, off(SRC, "Boost(null")).unwrap();
         assert_eq!(r.level, LEVEL_MIXIN);
     }
 
@@ -1312,16 +1336,16 @@ class B : A
     void BeginPlay() { Super::BeginPlay(); }
 }
 ";
-        let idx = build(&[("unique://res/super.as", SRC)]);
+        let ws = build(&[("unique://res/super.as", SRC)]);
         let file = file_of("unique://res/super.as");
         // Super → 直接父类 A
-        let r = resolve_at(&idx, file, off(SRC, "Super::")).unwrap();
+        let r = resolve_at(&ws, file, off(SRC, "Super::")).unwrap();
         assert_eq!(r.level, LEVEL_THIS_SUPER);
-        assert_eq!(first_name(&idx, &r), "A");
+        assert_eq!(first_name(&ws, &r), "A");
         // Super::BeginPlay → A 的成员（"BeginPlay();" 仅使用点——声明是 "BeginPlay() {"）
-        let r = resolve_at(&idx, file, off(SRC, "BeginPlay();")).unwrap();
+        let r = resolve_at(&ws, file, off(SRC, "BeginPlay();")).unwrap();
         assert_eq!(r.level, LEVEL_THIS_SUPER);
-        assert_eq!(first_name(&idx, &r), "BeginPlay");
+        assert_eq!(first_name(&ws, &r), "BeginPlay");
     }
 
     #[test]
@@ -1340,19 +1364,19 @@ void F()
 }
 class AActor {}
 ";
-        let idx = build(&[("unique://res/ns.as", SRC)]);
+        let ws = build(&[("unique://res/ns.as", SRC)]);
         let file = file_of("unique://res/ns.as");
 
-        let r = resolve_at(&idx, file, nth(SRC, "ZeroVector", 2)).unwrap();
+        let r = resolve_at(&ws, file, nth(SRC, "ZeroVector", 2)).unwrap();
         assert_eq!(r.level, LEVEL_NAMESPACE);
-        assert_eq!(first_name(&idx, &r), "ZeroVector");
-        // 合成 StaticClass（M3b）：class 同名 namespace 聚合命中
-        let r = resolve_at(&idx, file, off(SRC, "StaticClass")).unwrap();
+        assert_eq!(first_name(&ws, &r), "ZeroVector");
+        // StaticClass（B4：class 兼任 namespace + 查询期合成成员）
+        let r = resolve_at(&ws, file, off(SRC, "StaticClass")).unwrap();
         assert_eq!(r.level, LEVEL_NAMESPACE);
-        assert_eq!(first_name(&idx, &r), "StaticClass");
+        assert_eq!(first_name(&ws, &r), "StaticClass");
         // 嵌套 namespace 首段
-        let r = resolve_at(&idx, file, off(SRC, "Inner::")).unwrap();
-        assert_eq!(first_name(&idx, &r), "Inner");
+        let r = resolve_at(&ws, file, off(SRC, "Inner::")).unwrap();
+        assert_eq!(first_name(&ws, &r), "Inner");
     }
 
     #[test]
@@ -1365,13 +1389,13 @@ void F()
     EColor D = Red;
 }
 ";
-        let idx = build(&[("unique://res/enum.as", SRC)]);
+        let ws = build(&[("unique://res/enum.as", SRC)]);
         let file = file_of("unique://res/enum.as");
-        let r = resolve_at(&idx, file, nth(SRC, "Red", 2)).unwrap();
+        let r = resolve_at(&ws, file, nth(SRC, "Red", 2)).unwrap();
         assert_eq!(r.level, LEVEL_GLOBAL);
-        assert_eq!(first_name(&idx, &r), "Red");
+        assert_eq!(first_name(&ws, &r), "Red");
         // 裸值不可用（asEP_REQUIRE_ENUM_SCOPE=1；"Red" 第 3 次 = 裸使用点）
-        assert!(resolve_at(&idx, file, nth(SRC, "Red", 3)).is_none());
+        assert!(resolve_at(&ws, file, nth(SRC, "Red", 3)).is_none());
     }
 
     #[test]
@@ -1384,19 +1408,19 @@ void F()
     float A = V.X;
 }
 ";
-        let idx = build(&[("unique://res/ty.as", SRC)]);
+        let ws = build(&[("unique://res/ty.as", SRC)]);
         let file = file_of("unique://res/ty.as");
         // 类型位置
-        let r = resolve_at(&idx, file, off(SRC, "FVector V")).unwrap();
+        let r = resolve_at(&ws, file, off(SRC, "FVector V")).unwrap();
         assert_eq!(r.level, LEVEL_GLOBAL);
-        assert_eq!(first_name(&idx, &r), "FVector");
+        assert_eq!(first_name(&ws, &r), "FVector");
         // 构造调用 callee → 类型本身
-        let r = resolve_at(&idx, file, off(SRC, "FVector(1.0")).unwrap();
-        assert_eq!(first_name(&idx, &r), "FVector");
+        let r = resolve_at(&ws, file, off(SRC, "FVector(1.0")).unwrap();
+        assert_eq!(first_name(&ws, &r), "FVector");
         // 成员链：V.X（局部 V 的声明类型 → FVector 成员；"X;" 第 2 次 = 使用点）
-        let r = resolve_at(&idx, file, nth(SRC, "X;", 2)).unwrap();
+        let r = resolve_at(&ws, file, nth(SRC, "X;", 2)).unwrap();
         assert_eq!(r.level, LEVEL_MEMBER);
-        assert_eq!(first_name(&idx, &r), "X");
+        assert_eq!(first_name(&ws, &r), "X");
     }
 
     #[test]
@@ -1414,14 +1438,14 @@ class A
     }
 }
 ";
-        let idx = build(&[("unique://res/chain2.as", SRC)]);
+        let ws = build(&[("unique://res/chain2.as", SRC)]);
         let file = file_of("unique://res/chain2.as");
-        let r = resolve_at(&idx, file, nth(SRC, "GetLocation(", 2)).unwrap();
+        let r = resolve_at(&ws, file, nth(SRC, "GetLocation(", 2)).unwrap();
         assert_eq!(r.level, LEVEL_MEMBER);
-        assert_eq!(first_name(&idx, &r), "GetLocation");
-        let r = resolve_at(&idx, file, nth(SRC, "X;", 2)).unwrap();
+        assert_eq!(first_name(&ws, &r), "GetLocation");
+        let r = resolve_at(&ws, file, nth(SRC, "X;", 2)).unwrap();
         assert_eq!(r.level, LEVEL_MEMBER);
-        assert_eq!(first_name(&idx, &r), "X");
+        assert_eq!(first_name(&ws, &r), "X");
     }
 
     #[test]
@@ -1432,13 +1456,13 @@ class A
 local void Helper() {}
 void User() { Helper(); }
 ";
-        let idx = build(&[("unique://res/local.as", SRC)]);
+        let ws = build(&[("unique://res/local.as", SRC)]);
         let file = file_of("unique://res/local.as");
-        let r = resolve_at(&idx, file, off(SRC, "Helper();")).unwrap();
+        let r = resolve_at(&ws, file, off(SRC, "Helper();")).unwrap();
         assert_eq!(r.level, LEVEL_GLOBAL);
-        assert_eq!(first_name(&idx, &r), "Helper");
-        assert!(idx
-            .def(match r.targets[0] {
+        assert_eq!(first_name(&ws, &r), "Helper");
+        assert!(ws
+            .decl(match &r.targets[0] {
                 Target::Def(d) => d,
                 _ => unreachable!(),
             })
@@ -1456,12 +1480,18 @@ class A
     void M() { OnHit.Execute(5); }
 }
 ";
-        let idx = build(&[("unique://res/dlg.as", SRC)]);
+        let ws = build(&[("unique://res/dlg.as", SRC)]);
         let file = file_of("unique://res/dlg.as");
-        let r = resolve_at(&idx, file, off(SRC, "Execute")).unwrap();
+        let r = resolve_at(&ws, file, off(SRC, "Execute")).unwrap();
         assert_eq!(r.level, LEVEL_MEMBER);
-        assert_eq!(first_name(&idx, &r), "Execute");
-        // 定义落回委托声明（D10 origin 由 server 侧回落；此处直接命中合成成员）
+        assert_eq!(first_name(&ws, &r), "Execute");
+        // 合成成员（B4）：锚点复用源头声明（D10 origin → 委托声明）
+        match &r.targets[0] {
+            Target::Synthetic(m) => {
+                assert_eq!(sym_str(ws.decl(&m.origin).name), "FOnHit");
+            }
+            other => panic!("应是 Synthetic，实际 {other:?}"),
+        }
     }
 
     #[test]
@@ -1473,13 +1503,13 @@ void F()
     int Y = 2;
 }
 ";
-        let idx = build(&[("unique://res/builtin.as", SRC)]);
+        let ws = build(&[("unique://res/builtin.as", SRC)]);
         let file = file_of("unique://res/builtin.as");
         // float 归一化（默认 float_is_float64=true → float64）
-        let r = resolve_at(&idx, file, off(SRC, "float X")).unwrap();
-        assert_eq!(first_name(&idx, &r), "float64");
-        let r = resolve_at(&idx, file, off(SRC, "int Y")).unwrap();
-        assert_eq!(first_name(&idx, &r), "int");
+        let r = resolve_at(&ws, file, off(SRC, "float X")).unwrap();
+        assert_eq!(first_name(&ws, &r), "float64");
+        let r = resolve_at(&ws, file, off(SRC, "int Y")).unwrap();
+        assert_eq!(first_name(&ws, &r), "int");
     }
 
     #[test]
@@ -1489,11 +1519,11 @@ void F()
 class A { int Field; }
 void G() { int X = 1; int Y = X; }
 ";
-        let idx = build(&[("unique://res/nothis.as", SRC)]);
+        let ws = build(&[("unique://res/nothis.as", SRC)]);
         let file = file_of("unique://res/nothis.as");
-        let r = resolve_at(&idx, file, off(SRC, "X;")).unwrap();
+        let r = resolve_at(&ws, file, off(SRC, "X;")).unwrap();
         assert_eq!(r.level, LEVEL_LOCAL);
-        assert_eq!(first_name(&idx, &r), "X");
+        assert_eq!(first_name(&ws, &r), "X");
     }
 
     #[test]
@@ -1507,18 +1537,18 @@ void F()
     for (int Elem : Items) { int A = Elem; }
 }
 ";
-        let idx = build(&[("unique://res/foreach.as", SRC)]);
+        let ws = build(&[("unique://res/foreach.as", SRC)]);
         let file = file_of("unique://res/foreach.as");
         // 循环体内的 Elem（第 2 次出现）→ 局部
-        let r = resolve_at(&idx, file, nth(SRC, "Elem", 2)).unwrap();
+        let r = resolve_at(&ws, file, nth(SRC, "Elem", 2)).unwrap();
         assert_eq!(r.level, LEVEL_LOCAL);
-        assert_eq!(first_name(&idx, &r), "Elem");
+        assert_eq!(first_name(&ws, &r), "Elem");
         // 迭代变量声明自身 → DECL_SELF
-        let r = resolve_at(&idx, file, off(SRC, "Elem :")).unwrap();
+        let r = resolve_at(&ws, file, off(SRC, "Elem :")).unwrap();
         assert_eq!(r.level, LEVEL_DECL_SELF);
         // range 表达式里的 Items（迭代变量声明点之前/之外）→ 全局
-        let r = resolve_at(&idx, file, nth(SRC, "Items", 2)).unwrap();
+        let r = resolve_at(&ws, file, nth(SRC, "Items", 2)).unwrap();
         assert_eq!(r.level, LEVEL_GLOBAL);
-        assert_eq!(first_name(&idx, &r), "Items");
+        assert_eq!(first_name(&ws, &r), "Items");
     }
 }

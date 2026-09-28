@@ -1,158 +1,54 @@
-//! references 内核（LSP实现规划 §4.1 Phase 3 / 架构设计 §4.6 / D5）。
+//! references 内核（架构设计 §4.6 / D5；Phase B：查询期唯一路径）。
 //!
-//! 数据流：引用倒排（`WorkspaceIndex::ref_index`）给候选文件集 → 逐文件解析
-//! UseSite（`resolve_at` 逐站点驱动——Phase 3 惰性，as-lsp 侧有按文件缓存）
-//! → 匹配。
+//! 数据流（B1 先行、Task 3 平移后倒排路径删除）：词边界字符串扫给出候选
+//! 偏移（超集）→ 逐偏移 `resolve_at_node` 解析验证 → 目标匹配。
+//! 不建倒排、不收 UseSite——uses.rs / ref_index 随 Phase B 退休。
 //!
-//! **匹配语义（架构设计 §4.6 / M4 定案）**：
+//! **匹配语义（架构设计 §4.6 / M4 定案，与旧倒排路径逐位等价）**：
 //! - 站点解析集合 ∩ 查询集合 ≠ ∅ 即命中——无法消歧的调用点对组内每个重载
 //!   都算引用（不可排除）；
 //! - 查询点本身消歧失败（重载组）⇒ 调用方对组内全部成员取并集
 //!   （**消歧失败报全部重载**）；
 //! - **DefId 匹配不做 origin 归一**（D10 的回落只影响 definition/hover 的
 //!   落点与声明位置的展示）：合成成员（delegate 的 Execute / StaticClass）
-//!   是独立名字，按各自 DefId 独立 references。**唯一例外是 class 的合成
-//!   同名 namespace**——它就是类名本身，归一到类（`AActor::` 限定段计入
-//!   类引用，见 [`origin_fallback`]）；
-//! - 局部变量无 DefId，按 `(file, 声明 span)` 身份匹配（SemCtx 逐站点独立
+//!   是独立名字，按 [`RefTarget::Synthetic`] 独立 references。
+//!   旧架构的唯一例外——class 合成同名 namespace 归一到类——在 B3 下天然
+//!   成立（`AActor::` 限定段解析直接产出类 DeclRef，无需归一函数）；
+//! - 局部变量无 DeclRef，按 `(file, 声明 span)` 身份匹配（SemCtx 逐站点独立
 //!   解析，遮蔽天然正确），引用天然限声明所在文件；
-//! - 内建 primitive（合成 DefId、无源码文件）不可 references/rename——
-//!   调用方提前返回空。
+//! - 内建 primitive（builtin 伪文件的 SYNTHETIC 声明、无源码锚点）不可
+//!   references/rename——调用方提前返回空。
 
-use std::collections::BTreeSet;
-
-use crate::id::{DefId, FileId, Sym};
-use crate::index::WorkspaceIndex;
+use crate::aggregation::DeclRef;
+use crate::id::{FileId, Sym};
 use crate::range::TextRange;
 use crate::resolve::{self, Target};
-use crate::symbol::{DefFlags, DefKind};
+use crate::workspace::Workspace;
 
 /// 归一化引用目标。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RefTarget {
-    Def(DefId),
+    Def(DeclRef),
+    /// 查询期合成成员（B4）：按 `(源头声明, 成员名)` 身份独立计数
+    /// （Execute 与 ExecuteIfBound 同源不同名，不串）。
+    Synthetic { origin: DeclRef, name: Sym },
     /// 局部变量 / 形参：语法层声明（索引不收函数体），按声明 span 唯一。
     Local { file: FileId, span: TextRange },
 }
 
-/// 一个使用点的解析结果（目标集合——重载组原样保留，消歧语义见上）。
-#[derive(Clone, Debug)]
-pub struct UseResolution {
-    pub span: TextRange,
-    pub targets: Vec<RefTarget>,
-}
-
-/// class 合成同名 namespace → class 本身（唯一做 origin 归一的形态）。
-/// delegate/event 展开成员（Execute 等）与 StaticClass 是独立名字，不归一。
-pub fn origin_fallback(idx: &WorkspaceIndex, id: DefId) -> DefId {
-    let d = idx.def(id);
-    if d.kind == DefKind::Namespace && d.flags.contains(DefFlags::SYNTHETIC) {
-        if let Some(origin) = d.origin {
-            return origin;
+impl RefTarget {
+    /// 目标名（query_names / 调用方日志用）。
+    pub fn name_sym(&self, ws: &Workspace) -> Option<Sym> {
+        match self {
+            RefTarget::Def(r) => Some(ws.decl(r).name),
+            RefTarget::Synthetic { name, .. } => Some(*name),
+            RefTarget::Local { .. } => None, // 局部名字从 CST 取（query_names）
         }
     }
-    id
-}
-
-/// 单文件全部 UseSite 的解析（纯函数；as-lsp 侧有按文件缓存，D5）。
-/// 节点定位走 tree-sitter 原生 `descendant_for_byte_range`（O(log n)）+
-/// `resolve_at_node`（parent 链上溯）——不做从根下潜的重遍历。
-pub fn resolve_file_uses(idx: &WorkspaceIndex, file: FileId) -> Vec<UseResolution> {
-    let Some(snap) = idx.files.get(&file) else { return Vec::new() };
-    let root = snap.tree.root_node();
-    let mut out = Vec::with_capacity(snap.uses.len());
-    for site in &snap.uses {
-        let ident = root.descendant_for_byte_range(
-            site.span.start as usize,
-            site.span.end as usize,
-        );
-        let res = match ident {
-            Some(n) => resolve::resolve_at_node(idx, file, &snap.source, n),
-            // 防御：提取与解析同树，正常必然命中；未命中按字节偏移重试
-            None => resolve::resolve_at(idx, file, site.span.start),
-        };
-        let Some(res) = res else { continue };
-        let mut targets = Vec::with_capacity(res.targets.len());
-        for t in res.targets {
-            match t {
-                Target::Def(id) => targets.push(RefTarget::Def(origin_fallback(idx, id))),
-                Target::Local(l) => targets.push(RefTarget::Local { file, span: l.name_span }),
-            }
-        }
-        if targets.is_empty() {
-            continue;
-        }
-        out.push(UseResolution { span: site.span, targets });
-    }
-    out
-}
-
-/// 内建 / 已摘除声明的目标（声明文件无快照）。调用方对这类查询返回空。
-pub fn is_unreferenced_target(idx: &WorkspaceIndex, t: &RefTarget) -> bool {
-    match t {
-        RefTarget::Def(id) => idx.files.get(&idx.def(*id).file).is_none(),
-        RefTarget::Local { .. } => false,
-    }
-}
-
-/// 引用倒排给出的候选文件集（∪ 声明文件；过滤已摘除快照）。升序稳定。
-pub fn candidate_files(idx: &WorkspaceIndex, targets: &[RefTarget]) -> Vec<FileId> {
-    let mut set: BTreeSet<FileId> = BTreeSet::new();
-    for t in targets {
-        match *t {
-            RefTarget::Def(id) => {
-                let d = idx.def(id);
-                if idx.files.get(&d.file).is_none() {
-                    continue; // 内建（无快照）
-                }
-                set.insert(d.file);
-                if let Some(fs) = idx.ref_index.get(&d.name) {
-                    set.extend(fs.iter().copied());
-                }
-            }
-            RefTarget::Local { file, .. } => {
-                set.insert(file);
-            }
-        }
-    }
-    set.into_iter().filter(|&f| idx.files.contains_key(&f)).collect()
-}
-
-/// 站点匹配：解析集合 ∩ 查询集合 ≠ ∅。
-pub fn match_uses(targets: &[RefTarget], resolved: &[UseResolution]) -> Vec<TextRange> {
-    resolved
-        .iter()
-        .filter(|u| u.targets.iter().any(|t| targets.contains(t)))
-        .map(|u| u.span)
-        .collect()
-}
-
-/// rename 的**严格匹配**（比 references 严）：只有「解析结果唯一且等于目标」
-/// 的站点才可改写——歧义站点（重载组）可能属于其它重载，改写会误伤
-/// （宁缺毋假，D14 同族；M4 定案）。
-pub fn match_uses_strict(targets: &[RefTarget], resolved: &[UseResolution]) -> Vec<TextRange> {
-    resolved
-        .iter()
-        .filter(|u| u.targets.len() == 1 && targets.contains(&u.targets[0]))
-        .map(|u| u.span)
-        .collect()
-}
-
-/// 纯函数版 references（单测与 as-cli 用；as-lsp 侧走缓存分批，语义相同）。
-pub fn find_references(idx: &WorkspaceIndex, targets: &[RefTarget]) -> Vec<(FileId, TextRange)> {
-    let mut out = Vec::new();
-    for file in candidate_files(idx, targets) {
-        let resolved = resolve_file_uses(idx, file);
-        for span in match_uses(targets, &resolved) {
-            out.push((file, span));
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
-// 查询期 references（D5 翻案 / index-architecture §6，Phase B1：
-// 先对旧 WorkspaceIndex 实现——B3 平移到 Workspace 后倒排路径整体删除）
+// 查询期 references（字符串搜 + 逐点解析验证，mylua 同构）
 // ---------------------------------------------------------------------------
 
 /// 词边界搜索（大小写敏感）：`word` 在 `src` 的全部出现起始字节偏移。
@@ -180,14 +76,20 @@ pub fn find_word_occurrences(src: &str, word: &str) -> Vec<u32> {
     out
 }
 
-/// 查询目标的名字集合（Def 组名字 ∪ 局部变量名字——局部名字从声明锚点
-/// 的 CST 节点取回）。返回 `(Sym, 源文本)` 对，去重。
-fn query_names(idx: &WorkspaceIndex, targets: &[RefTarget]) -> Vec<(Sym, &'static str)> {
+/// 查询目标的名字集合（Def/Synthetic 组名字 ∪ 局部变量名字——局部名字从
+/// 声明锚点的 CST 节点取回）。返回 `(Sym, 源文本)` 对，去重。
+fn query_names(ws: &Workspace, targets: &[RefTarget]) -> Vec<(Sym, &'static str)> {
     let mut out: Vec<(Sym, &'static str)> = Vec::new();
     for t in targets {
         match *t {
-            RefTarget::Def(id) => {
-                let name = idx.def(id).name;
+            RefTarget::Def(r) => {
+                let name = ws.decl(&r).name;
+                let s = crate::intern::sym_str(name);
+                if !out.iter().any(|(n, _)| *n == name) {
+                    out.push((name, s));
+                }
+            }
+            RefTarget::Synthetic { name, .. } => {
                 let s = crate::intern::sym_str(name);
                 if !out.iter().any(|(n, _)| *n == name) {
                     out.push((name, s));
@@ -195,13 +97,13 @@ fn query_names(idx: &WorkspaceIndex, targets: &[RefTarget]) -> Vec<(Sym, &'stati
             }
             RefTarget::Local { file, span } => {
                 // 局部名字：声明锚点处的 CST 节点文本
-                if let Some(snap) = idx.files.get(&file) {
-                    if let Some(node) = snap
+                if let Some(entry) = ws.files.get(&file) {
+                    if let Some(node) = entry
                         .tree
                         .root_node()
                         .descendant_for_byte_range(span.start as usize, span.end as usize)
                     {
-                        let s = node.utf8_text(snap.source.as_bytes()).unwrap_or("");
+                        let s = node.utf8_text(entry.source.as_bytes()).unwrap_or("");
                         let name = crate::intern::intern_sym(s);
                         if !out.iter().any(|(n, _)| *n == name) {
                             out.push((name, crate::intern::sym_str(name)));
@@ -214,41 +116,44 @@ fn query_names(idx: &WorkspaceIndex, targets: &[RefTarget]) -> Vec<(Sym, &'stati
     out
 }
 
-/// 查询期 references（字符串搜 + 逐点解析验证，mylua 同构）。
-/// 语义与 [`find_references`]（倒排路径）完全一致——站点解析集合 ∩ 查询
-/// 集合 ≠ ∅ 即命中；`strict`（rename）= 解析唯一且等于目标。
-pub fn find_references_query(
-    idx: &WorkspaceIndex,
+/// 查询期 references（字符串搜 + 逐点解析验证，唯一路径——旧倒排路径随
+/// Phase B 删除）。语义 = 架构设计 §4.6：站点解析集合 ∩ 查询集合 ≠ ∅ 即
+/// 命中；`strict`（rename）= 解析唯一且等于目标（歧义站点可能属于其它
+/// 重载，改写会误伤——宁缺毋假）。
+pub fn find_references(
+    ws: &Workspace,
     targets: &[RefTarget],
     strict: bool,
 ) -> Vec<(FileId, TextRange)> {
-    let names = query_names(idx, targets);
+    let names = query_names(ws, targets);
     if names.is_empty() {
         return Vec::new();
     }
-    let has_def_target = targets.iter().any(|t| matches!(t, RefTarget::Def(_)));
+    let has_def_target = targets
+        .iter()
+        .any(|t| matches!(t, RefTarget::Def(_) | RefTarget::Synthetic { .. }));
     // 文件级 rayon 并行（设计稿 §6.2 预留）：文件间完全独立，resolve 只读。
     // 串行实测 10MB 语料 ~700ms/查询（逐 occurrence 全链解析），并行后
     // 进入可接受区间；文件内仍串行（保持命中序 = 源码序）。
     use rayon::prelude::*;
-    let mut out: Vec<(FileId, TextRange)> = idx
+    let mut out: Vec<(FileId, TextRange)> = ws
         .files
         .par_iter()
-        .flat_map_iter(|(&file, snap)| {
+        .flat_map_iter(|(&file, entry)| {
             // 局部变量目标：引用天然限声明所在文件（Def 目标才全库扫）
             if !has_def_target {
                 let declared_here = targets.iter().any(|t| match *t {
                     RefTarget::Local { file: f, .. } => f == file,
-                    RefTarget::Def(_) => false,
+                    _ => false,
                 });
                 if !declared_here {
                     return Vec::new();
                 }
             }
-            let root = snap.tree.root_node();
+            let root = entry.tree.root_node();
             let mut hits: Vec<u32> = Vec::new();
             for (_, word) in &names {
-                hits.extend(find_word_occurrences(&snap.source, word));
+                hits.extend(find_word_occurrences(&entry.source, word));
             }
             hits.sort_unstable();
             hits.dedup();
@@ -262,7 +167,7 @@ pub fn find_references_query(
                 if node.kind() != "identifier" || node.start_byte() as u32 != off {
                     continue;
                 }
-                let Some(res) = resolve::resolve_at_node(idx, file, &snap.source, node) else {
+                let Some(res) = resolve::resolve_at_node(ws, file, &entry.source, node) else {
                     continue;
                 };
                 // 声明名位点不计引用（旧路径 UseSite 提取排除声明名——
@@ -273,7 +178,8 @@ pub fn find_references_query(
                 let mut matched = false;
                 for t in &res.targets {
                     let rt = match t {
-                        Target::Def(id) => RefTarget::Def(origin_fallback(idx, *id)),
+                        Target::Def(r) => RefTarget::Def(*r),
+                        Target::Synthetic(m) => RefTarget::Synthetic { origin: m.origin, name: m.name },
                         Target::Local(l) => RefTarget::Local { file, span: l.name_span },
                     };
                     if targets.contains(&rt) && (!strict || res.targets.len() == 1) {
@@ -297,13 +203,13 @@ pub fn find_references_query(
 mod tests {
     use super::*;
     use crate::config::IndexConfig;
-    use crate::index::{FileInput, FileKind};
     use crate::intern::{intern_file, intern_sym, sym_str};
     use crate::resolve::{resolve_at, Target, LEVEL_DECL_SELF, LEVEL_MIXIN};
-    use crate::symbol::DefExtra;
+    use crate::summary::RawExtra;
     use crate::types::SynType;
+    use crate::workspace::{FileInput, FileKind};
 
-    fn build(srcs: &[(&str, &str)]) -> WorkspaceIndex {
+    fn build(srcs: &[(&str, &str)]) -> Workspace {
         let inputs = srcs
             .iter()
             .map(|(path, src)| FileInput {
@@ -313,7 +219,7 @@ mod tests {
                 module: None,
             })
             .collect();
-        WorkspaceIndex::build(IndexConfig::default(), inputs)
+        Workspace::build(IndexConfig::default(), inputs)
     }
 
     /// 用例源码全部内置（AGENTS.md 硬性规则 / D1）。
@@ -332,20 +238,21 @@ mod tests {
         intern_file(path, 0)
     }
 
-    /// 光标处的查询目标（Def 组或 Local）。
-    fn query_at(idx: &WorkspaceIndex, file: FileId, _src: &str, byte: u32) -> Vec<RefTarget> {
-        let r = resolve_at(idx, file, byte).expect("应命中");
+    /// 光标处的查询目标（Def 组 / Synthetic / Local）。
+    fn query_at(ws: &Workspace, file: FileId, _src: &str, byte: u32) -> Vec<RefTarget> {
+        let r = resolve_at(ws, file, byte).expect("应命中");
         r.targets
             .iter()
             .map(|t| match t {
-                Target::Def(id) => RefTarget::Def(origin_fallback(idx, *id)),
+                Target::Def(r) => RefTarget::Def(*r),
+                Target::Synthetic(m) => RefTarget::Synthetic { origin: m.origin, name: m.name },
                 Target::Local(l) => RefTarget::Local { file, span: l.name_span },
             })
             .collect()
     }
 
     // ------------------------------------------------------------------
-    // 查询期内核（B1）：词边界搜索 + 与倒排路径的等价性
+    // 查询期内核（B1）：词边界 + 基础语义
     // ------------------------------------------------------------------
 
     #[test]
@@ -359,9 +266,10 @@ mod tests {
     }
 
     #[test]
-    fn query_time_matches_inverted_index() {
+    fn query_time_semantics() {
         // 覆盖：跨文件 / 重载组（消歧失败报全部）/ 局部变量（限本文件）/
-        // 声明名不计 / f-string 插值段
+        // 声明名不计 / f-string 插值段（原 A/B 对账用例的语义面——倒排
+        // 路径删除后直接断言查询期结果）
         const A: &str = "\
 int Counter = 0;
 void Target2() {}
@@ -384,27 +292,36 @@ void G()
     OverloadFn(1);
 }
 ";
-        let idx = build(&[("unique://qtime/a.as", A), ("unique://qtime/b.as", B)]);
+        let ws = build(&[("unique://qtime/a.as", A), ("unique://qtime/b.as", B)]);
         let fa = file_of("unique://qtime/a.as");
-        let queries: Vec<(u32, &str)> = vec![
-            (off(A, "Counter = 0"), "全局变量（声明名锚点查询）"),
-            (off(A, "Target2() {}"), "跨文件函数"),
-            (nth(A, "OverloadFn(", 2), "重载组"),
-            (off(A, "Local + Counter"), "局部变量"),
-        ];
-        for (byte, what) in queries {
-            let targets = query_at(&idx, fa, A, byte);
-            let old = find_references(&idx, &targets);
-            let new = find_references_query(&idx, &targets, false);
-            assert_eq!(old, new, "两法结果不等（{what}）: old {old:?} vs new {new:?}");
-        }
-        // 局部变量：另一文件同名局部不得串
-        let targets = query_at(&idx, fa, A, off(A, "Local + Counter"));
-        let hits = find_references_query(&idx, &targets, false);
+
+        // 跨文件函数：a.as 两处（无——Target2 在 a 只声明）+ b.as 一处调用
+        let targets = query_at(&ws, fa, A, off(A, "Target2() {}"));
+        let hits = find_references(&ws, &targets, false);
+        assert_eq!(hits.len(), 1, "声明名不计，仅 b.as 使用点");
+        assert_eq!(hits[0].0, file_of("unique://qtime/b.as"));
+
+        // 重载组查询（整组 = 该名字全部声明——调用点已消歧为单目标，
+        // 整组需显式构造）：全部使用点
+        let group: Vec<RefTarget> = ws
+            .lookup(intern_sym("OverloadFn"))
+            .iter()
+            .copied()
+            .map(RefTarget::Def)
+            .collect();
+        assert_eq!(group.len(), 2);
+        let hits = find_references(&ws, &group, false);
+        assert_eq!(hits.len(), 3, "OverloadFn(X) + OverloadFn(1.5) + b.as OverloadFn(1)");
+
+        // 局部变量：另一文件同名局部不得串 + f-string 插值段计入
+        let targets = query_at(&ws, fa, A, off(A, "Local + Counter"));
+        let hits = find_references(&ws, &targets, false);
         assert!(hits.iter().all(|(f, _)| *f == fa), "局部限本文件");
+        assert_eq!(hits.len(), 2, "使用点 int X = Local + f-string 插值段");
+
         // 声明名不计：Counter 全部引用 = 使用点 1 处（声明除外）
-        let targets = query_at(&idx, fa, A, off(A, "Counter = 0"));
-        let hits = find_references_query(&idx, &targets, false);
+        let targets = query_at(&ws, fa, A, off(A, "Counter = 0"));
+        let hits = find_references(&ws, &targets, false);
         assert_eq!(hits.len(), 1, "声明位点不计引用");
     }
 
@@ -416,14 +333,14 @@ void G()
     fn cross_file_function_references() {
         const A: &str = "void Target() {}\nvoid Other() { Target(); Target(); }\n";
         const B: &str = "void User() { Target(); }\n";
-        let idx = build(&[("unique://ref/a.as", A), ("unique://ref/b.as", B)]);
-        let targets = query_at(&idx, file_of("unique://ref/a.as"), A, off(A, "Target() {}"));
-        let refs = find_references(&idx, &targets);
+        let ws = build(&[("unique://ref/a.as", A), ("unique://ref/b.as", B)]);
+        let targets = query_at(&ws, file_of("unique://ref/a.as"), A, off(A, "Target() {}"));
+        let refs = find_references(&ws, &targets, false);
         assert_eq!(refs.len(), 3, "a.as 两处 + b.as 一处");
         let in_a = refs.iter().filter(|(f, _)| *f == file_of("unique://ref/a.as")).count();
         let in_b = refs.iter().filter(|(f, _)| *f == file_of("unique://ref/b.as")).count();
         assert_eq!((in_a, in_b), (2, 1));
-        // 声明名本身不计入（UseSite 排除）
+        // 声明名本身不计入
         let decl_start = off(A, "Target() {}");
         assert!(refs.iter().all(|(_, s)| s.start != decl_start));
     }
@@ -441,17 +358,17 @@ void F()
     int B = X;
 }
 ";
-        let idx = build(&[("unique://ref/shadow.as", SRC)]);
+        let ws = build(&[("unique://ref/shadow.as", SRC)]);
         let file = file_of("unique://ref/shadow.as");
         // 内层 X（float）声明：LEVEL_DECL_SELF + Local
-        let r = resolve_at(&idx, file, off(SRC, "X = 2.0")).unwrap();
+        let r = resolve_at(&ws, file, off(SRC, "X = 2.0")).unwrap();
         assert_eq!(r.level, LEVEL_DECL_SELF);
-        let inner = query_at(&idx, file, SRC, off(SRC, "X = 2.0"));
-        let refs = find_references(&idx, &inner);
+        let inner = query_at(&ws, file, SRC, off(SRC, "X = 2.0"));
+        let refs = find_references(&ws, &inner, false);
         assert_eq!(refs.len(), 1, "只命中内层使用点（int A = X）");
         // 外层 X（int）声明
-        let outer = query_at(&idx, file, SRC, off(SRC, "X = 1"));
-        let refs = find_references(&idx, &outer);
+        let outer = query_at(&ws, file, SRC, off(SRC, "X = 1"));
+        let refs = find_references(&ws, &outer, false);
         assert_eq!(refs.len(), 1, "只命中外层使用点（int B = X）——遮蔽不误报");
     }
 
@@ -465,12 +382,12 @@ class C : AActor
     void M() { Heal(1.0); }
 }
 ";
-        let idx = build(&[("unique://ref/mixin.as", SRC)]);
+        let ws = build(&[("unique://ref/mixin.as", SRC)]);
         let file = file_of("unique://ref/mixin.as");
-        let r = resolve_at(&idx, file, off(SRC, "Heal(1.0)")).unwrap();
+        let r = resolve_at(&ws, file, off(SRC, "Heal(1.0)")).unwrap();
         assert_eq!(r.level, LEVEL_MIXIN, "mixin 命中");
-        let targets = query_at(&idx, file, SRC, off(SRC, "Heal(1.0)"));
-        let refs = find_references(&idx, &targets);
+        let targets = query_at(&ws, file, SRC, off(SRC, "Heal(1.0)"));
+        let refs = find_references(&ws, &targets, false);
         assert_eq!(refs.len(), 1, "调用点计入 mixin 声明的 references");
     }
 
@@ -484,14 +401,14 @@ void F()
     EColor B = EColor::Green;
 }
 ";
-        let idx = build(&[("unique://ref/enum.as", SRC)]);
+        let ws = build(&[("unique://ref/enum.as", SRC)]);
         let file = file_of("unique://ref/enum.as");
-        let red = query_at(&idx, file, SRC, off(SRC, "Red"));
-        let refs = find_references(&idx, &red);
+        let red = query_at(&ws, file, SRC, off(SRC, "Red"));
+        let refs = find_references(&ws, &red, false);
         assert_eq!(refs.len(), 1, "EColor::Red 的使用点");
         assert_eq!(refs[0].1.start, nth(SRC, "Red", 2), "落在使用点（EColor::Red）");
-        let green = query_at(&idx, file, SRC, off(SRC, "Green"));
-        assert_eq!(find_references(&idx, &green).len(), 1);
+        let green = query_at(&ws, file, SRC, off(SRC, "Green"));
+        assert_eq!(find_references(&ws, &green, false).len(), 1);
     }
 
     // ------------------------------------------------------------------
@@ -511,11 +428,11 @@ void Calls()
     F(Unknown());
 }
 ";
-        let idx = build(&[("unique://ref/ovl.as", SRC)]);
+        let ws = build(&[("unique://ref/ovl.as", SRC)]);
         let file = file_of("unique://ref/ovl.as");
 
-        let param0_is = |id: DefId, name: &str| match &idx.def(id).extra {
-            DefExtra::Callable { params, .. } => match &params[0].ty {
+        let param0_is = |r: DeclRef, name: &str| match &ws.decl(&r).extra {
+            RawExtra::Callable { params, .. } => match &params[0].ty {
                 Some(SynType::Primitive(n, _)) => sym_str(*n) == name,
                 Some(SynType::Named(n, _)) => sym_str(*n) == name,
                 _ => false,
@@ -524,31 +441,32 @@ void Calls()
         };
 
         // 成功路径 ①：字面量实参类型消歧
-        let r = resolve_at(&idx, file, off(SRC, "F(1);")).unwrap();
+        let r = resolve_at(&ws, file, off(SRC, "F(1);")).unwrap();
         assert_eq!(r.targets.len(), 1, "int 实参唯一命中");
         let Target::Def(int_overload) = r.targets[0] else { panic!() };
         assert!(param0_is(int_overload, "int"));
-        let r = resolve_at(&idx, file, off(SRC, "F(\"x\");")).unwrap();
+        let r = resolve_at(&ws, file, off(SRC, "F(\"x\");")).unwrap();
         assert_eq!(r.targets.len(), 1, "字符串实参唯一命中");
         let Target::Def(str_overload) = r.targets[0] else { panic!() };
         assert!(param0_is(str_overload, "FString"));
 
         // 成功路径 ②：arity 消歧
-        let r = resolve_at(&idx, file, off(SRC, "F(Unknown());")).unwrap();
+        let r = resolve_at(&ws, file, off(SRC, "F(Unknown());")).unwrap();
         assert_eq!(r.targets.len(), 2, "不可定型实参 ⇒ 消歧失败，保留全部重载");
 
         // references 侧：消歧成功的站点归各自重载；**不可消歧的站点
         // （F(Unknown())）对组内每个重载都算引用**（架构设计 §4.6——
         // 不可排除）⇒ int = F(1) + F(Unknown())，FString = F("x") + F(Unknown())
-        let int_refs = find_references(&idx, &[RefTarget::Def(int_overload)]);
+        let int_refs = find_references(&ws, &[RefTarget::Def(int_overload)], false);
         assert_eq!(int_refs.len(), 2, "F(1) + F(Unknown())");
-        let str_refs = find_references(&idx, &[RefTarget::Def(str_overload)]);
+        let str_refs = find_references(&ws, &[RefTarget::Def(str_overload)], false);
         assert_eq!(str_refs.len(), 2, "F(\"x\") + F(Unknown())");
 
         // 消歧失败 ⇒ 报全部重载（查询组 = 两个重载的并集，与单查询取并同）
         let both = find_references(
-            &idx,
+            &ws,
             &[RefTarget::Def(int_overload), RefTarget::Def(str_overload)],
+            false,
         );
         assert_eq!(both.len(), 3, "F(1) + F(\"x\") + F(Unknown()) 全部计入");
     }
@@ -564,21 +482,21 @@ void C()
     F2(1, 2);
 }
 ";
-        let idx = build(&[("unique://ref/ar.as", SRC)]);
+        let ws = build(&[("unique://ref/ar.as", SRC)]);
         let file = file_of("unique://ref/ar.as");
-        let r = resolve_at(&idx, file, off(SRC, "F2(1);")).unwrap();
+        let r = resolve_at(&ws, file, off(SRC, "F2(1);")).unwrap();
         assert_eq!(r.targets.len(), 1, "单实参 ⇒ 一参重载");
         let Target::Def(one) = r.targets[0] else { panic!() };
-        let r = resolve_at(&idx, file, off(SRC, "F2(1, 2);")).unwrap();
+        let r = resolve_at(&ws, file, off(SRC, "F2(1, 2);")).unwrap();
         assert_eq!(r.targets.len(), 1, "双实参 ⇒ 两参重载");
         let Target::Def(two) = r.targets[0] else { panic!() };
         assert_ne!(one, two);
-        assert_eq!(find_references(&idx, &[RefTarget::Def(one)]).len(), 1);
-        assert_eq!(find_references(&idx, &[RefTarget::Def(two)]).len(), 1);
+        assert_eq!(find_references(&ws, &[RefTarget::Def(one)], false).len(), 1);
+        assert_eq!(find_references(&ws, &[RefTarget::Def(two)], false).len(), 1);
     }
 
     // ------------------------------------------------------------------
-    // 合成符号的引用语义（D27 取舍）
+    // 合成符号的引用语义（D27 取舍 / B4 Synthetic 身份）
     // ------------------------------------------------------------------
 
     #[test]
@@ -592,17 +510,17 @@ class A
     void N() { FOnHit H; }
 }
 ";
-        let idx = build(&[("unique://ref/dlg.as", SRC)]);
+        let ws = build(&[("unique://ref/dlg.as", SRC)]);
         let file = file_of("unique://ref/dlg.as");
 
         // Execute（合成成员）独立 references
-        let exec = query_at(&idx, file, SRC, off(SRC, "Execute"));
-        let exec_refs = find_references(&idx, &exec);
+        let exec = query_at(&ws, file, SRC, off(SRC, "Execute"));
+        let exec_refs = find_references(&ws, &exec, false);
         assert_eq!(exec_refs.len(), 2, "两个 Execute 调用点");
 
         // 委托声明 FOnHit 的 references = 类型使用点，不含 Execute 站点
-        let decl = query_at(&idx, file, SRC, off(SRC, "FOnHit(int"));
-        let decl_refs = find_references(&idx, &decl);
+        let decl = query_at(&ws, file, SRC, off(SRC, "FOnHit(int"));
+        let decl_refs = find_references(&ws, &decl, false);
         assert_eq!(decl_refs.len(), 2, "FOnHit OnHit; + FOnHit H;（Execute 不并入）");
     }
 
@@ -612,13 +530,14 @@ class A
 class AActor {}
 void F() { UClass C = AActor::StaticClass(); }
 ";
-        let idx = build(&[("unique://ref/cls.as", SRC)]);
+        let ws = build(&[("unique://ref/cls.as", SRC)]);
         let file = file_of("unique://ref/cls.as");
         // 查询：类声明本身
-        let class = query_at(&idx, file, SRC, off(SRC, "AActor {}"));
-        // 站点：AActor:: 限定段（第 2 次出现）经合成 namespace 归一到类
-        let refs = find_references(&idx, &class);
-        assert_eq!(refs.len(), 1, "AActor:: 限定段计入类引用（origin_fallback）");
+        let class = query_at(&ws, file, SRC, off(SRC, "AActor {}"));
+        // 站点：AActor:: 限定段（第 2 次出现）——B3 下 ScopedFirst 直接产出
+        // 类 DeclRef（天然归一，原 origin_fallback 删除）
+        let refs = find_references(&ws, &class, false);
+        assert_eq!(refs.len(), 1, "AActor:: 限定段计入类引用（B3 天然归一）");
         assert_eq!(refs[0].1.start, nth(SRC, "AActor", 2));
     }
 
@@ -632,34 +551,30 @@ void F() { UClass C = AActor::StaticClass(); }
         const USER: &str = "void F() { CLib C; }\n";
         let lib_path = "unique://reflife/lib.as";
         let user_file = file_of("unique://reflife/user.as");
-        let mut idx = build(&[(lib_path, LIB), ("unique://reflife/user.as", USER)]);
+        let mut ws = build(&[(lib_path, LIB), ("unique://reflife/user.as", USER)]);
         let lib_file = file_of(lib_path);
 
-        let cls = query_at(&idx, lib_file, LIB, off(LIB, "CLib"));
-        assert_eq!(find_references(&idx, &cls).len(), 1, "user 的类型使用点");
+        let cls = query_at(&ws, lib_file, LIB, off(LIB, "CLib"));
+        assert_eq!(find_references(&ws, &cls, false).len(), 1, "user 的类型使用点");
 
-        // 删除：defs 摘除 + 幽灵符号不得残留
-        idx.remove_file(lib_file);
-        assert!(idx.lookup_type_def(intern_sym("CLib")).is_none(), "声明不可达");
-        assert!(idx.files.get(&lib_file).is_none(), "快照摘除");
+        // 删除：贡献摘除（agg 增量）+ 幽灵符号不得残留
+        ws.remove_file(lib_file);
+        assert!(ws.lookup_type_def(intern_sym("CLib")).is_none(), "声明不可达");
+        assert!(ws.files.get(&lib_file).is_none(), "快照摘除");
         assert!(
-            !idx.ref_index.get(&intern_sym("CLib")).map_or(false, |s| s.contains(&lib_file)),
-            "引用倒排摘除该文件的贡献"
-        );
-        assert!(
-            resolve_at(&idx, user_file, off(USER, "CLib C")).is_none(),
+            resolve_at(&ws, user_file, off(USER, "CLib C")).is_none(),
             "使用点随之失效"
         );
 
         // 复活（同路径 ⇒ 同 FileId，墓碑翻回）：声明与 references 恢复
-        idx.reindex_file_full(lib_file, FileKind::Script, None, LIB.to_string());
-        assert!(idx.lookup_type_def(intern_sym("CLib")).is_some());
-        let cls2 = query_at(&idx, user_file, USER, off(USER, "CLib C"));
-        assert_eq!(find_references(&idx, &cls2).len(), 1);
+        ws.reindex_file_full(lib_file, FileKind::Script, None, LIB.to_string());
+        assert!(ws.lookup_type_def(intern_sym("CLib")).is_some());
+        let cls2 = query_at(&ws, user_file, USER, off(USER, "CLib C"));
+        assert_eq!(find_references(&ws, &cls2, false).len(), 1);
     }
 
     // ------------------------------------------------------------------
-    // 指纹：decl_surface（D29，as-lsp 缓存联动失效的判定）
+    // 其他：for-range 迭代变量
     // ------------------------------------------------------------------
 
     #[test]
@@ -672,16 +587,16 @@ void F()
     for (int Elem : Items) { int B = Elem; }
 }
 ";
-        let idx = build(&[("unique://ref/fe.as", SRC)]);
+        let ws = build(&[("unique://ref/fe.as", SRC)]);
         let file = file_of("unique://ref/fe.as");
         // 第一个迭代变量的引用：第 1 个循环体的 Elem 使用点
-        let decl1 = query_at(&idx, file, SRC, off(SRC, "Elem :"));
-        let refs = find_references(&idx, &decl1);
+        let decl1 = query_at(&ws, file, SRC, off(SRC, "Elem :"));
+        let refs = find_references(&ws, &decl1, false);
         assert_eq!(refs.len(), 1, "只命中本循环体的使用点");
         assert_eq!(refs[0].1.start, nth(SRC, "Elem", 2));
         // 第二个循环：同名迭代变量是独立声明
-        let decl2 = query_at(&idx, file, SRC, nth(SRC, "Elem :", 2));
-        let refs2 = find_references(&idx, &decl2);
+        let decl2 = query_at(&ws, file, SRC, nth(SRC, "Elem :", 2));
+        let refs2 = find_references(&ws, &decl2, false);
         assert_eq!(refs2.len(), 1);
         assert_eq!(refs2[0].1.start, nth(SRC, "Elem", 4));
     }

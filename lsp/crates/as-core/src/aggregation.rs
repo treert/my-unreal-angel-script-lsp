@@ -189,9 +189,9 @@ impl Aggregation {
 mod tests {
     use super::*;
     use crate::config::IndexConfig;
-    use crate::index::FileKind;
     use crate::intern::{intern_file, intern_sym};
     use crate::summary::extract_summary;
+    use crate::workspace::FileKind;
 
     // 用例源码全部内置（AGENTS.md 硬性规则 / D1）。
 

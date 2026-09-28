@@ -14,10 +14,10 @@ use as_syntax::tree_sitter::Node;
 use crate::expr::{expr_type, for_each_element, is_auto_type};
 use crate::hover::render_syn;
 use crate::id::FileId;
-use crate::index::WorkspaceIndex;
 use crate::resolve::SemCtx;
 use crate::syntax;
 use crate::types::SynType;
+use crate::workspace::Workspace;
 
 /// 一个 inlay hint（as-core 自有结构，as-lsp 映射 InlayHint）。
 pub struct Inlay {
@@ -28,31 +28,31 @@ pub struct Inlay {
 }
 
 /// 全文件 auto 推导 hint。文件不在索引 → 空。
-pub fn inlay_hints(idx: &WorkspaceIndex, file: FileId) -> Vec<Inlay> {
-    let Some(snap) = idx.files.get(&file) else { return Vec::new() };
-    let src = &snap.source;
-    let root = snap.tree.root_node();
+pub fn inlay_hints(ws: &Workspace, file: FileId) -> Vec<Inlay> {
+    let Some(entry) = ws.files.get(&file) else { return Vec::new() };
+    let src = &entry.source;
+    let root = entry.tree.root_node();
     let mut out = Vec::new();
     // 根语境（函数体内部各自的局部由 SemCtx 逐声明重建——auto 是函数体
     // 局部自包含分析，用声明点位置的语境保证先行声明可见）
-    walk_nodes(idx, file, src, root, &mut out);
+    walk_nodes(ws, file, src, root, &mut out);
     out
 }
 
-fn walk_nodes(idx: &WorkspaceIndex, file: FileId, src: &str, node: Node<'_>, out: &mut Vec<Inlay>) {
+fn walk_nodes(ws: &Workspace, file: FileId, src: &str, node: Node<'_>, out: &mut Vec<Inlay>) {
     let children = syntax::children_with_fields(node);
     for (_, child) in children {
         match child.kind() {
-            "variable_declaration" => collect_auto_decl(idx, file, src, child, out),
-            "for_each_statement" => collect_for_each(idx, file, src, child, out),
-            _ => walk_nodes(idx, file, src, child, out),
+            "variable_declaration" => collect_auto_decl(ws, file, src, child, out),
+            "for_each_statement" => collect_for_each(ws, file, src, child, out),
+            _ => walk_nodes(ws, file, src, child, out),
         }
     }
 }
 
 /// 块内 / for 初始化的 auto 声明（多 declarator 逐个取）。
 fn collect_auto_decl(
-    idx: &WorkspaceIndex,
+    ws: &Workspace,
     file: FileId,
     src: &str,
     decl: Node<'_>,
@@ -72,9 +72,9 @@ fn collect_auto_decl(
         let Some(name_node) = child.child_by_field_name("name") else { continue };
         let Some(init) = child.child_by_field_name("value") else { continue };
         // 语境锚点 = 声明点（初始化式开头——先于自身求值点的局部已可见）
-        let ctx = SemCtx::at_byte(idx, file, src, init.start_byte() as u32, name_node);
-        if let Some(e) = expr_type(idx, &ctx, src, init) {
-            let syn = e.syn.unwrap_or_else(|| crate::expr::syn_of_base(idx, e.base));
+        let ctx = SemCtx::at_byte(ws, file, src, init.start_byte() as u32, name_node);
+        if let Some(e) = expr_type(ws, &ctx, src, init) {
+            let syn = e.syn.unwrap_or_else(|| crate::expr::syn_of_base(ws, e.base));
             push_hint(name_node, src, syn, out);
         }
         // 定型失败：宁缺毋假——不出 hint
@@ -83,7 +83,7 @@ fn collect_auto_decl(
 
 /// range-for 迭代变量（auto 才出；`for (FVector E : ...)` 显式类型不出）。
 fn collect_for_each(
-    idx: &WorkspaceIndex,
+    ws: &Workspace,
     file: FileId,
     src: &str,
     node: Node<'_>,
@@ -97,9 +97,9 @@ fn collect_for_each(
     let Some(name_node) = node.child_by_field_name("name") else { return };
     // 语境锚点 = range 表达式开头
     let Some(range) = node.child_by_field_name("range") else { return };
-    let ctx = SemCtx::at_byte(idx, file, src, range.start_byte() as u32, name_node);
-    if let Some(e) = for_each_element(idx, &ctx, src, node) {
-        let syn = e.syn.unwrap_or_else(|| crate::expr::syn_of_base(idx, e.base));
+    let ctx = SemCtx::at_byte(ws, file, src, range.start_byte() as u32, name_node);
+    if let Some(e) = for_each_element(ws, &ctx, src, node) {
+        let syn = e.syn.unwrap_or_else(|| crate::expr::syn_of_base(ws, e.base));
         push_hint(name_node, src, syn, out);
     }
 }
@@ -115,10 +115,10 @@ fn push_hint(name_node: Node<'_>, _src: &str, syn: SynType, out: &mut Vec<Inlay>
 mod tests {
     use super::*;
     use crate::config::IndexConfig;
-    use crate::index::{FileInput, FileKind};
     use crate::intern::intern_file;
+    use crate::workspace::{FileInput, FileKind};
 
-    fn build(srcs: &[(&str, &str)]) -> WorkspaceIndex {
+    fn build(srcs: &[(&str, &str)]) -> Workspace {
         let inputs = srcs
             .iter()
             .map(|(path, src)| FileInput {
@@ -128,13 +128,13 @@ mod tests {
                 module: None,
             })
             .collect();
-        WorkspaceIndex::build(IndexConfig::default(), inputs)
+        Workspace::build(IndexConfig::default(), inputs)
     }
 
     fn hints_of(srcs: &[(&str, &str)], path: &str) -> Vec<(u32, String)> {
-        let idx = build(srcs);
+        let ws = build(srcs);
         let file = intern_file(path, 0);
-        inlay_hints(&idx, file).into_iter().map(|i| (i.position, i.ty)).collect()
+        inlay_hints(&ws, file).into_iter().map(|i| (i.position, i.ty)).collect()
     }
 
     #[test]

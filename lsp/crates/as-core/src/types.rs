@@ -12,7 +12,8 @@
 
 use std::collections::HashMap;
 
-use crate::id::{DefId, Sym, TypeId};
+use crate::aggregation::DeclRef;
+use crate::id::{Sym, TypeId};
 use crate::range::TextRange;
 
 /// 引用方向（`&in` / `&out` / `&inout` / 裸 `&`）。
@@ -42,8 +43,10 @@ impl RefKind {
 /// 等价物——`TypeKind` 字面量可以拼，但只有 intern 会入表并保证规范序）。
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum TypeKind {
-    /// FVector / TArray<t_?>（模板实参已 intern）
-    Named { def: DefId, args: Vec<TypeId> },
+    /// FVector / TArray<t_?>（模板实参已 intern）。`def` 是跨文件声明锚点
+    /// （Phase B / D37：DefId → DeclRef；builtin 伪文件的 SYNTHETIC decl
+    /// 与普通声明同一形态）
+    Named { def: DeclRef, args: Vec<TypeId> },
     /// T[]
     Array(TypeId),
     Const(TypeId),
@@ -179,8 +182,12 @@ impl TypeTable {
 mod tests {
     use super::*;
 
+    fn dummy_ref() -> DeclRef {
+        DeclRef { file: crate::id::FileId::from_raw(0), local: 0 }
+    }
+
     fn named(tt: &mut TypeTable) -> TypeId {
-        tt.intern(TypeKind::Named { def: DefId::from_raw(0), args: vec![] })
+        tt.intern(TypeKind::Named { def: dummy_ref(), args: vec![] })
     }
 
     /// G7：语义相同的两种修饰符写法必须拿到同一 TypeId（D17 规范形式）。
@@ -214,10 +221,10 @@ mod tests {
         let a = tt.intern(TypeKind::Wildcard);
         let b = tt.intern(TypeKind::Wildcard);
         assert_eq!(a, b);
-        let n1 = tt.intern(TypeKind::Named { def: DefId::from_raw(7), args: vec![a] });
-        let n2 = tt.intern(TypeKind::Named { def: DefId::from_raw(7), args: vec![b] });
+        let n1 = tt.intern(TypeKind::Named { def: DeclRef { file: crate::id::FileId::from_raw(7), local: 0 }, args: vec![a] });
+        let n2 = tt.intern(TypeKind::Named { def: DeclRef { file: crate::id::FileId::from_raw(7), local: 0 }, args: vec![b] });
         assert_eq!(n1, n2);
-        let n3 = tt.intern(TypeKind::Named { def: DefId::from_raw(8), args: vec![a] });
+        let n3 = tt.intern(TypeKind::Named { def: DeclRef { file: crate::id::FileId::from_raw(8), local: 0 }, args: vec![a] });
         assert_ne!(n1, n3);
     }
 }

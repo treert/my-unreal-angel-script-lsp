@@ -2,9 +2,10 @@
 //!
 //! 语境四类（从光标处最深节点沿祖先链**由内向外**判定，内层语境优先）：
 //! - **Member**（`X.` / `X.Ab|`）：接收者定型 → 成员空间（class 闭包 / struct
-//!   单层）全量成员 + 访问器折叠 + mixin（显式接收者准入，D23）；
-//! - **Scoped**（`A::` / `A::Na|`）：namespace 聚合成员（含 class 合成
-//!   StaticClass namespace）+ enum 值 + `Super::` 父类成员；
+//!   单层）全量成员 + 访问器折叠 + mixin（显式接收者准入，D23）+ 委托/事件
+//!   接收者的**合成成员集**（B4：Execute / Broadcast / ctor / opAssign）；
+//! - **Scoped**（`A::` / `A::Na|`）：namespace 聚合成员 + class 兼任 namespace
+//!   的 StaticClass（B3/B4）+ enum 值 + `Super::` 父类成员；
 //! - **CallArg**（调用实参位）：命名实参候选（callee 重载组形参并集，**跳过
 //!   `InArgN` 占位**——UNNAMED_PARAM 索引期标记，架构设计 §2.4.6 硬性）∪
 //!   裸标识符全集；
@@ -22,16 +23,18 @@ use std::collections::HashSet;
 
 use as_syntax::tree_sitter::Node;
 
+use crate::aggregation::DeclRef;
 use crate::expr::expr_type;
 use crate::hover;
-use crate::id::{DefId, FileId, Sym};
-use crate::index::WorkspaceIndex;
+use crate::id::{FileId, Sym};
 use crate::intern::{intern_sym, sym_str};
 use crate::resolve::{
-    member_search_space, namespaces_named, resolve_callee, SemCtx, Target,
+    member_search_space, resolve_callee, SemCtx, Target,
 };
-use crate::symbol::{DefExtra, DefFlags, DefKind};
+use crate::summary::RawExtra;
+use crate::symbol::{DefFlags, DefKind};
 use crate::syntax;
+use crate::workspace::Workspace;
 
 /// 候选种类（as-lsp 负责映射 CompletionItemKind）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -77,27 +80,27 @@ pub const MAX_CANDIDATES: usize = 4096;
 // ---------------------------------------------------------------------------
 
 /// 光标处补全。字节偏移；返回按 sort_hint + label 排序的候选集。
-pub fn complete_at(idx: &WorkspaceIndex, file: FileId, byte: u32) -> Vec<Candidate> {
-    let Some(snap) = idx.files.get(&file) else { return Vec::new() };
-    let src = &snap.source;
-    let root = snap.tree.root_node();
+pub fn complete_at(ws: &Workspace, file: FileId, byte: u32) -> Vec<Candidate> {
+    let Some(entry) = ws.files.get(&file) else { return Vec::new() };
+    let src = &entry.source;
+    let root = entry.tree.root_node();
     if byte > root.end_byte() as u32 {
         return Vec::new();
     }
     let Some(node) = deepest_at(root, byte, src) else { return Vec::new() };
     let prefix = prefix_at(node, src, byte);
-    let ctx = SemCtx::at_byte(idx, file, src, byte, node);
+    let ctx = SemCtx::at_byte(ws, file, src, byte, node);
 
     let out = match detect_from(node, src, byte) {
         Ctx::None => Vec::new(),
-        Ctx::Member { object } => member_candidates(idx, &ctx, src, object),
-        Ctx::Scoped { scope } => scoped_candidates(idx, &ctx, src, scope),
+        Ctx::Member { object } => member_candidates(ws, &ctx, src, object),
+        Ctx::Scoped { scope } => scoped_candidates(ws, &ctx, src, scope),
         Ctx::CallArg { callee, args } => {
-            call_arg_candidates(idx, &ctx, src, callee, args, prefix.as_deref())
+            call_arg_candidates(ws, &ctx, src, callee, args, prefix.as_deref())
         }
         Ctx::Specifier { macro_name } => specifier_candidates(macro_name, prefix.as_deref()),
-        Ctx::FNameUFunction { call } => fname_ufunction_candidates(idx, &ctx, src, call),
-        Ctx::Plain => plain_candidates(idx, &ctx, prefix.as_deref()),
+        Ctx::FNameUFunction { call } => fname_ufunction_candidates(ws, &ctx, src, call),
+        Ctx::Plain => plain_candidates(ws, &ctx, prefix.as_deref()),
     };
     finish(out, prefix.as_deref())
 }
@@ -323,41 +326,55 @@ fn recover_error_ctx<'t>(err: Node<'t>, byte: u32) -> Option<Ctx<'t>> {
 // ---------------------------------------------------------------------------
 
 fn member_candidates(
-    idx: &WorkspaceIndex,
+    ws: &Workspace,
     ctx: &SemCtx,
     src: &str,
     object: Node<'_>,
 ) -> Vec<Candidate> {
     // 接收者定型（宁缺毋假）：不可定型不给候选
-    let Some(recv) = expr_type(idx, ctx, src, object) else {
+    let Some(recv) = expr_type(ws, ctx, src, object) else {
         return Vec::new();
     };
-    let space = member_search_space(idx, recv.base);
+    let space = member_search_space(ws, recv.base);
     let mut out = Vec::new();
     let mut seen: HashSet<Sym> = HashSet::new();
 
     // 1. 真实成员（近者在前：子类遮蔽父类；opXxx / 构造 / notCallable 不补）
     for &t in &space {
-        extend_member_candidates(idx, t, &mut seen, &mut out);
+        extend_member_candidates(ws, t, &mut seen, &mut out);
     }
-    // 2. 访问器折叠（反向默认：不带 NOT_PROPERTY 即候选，§2.4.5）
-    fold_accessors(idx, &space, &seen, &mut out);
-    // 3. mixin（显式接收者准入：无 scope 限定 ✓；沿闭包查倒排 = DerivesOrShadows）
-    extend_mixin_candidates(idx, recv.base, &ctx.ns_syms, HINT_MEMBER + 2, &mut out);
+    // 2. 合成成员（B4）：仅 delegate/event 接收者（Execute / Broadcast /
+    //    ctor / opAssign）。class 的 StaticClass 是静态语境成员，不进
+    //    `X.` 实例补全（与旧架构一致——它挂在合成 namespace 下）。
+    if matches!(ws.decl(&recv.base).kind, DefKind::Delegate | DefKind::Event) {
+        for m in ws.synthetic_members(&recv.base) {
+            if matches!(m.kind, DefKind::Constructor | DefKind::Destructor | DefKind::Operator) {
+                continue; // ctor / opAssign 不进补全（与真实成员同规则）
+            }
+            if !seen.insert(m.name) {
+                continue;
+            }
+            out.push(synthetic_candidate(ws, &m, HINT_MEMBER));
+        }
+    }
+    // 3. 访问器折叠（反向默认：不带 NOT_PROPERTY 即候选，§2.4.5）
+    fold_accessors(ws, &space, &seen, &mut out);
+    // 4. mixin（显式接收者准入：无 scope 限定 ✓；沿闭包查名字倒排 =
+    //    DerivesOrShadows，D23 翻案后的名字键语义）
+    extend_mixin_candidates(ws, recv.base, &ctx.ns_syms, HINT_MEMBER + 2, &mut out);
     out
 }
 
 /// 一个成员空间的全量候选（去重键 = 名字；NOT_CALLABLE / Operator /
 /// Constructor / Destructor 不进补全）。
 fn extend_member_candidates(
-    idx: &WorkspaceIndex,
-    owner: DefId,
+    ws: &Workspace,
+    owner: DeclRef,
     seen: &mut HashSet<Sym>,
     out: &mut Vec<Candidate>,
 ) {
-    let Some(ms) = idx.members.get(&owner) else { return };
-    for &m in ms {
-        let d = idx.def(m);
+    for m in ws.members(&owner) {
+        let d = ws.decl(&m);
         if d.flags.contains(DefFlags::NOT_CALLABLE) {
             continue;
         }
@@ -370,18 +387,17 @@ fn extend_member_candidates(
         if !seen.insert(d.name) {
             continue; // 近层遮蔽
         }
-        out.push(def_candidate(idx, m, HINT_MEMBER));
+        out.push(def_candidate(ws, m, HINT_MEMBER));
     }
 }
 
 /// `Get*/Set*`（无 NOT_PROPERTY）折叠为属性项；与真实成员同名（含跨层
 /// 遮蔽）则跳过。detail 显示读写两侧的原签名。
-fn fold_accessors(idx: &WorkspaceIndex, space: &[DefId], seen: &HashSet<Sym>, out: &mut Vec<Candidate>) {
+fn fold_accessors(ws: &Workspace, space: &[DeclRef], seen: &HashSet<Sym>, out: &mut Vec<Candidate>) {
     let mut folded: HashSet<Sym> = HashSet::new();
     for &t in space {
-        let Some(ms) = idx.members.get(&t) else { continue };
-        for &m in ms {
-            let d = idx.def(m);
+        for m in ws.members(&t) {
+            let d = ws.decl(&m);
             if d.flags.contains(DefFlags::NOT_PROPERTY)
                 || !matches!(d.kind, DefKind::Method | DefKind::Function)
             {
@@ -410,34 +426,34 @@ fn fold_accessors(idx: &WorkspaceIndex, space: &[DefId], seen: &HashSet<Sym>, ou
     }
 }
 
-/// mixin 候选（沿接收者闭包逐级查倒排；ns 准入同 resolve::mixin_candidates——
-/// 全局 mixin 任何链可见，ns 内 mixin 须在当前位置的 ns 链上）。
-/// hint 由调用方给（Member / Plain 两场景层位不同）。
+/// mixin 候选（沿接收者闭包逐级查名字倒排 `mixin_by_name`；ns 准入同
+/// resolve::mixin_candidates——全局 mixin 任何链可见，ns 内 mixin 须在
+/// 当前位置的 ns 链上）。hint 由调用方给（Member / Plain 两场景层位不同）。
 fn extend_mixin_candidates(
-    idx: &WorkspaceIndex,
-    recv: DefId,
+    ws: &Workspace,
+    recv: DeclRef,
     ns_syms: &[Sym],
     hint: u8,
     out: &mut Vec<Candidate>,
 ) {
     let mut chain = vec![recv];
-    if let Some(cl) = idx.closures.get(&recv) {
+    if let Some(cl) = ws.closures.get(&recv) {
         chain.extend(cl.iter().copied());
     }
-    let mut seen: HashSet<DefId> = HashSet::new();
+    let mut seen: HashSet<DeclRef> = HashSet::new();
     for base in chain {
-        let Some(ms) = idx.mixin_index.get(&base) else { continue };
+        let base_name = ws.decl(&base).name;
+        let Some(ms) = ws.agg.mixin_by_name.get(&base_name) else { continue };
         for &m in ms {
             if !seen.insert(m) {
                 continue;
             }
-            let d = idx.def(m);
-            let ns_ok = match d.parent {
+            let ns_ok = match ws.parent_of(&m) {
                 None => true,
-                Some(ns) => ns_syms.contains(&idx.def(ns).name),
+                Some(ns) => ns_syms.contains(&ws.decl(&ns).name),
             };
             if ns_ok {
-                out.push(def_candidate(idx, m, hint));
+                out.push(def_candidate(ws, m, hint));
             }
         }
     }
@@ -448,7 +464,7 @@ fn extend_mixin_candidates(
 // ---------------------------------------------------------------------------
 
 fn scoped_candidates(
-    idx: &WorkspaceIndex,
+    ws: &Workspace,
     ctx: &SemCtx,
     src: &str,
     scope: Node<'_>,
@@ -459,15 +475,15 @@ fn scoped_candidates(
     if scope_text == "Super" || scope_text == "super" {
         if let Some(base) = ctx
             .type_def
-            .and_then(|t| idx.closures.get(&t).and_then(|c| c.first().copied()))
+            .and_then(|t| ws.closures.get(&t).and_then(|c| c.first().copied()))
         {
-            let space = member_search_space(idx, base);
+            let space = member_search_space(ws, base);
             let mut seen = HashSet::new();
             let mut out = Vec::new();
             for &t in &space {
-                extend_member_candidates(idx, t, &mut seen, &mut out);
+                extend_member_candidates(ws, t, &mut seen, &mut out);
             }
-            fold_accessors(idx, &space, &seen, &mut out);
+            fold_accessors(ws, &space, &seen, &mut out);
             return out;
         }
         return Vec::new();
@@ -476,21 +492,26 @@ fn scoped_candidates(
     let sym = intern_sym(scope_text);
     let mut out = Vec::new();
     let mut seen: HashSet<Sym> = HashSet::new();
-    // namespace 聚合（跨文件 + class 合成 StaticClass namespace）
-    for nsdef in namespaces_named(idx, sym) {
-        extend_member_candidates(idx, nsdef, &mut seen, &mut out);
-    }
-    // enum 值（`EColor::`——裸值不可用，asEP_REQUIRE_ENUM_SCOPE=1）
-    if let Some(enm) = idx
-        .main
-        .get(&sym)
-        .and_then(|ds| {
-            ds.iter().copied().find(|&id| {
-                idx.def(id).kind == DefKind::Enum && !idx.def(id).flags.contains(DefFlags::SYNTHETIC)
-            })
-        })
-    {
-        extend_member_candidates(idx, enm, &mut seen, &mut out);
+    // B3：namespace 聚合成员（跨文件）+ class 兼任 namespace 的 StaticClass
+    //（B4）+ enum 值（`EColor::`——裸值不可用，asEP_REQUIRE_ENUM_SCOPE=1）。
+    // struct 兼任 namespace 但无合成成员（无 UClass）。
+    for nsdef in ws.namespaces_named(sym) {
+        match ws.decl(&nsdef).kind {
+            DefKind::Enum => {
+                extend_member_candidates(ws, nsdef, &mut seen, &mut out);
+            }
+            DefKind::Namespace => {
+                extend_member_candidates(ws, nsdef, &mut seen, &mut out);
+            }
+            _ => {
+                // class / struct：只合成成员（StaticClass），不列实例成员
+                for m in ws.synthetic_members(&nsdef) {
+                    if seen.insert(m.name) {
+                        out.push(synthetic_candidate(ws, &m, HINT_MEMBER));
+                    }
+                }
+            }
+        }
     }
     out
 }
@@ -500,7 +521,7 @@ fn scoped_candidates(
 // ---------------------------------------------------------------------------
 
 fn call_arg_candidates(
-    idx: &WorkspaceIndex,
+    ws: &Workspace,
     ctx: &SemCtx,
     src: &str,
     callee: Node<'_>,
@@ -509,11 +530,11 @@ fn call_arg_candidates(
 ) -> Vec<Candidate> {
     let mut out = Vec::new();
     // 命名实参：callee 重载组形参并集（跳过 InArgN 占位 / 已提供名）
-    if let Some(defs) = callee_overloads(idx, ctx, src, callee) {
+    if let Some(defs) = callee_overloads(ws, ctx, src, callee) {
         let provided: HashSet<Sym> = provided_named_args(args, src, prefix);
         let mut seen: HashSet<Sym> = HashSet::new();
         for &d in &defs {
-            let DefExtra::Callable { params, .. } = &idx.def(d).extra else { continue };
+            let RawExtra::Callable { params, .. } = &ws.decl(&d).extra else { continue };
             for p in params {
                 // InArgN 是占位而非真名（架构设计 §2.4.6 硬性）——
                 // UNNAMED_PARAM 索引期已标记（syntax::param_decls）
@@ -543,7 +564,7 @@ fn call_arg_candidates(
         }
     }
     // 裸标识符全集（局部 / 成员 / ns / 全局；hint 顺延）
-    out.extend(plain_universe(idx, ctx, prefix, /*detail_globs=*/ prefix.is_some(), HINT_NAMED_ARG + 1));
+    out.extend(plain_universe(ws, ctx, prefix, /*detail_globs=*/ prefix.is_some(), HINT_NAMED_ARG + 1));
     out
 }
 
@@ -551,36 +572,36 @@ fn call_arg_candidates(
 /// `callee` 是调用函数段节点（identifier / member_expression；错误恢复
 /// 形态下由 recover_error_ctx 从 ERROR 直接孩子中取出）。
 fn callee_overloads(
-    idx: &WorkspaceIndex,
+    ws: &Workspace,
     ctx: &SemCtx,
     src: &str,
     callee: Node<'_>,
-) -> Option<Vec<DefId>> {
+) -> Option<Vec<DeclRef>> {
     let f = callee;
     match f.kind() {
         "identifier" => {
             let name = intern_sym(syntax::text(f, src));
-            let res = resolve_callee(idx, ctx, name, 0)?;
-            let defs: Vec<DefId> = res
+            let res = resolve_callee(ws, ctx, name, 0)?;
+            let defs: Vec<DeclRef> = res
                 .targets
                 .iter()
                 .filter_map(|t| match t {
-                    Target::Def(id) => Some(*id),
-                    Target::Local(_) => None,
+                    Target::Def(r) => Some(*r),
+                    Target::Synthetic(_) | Target::Local(_) => None,
                 })
                 .collect();
             (!defs.is_empty()).then_some(defs)
         }
         "member_expression" => {
-            let recv = expr_type(idx, ctx, src, f.child_by_field_name("object")?)?;
+            let recv = expr_type(ws, ctx, src, f.child_by_field_name("object")?)?;
             let prop = f.child_by_field_name("property")?;
             let name = intern_sym(syntax::text(prop, src));
-            let space = member_search_space(idx, recv.base);
-            let mut cands = crate::resolve::members_named(idx, &space, name, |d| {
+            let space = member_search_space(ws, recv.base);
+            let mut cands = crate::resolve::members_named(ws, &space, name, |d| {
                 matches!(d.kind, DefKind::Method | DefKind::Function | DefKind::Operator)
             });
             if cands.is_empty() {
-                cands = crate::resolve::find_accessors(idx, &space, name);
+                cands = crate::resolve::find_accessors(ws, &space, name);
             }
             (!cands.is_empty()).then_some(cands)
         }
@@ -686,7 +707,7 @@ fn is_second_string_arg(call: Node<'_>, lit: Node<'_>) -> bool {
 /// 脚本侧 `UFUNCTION()` 宏（SCRIPT_UFUNCTION flag）∪ `.d.as` 侧
 /// `@ufunction`/`@event` tag（TagKind::UFunction/Event）——的方法名。
 fn fname_ufunction_candidates(
-    idx: &WorkspaceIndex,
+    ws: &Workspace,
     ctx: &SemCtx,
     src: &str,
     call: Node<'_>,
@@ -704,16 +725,15 @@ fn fname_ufunction_candidates(
         .collect::<Vec<_>>();
     let recv = args
         .first()
-        .and_then(|a| expr_type(idx, ctx, src, *a).map(|t| t.base))
+        .and_then(|a| expr_type(ws, ctx, src, *a).map(|t| t.base))
         .or(ctx.type_def);
     let Some(recv) = recv else { return Vec::new() };
-    let space = member_search_space(idx, recv);
+    let space = member_search_space(ws, recv);
     let mut out = Vec::new();
     let mut seen: HashSet<Sym> = HashSet::new();
     for &t in &space {
-        let Some(ms) = idx.members.get(&t) else { continue };
-        for &m in ms {
-            let d = idx.def(m);
+        for m in ws.members(&t) {
+            let d = ws.decl(&m);
             if d.kind != DefKind::Method && d.kind != DefKind::Function {
                 continue;
             }
@@ -725,7 +745,7 @@ fn fname_ufunction_candidates(
                     )
                 });
             if is_ufunc && seen.insert(d.name) {
-                out.push(def_candidate(idx, m, 0));
+                out.push(def_candidate(ws, m, 0));
             }
         }
     }
@@ -735,14 +755,14 @@ fn fname_ufunction_candidates(
 const HINT_NAMED_ARG: u8 = 10;
 const HINT_MEMBER: u8 = 20;
 
-fn plain_candidates(idx: &WorkspaceIndex, ctx: &SemCtx, prefix: Option<&str>) -> Vec<Candidate> {
-    plain_universe(idx, ctx, prefix, /*detail_globs=*/ prefix.is_some(), HINT_MEMBER)
+fn plain_candidates(ws: &Workspace, ctx: &SemCtx, prefix: Option<&str>) -> Vec<Candidate> {
+    plain_universe(ws, ctx, prefix, /*detail_globs=*/ prefix.is_some(), HINT_MEMBER)
 }
 
 /// 裸标识符全集：局部 → 隐式 this 成员（含折叠/mixin）→ ns 链 → 全局/类型
 /// → 关键字。`base_hint` 是局部层的起始 hint（CallArg 场景顺延）。
 fn plain_universe(
-    idx: &WorkspaceIndex,
+    ws: &Workspace,
     ctx: &SemCtx,
     prefix: Option<&str>,
     detail_globs: bool,
@@ -759,7 +779,7 @@ fn plain_universe(
         out.push(Candidate {
             label,
             kind: if l.kind == DefKind::Param { CandidateKind::Param } else { CandidateKind::LocalVar },
-            detail: Some(hover::signature(idx, &Target::Local(l.clone())).unwrap_or_default()),
+            detail: Some(hover::signature(ws, &Target::Local(l.clone())).unwrap_or_default()),
             insert: None,
             sort_hint: base_hint,
         });
@@ -767,28 +787,28 @@ fn plain_universe(
 
     // 1. 隐式 this 成员（方法体内；引擎在类语境同样按成员解析，包括 default 块）
     if let Some(t) = ctx.type_def {
-        let space = member_search_space(idx, t);
+        let space = member_search_space(ws, t);
         let mut seen: HashSet<Sym> = HashSet::new();
         let mut members = Vec::new();
         for &u in &space {
-            extend_member_candidates_filtered(idx, u, &mut seen, &mut members, prefix);
+            extend_member_candidates_filtered(ws, u, &mut seen, &mut members, prefix);
         }
-        fold_accessors(idx, &space, &seen, &mut members);
+        fold_accessors(ws, &space, &seen, &mut members);
         for mut c in members {
             c.sort_hint = base_hint + 1;
             out.push(c);
         }
         // mixin（隐式 this 准入：方法体内引擎自动压 this，§4.5.1 条 2）
-        extend_mixin_candidates(idx, t, &ctx.ns_syms, base_hint + 1, &mut out);
+        extend_mixin_candidates(ws, t, &ctx.ns_syms, base_hint + 1, &mut out);
     }
 
     // 2. ns 链成员（逐级回退，近者在前）
     for &ns in ctx.ns_defs.iter().rev() {
-        let sym = idx.def(ns).name;
-        for nsdef in namespaces_named(idx, sym) {
+        let sym = ws.decl(&ns).name;
+        for nsdef in ws.namespaces_named(sym) {
             let mut seen: HashSet<Sym> = HashSet::new();
             let mut members = Vec::new();
-            extend_member_candidates_filtered(idx, nsdef, &mut seen, &mut members, prefix);
+            extend_member_candidates_filtered(ws, nsdef, &mut seen, &mut members, prefix);
             for mut c in members {
                 c.sort_hint = base_hint + 2;
                 out.push(c);
@@ -796,17 +816,17 @@ fn plain_universe(
         }
     }
 
-    // 3. 全局符号 + 类型（main 全表；有前缀先按名过滤，无前缀不带 detail）
-    for (sym, defs) in idx.main.iter() {
+    // 3. 全局符号 + 类型（agg.main 全表；有前缀先按名过滤，无前缀不带 detail）
+    for (sym, defs) in ws.agg.main.iter() {
         let label = sym_str(*sym);
         if !prefix_match(label, prefix) {
             continue;
         }
         // 该名字下的候选：取首个可见者（局部/成员层未覆盖时才落到这——
         // finish 的按 label 去重会保 hint 更小者）
-        let mut picked: Option<(DefId, CandidateKind)> = None;
-        for &id in defs {
-            let d = idx.def(id);
+        let mut picked: Option<(DeclRef, CandidateKind)> = None;
+        for &r in defs {
+            let d = ws.decl(&r);
             if d.flags.contains(DefFlags::NOT_CALLABLE) {
                 continue;
             }
@@ -833,31 +853,31 @@ fn plain_universe(
             // local 函数：跨模块不可见（visible_global 同语义；模块信息缺失
             // 时不过滤）
             if d.flags.contains(DefFlags::LOCAL) {
-                match (idx.modules.get(&d.file), idx.modules.get(&ctx.file)) {
+                match (ws.module_of(r.file), ws.module_of(ctx.file)) {
                     (Some(a), Some(b)) if a != b => continue,
                     _ => {}
                 }
             }
             match picked {
-                None => picked = Some((id, kind)),
+                None => picked = Some((r, kind)),
                 // 类型声明优先于其它（同名时补全里类型更有辨识度）
                 Some((_, CandidateKind::Class | CandidateKind::Struct | CandidateKind::Enum | CandidateKind::Delegate)) => {}
                 Some((pid, pk)) => {
                     if matches!(kind, CandidateKind::Class | CandidateKind::Struct | CandidateKind::Enum | CandidateKind::Delegate)
                         && !matches!(pk, CandidateKind::Class | CandidateKind::Struct | CandidateKind::Enum | CandidateKind::Delegate)
                     {
-                        picked = Some((id, kind));
+                        picked = Some((r, kind));
                         let _ = pid;
                     }
                 }
             }
         }
-        if let Some((id, kind)) = picked {
+        if let Some((r, kind)) = picked {
             out.push(Candidate {
                 label: label.to_string(),
                 kind,
                 detail: if detail_globs {
-                    hover::signature(idx, &Target::Def(id))
+                    hover::signature(ws, &Target::Def(r))
                 } else {
                     None
                 },
@@ -897,15 +917,14 @@ fn prefix_match(label: &str, prefix: Option<&str>) -> bool {
 /// [`extend_member_candidates`] 的带前缀版本（先按名过滤，detail 只对幸存者
 /// 渲染——无前缀时 member 层带 detail，量级 = 单类型成员数，可承受）。
 fn extend_member_candidates_filtered(
-    idx: &WorkspaceIndex,
-    owner: DefId,
+    ws: &Workspace,
+    owner: DeclRef,
     seen: &mut HashSet<Sym>,
     out: &mut Vec<Candidate>,
     prefix: Option<&str>,
 ) {
-    let Some(ms) = idx.members.get(&owner) else { return };
-    for &m in ms {
-        let d = idx.def(m);
+    for m in ws.members(&owner) {
+        let d = ws.decl(&m);
         if d.flags.contains(DefFlags::NOT_CALLABLE) {
             continue;
         }
@@ -922,7 +941,7 @@ fn extend_member_candidates_filtered(
         if !prefix_match(label, prefix) {
             continue;
         }
-        out.push(def_candidate(idx, m, 0)); // hint 由调用方改写
+        out.push(def_candidate(ws, m, 0)); // hint 由调用方改写
     }
 }
 
@@ -930,12 +949,23 @@ fn extend_member_candidates_filtered(
 // 公共构件
 // ---------------------------------------------------------------------------
 
-fn def_candidate(idx: &WorkspaceIndex, id: DefId, sort_hint: u8) -> Candidate {
-    let d = idx.def(id);
+fn def_candidate(ws: &Workspace, r: DeclRef, sort_hint: u8) -> Candidate {
+    let d = ws.decl(&r);
     Candidate {
         label: sym_str(d.name).to_string(),
         kind: kind_of(d.kind),
-        detail: hover::signature(idx, &Target::Def(id)),
+        detail: hover::signature(ws, &Target::Def(r)),
+        insert: None,
+        sort_hint,
+    }
+}
+
+/// 合成成员候选（B4）：签名经 hover::signature(Target::Synthetic) 同源渲染。
+fn synthetic_candidate(ws: &Workspace, m: &crate::workspace::SyntheticMember, sort_hint: u8) -> Candidate {
+    Candidate {
+        label: sym_str(m.name).to_string(),
+        kind: kind_of(m.kind),
+        detail: hover::signature(ws, &Target::Synthetic(m.clone())),
         insert: None,
         sort_hint,
     }
@@ -999,11 +1029,10 @@ const KEYWORDS: &[&str] = &[
 mod tests {
     use super::*;
     use crate::config::IndexConfig;
-    use crate::id::FileId;
-    use crate::index::{FileInput, FileKind};
     use crate::intern::intern_file;
+    use crate::workspace::{FileInput, FileKind};
 
-    fn build(srcs: &[(&str, &str)]) -> WorkspaceIndex {
+    fn build(srcs: &[(&str, &str)]) -> Workspace {
         let inputs = srcs
             .iter()
             .map(|(path, src)| FileInput {
@@ -1013,7 +1042,7 @@ mod tests {
                 module: None,
             })
             .collect();
-        WorkspaceIndex::build(IndexConfig::default(), inputs)
+        Workspace::build(IndexConfig::default(), inputs)
     }
 
     fn off(src: &str, needle: &str) -> u32 {
@@ -1056,10 +1085,10 @@ class CDerived : ABase
     }
 }
 ";
-        let idx = build(&[("unique://cmp/member.as", SRC)]);
+        let ws = build(&[("unique://cmp/member.as", SRC)]);
         let file = file_of("unique://cmp/member.as");
         // 光标在 "D." 之后（'.' 的下一字节）
-        let cands = complete_at(&idx, file, at(SRC, "D.", 2));
+        let cands = complete_at(&ws, file, at(SRC, "D.", 2));
         let ls = labels(&cands);
         for want in ["BaseField", "BaseFn", "DerivedField", "DerivedFn"] {
             assert!(ls.contains(&want.to_string()), "应含 {want}: {ls:?}");
@@ -1085,9 +1114,9 @@ class C
     }
 }
 ";
-        let idx = build(&[("unique://cmp/fold.as", SRC)]);
+        let ws = build(&[("unique://cmp/fold.as", SRC)]);
         let file = file_of("unique://cmp/fold.as");
-        let cands = complete_at(&idx, file, at(SRC, "C2.", 3));
+        let cands = complete_at(&ws, file, at(SRC, "C2.", 3));
         let ls = labels(&cands);
         assert!(ls.contains(&"Health".to_string()), "访问器折叠出 Health: {ls:?}");
         // GetMana 带 @notProperty：不折叠，但方法本体照列
@@ -1104,18 +1133,70 @@ void F()
     Unknown.
 }
 ";
-        let idx = build(&[("unique://cmp/unk.as", SRC)]);
+        let ws = build(&[("unique://cmp/unk.as", SRC)]);
         let file = file_of("unique://cmp/unk.as");
-        let cands = complete_at(&idx, file, at(SRC, "Unknown.", 8));
+        let cands = complete_at(&ws, file, at(SRC, "Unknown.", 8));
         assert!(cands.is_empty(), "不可定型接收者不给候选");
     }
 
+    #[test]
+    fn member_completion_delegate_synthetic_members() {
+        // B4：委托接收者的 `X.` 补全含合成成员（Execute / ExecuteIfBound /
+        // BindUFunction）；ctor / opAssign 不进（与真实成员同规则）
+        const SRC: &str = "\
+delegate void FOnHit(int Damage);
+class A
+{
+    FOnHit OnHit;
+    void M()
+    {
+        OnHit.
+    }
+}
+";
+        let ws = build(&[("unique://cmp/dlg.as", SRC)]);
+        let file = file_of("unique://cmp/dlg.as");
+        let cands = complete_at(&ws, file, at(SRC, "OnHit.", 6));
+        let ls = labels(&cands);
+        for want in ["Execute", "ExecuteIfBound", "BindUFunction"] {
+            assert!(ls.contains(&want.to_string()), "委托合成成员 {want}: {ls:?}");
+        }
+        assert!(!ls.contains(&"opAssign".to_string()), "opAssign 不补: {ls:?}");
+        assert!(
+            !ls.iter().any(|l| l == "FOnHit"),
+            "构造函数不进补全: {ls:?}"
+        );
+    }
+
+    #[test]
+    fn member_completion_class_receiver_no_static_class() {
+        // class 实例接收者的 `X.` 补全不含 StaticClass（静态语境成员，
+        // 与旧架构一致——只在 `类名::` 语境出现）
+        const SRC: &str = "\
+class C
+{
+    int Field;
+    void M()
+    {
+        C X;
+        X.
+    }
+}
+";
+        let ws = build(&[("unique://cmp/sc.as", SRC)]);
+        let file = file_of("unique://cmp/sc.as");
+        let cands = complete_at(&ws, file, at(SRC, "X.", 2));
+        let ls = labels(&cands);
+        assert!(ls.contains(&"Field".to_string()), "实例成员: {ls:?}");
+        assert!(!ls.contains(&"StaticClass".to_string()), "StaticClass 不进实例补全: {ls:?}");
+    }
+
     // ------------------------------------------------------------------
-    // `A::` 命名空间 / enum
+    // `A::` 命名空间 / enum / StaticClass
     // ------------------------------------------------------------------
 
     #[test]
-    fn scoped_completion_namespace_and_enum() {
+    fn scoped_completion_namespace_enum_and_static_class() {
         const SRC: &str = "\
 namespace FVector
 {
@@ -1123,24 +1204,31 @@ namespace FVector
     float64 OneVector;
 }
 enum EColor { Red, Green, Blue }
+class AActor {}
 void F()
 {
     FVector::
     EColor C = EColor::
+    UClass D = AActor::S
 }
 ";
-        let idx = build(&[("unique://cmp/scoped.as", SRC)]);
+        let ws = build(&[("unique://cmp/scoped.as", SRC)]);
         let file = file_of("unique://cmp/scoped.as");
-        let cands = complete_at(&idx, file, at(SRC, "FVector::", 10));
+        let cands = complete_at(&ws, file, at(SRC, "FVector::", 10));
         let ls = labels(&cands);
         assert!(ls.contains(&"ZeroVector".to_string()), "ns 成员: {ls:?}");
         assert!(ls.contains(&"OneVector".to_string()), "ns 成员: {ls:?}");
         // enum 值（第 2 个 "EColor::"）
-        let cands = complete_at(&idx, file, at(SRC, "EColor C = EColor::", 20));
+        let cands = complete_at(&ws, file, at(SRC, "EColor C = EColor::", 20));
         let ls = labels(&cands);
         for want in ["Red", "Green", "Blue"] {
             assert!(ls.contains(&want.to_string()), "enum 值 {want}: {ls:?}");
         }
+        // class 兼任 namespace：StaticClass（B3/B4）——`AActor::S|`（部分
+        // 输入形态；裸 `AActor::` 行尾会被 GLR 解析吞并，语境归不到 Scoped）
+        let cands = complete_at(&ws, file, at(SRC, "AActor::S", 9));
+        let ls = labels(&cands);
+        assert_eq!(ls, vec!["StaticClass".to_string()], "AActor:: 只给 StaticClass: {ls:?}");
     }
 
     // ------------------------------------------------------------------
@@ -1157,10 +1245,10 @@ void F()
     Print(\"x\", Du
 }
 ";
-        let idx = build(&[("unique://cmp/narg.as", SRC)]);
+        let ws = build(&[("unique://cmp/narg.as", SRC)]);
         let file = file_of("unique://cmp/narg.as");
         // 光标在 "Du" 之后（实参位、前缀 Du；needle 7 字节 + 尾后 0 偏移）
-        let cands = complete_at(&idx, file, at(SRC, "\"x\", Du", 7));
+        let cands = complete_at(&ws, file, at(SRC, "\"x\", Du", 7));
         let named: Vec<&Candidate> = cands.iter().filter(|c| c.kind == CandidateKind::NamedArg).collect();
         let ls: Vec<&str> = named.iter().map(|c| c.label.as_str()).collect();
         assert_eq!(ls, vec!["Duration"], "命中唯一命名实参 Duration: {ls:?}");
@@ -1177,10 +1265,10 @@ void F()
     SetX(1.0, 
 }
 ";
-        let idx = build(&[("unique://cmp/inarg.as", SRC)]);
+        let ws = build(&[("unique://cmp/inarg.as", SRC)]);
         let file = file_of("unique://cmp/inarg.as");
         // 光标在 ", " 之后（10 = needle 长度；空白左偏落回实参语境）
-        let cands = complete_at(&idx, file, at(SRC, "SetX(1.0, ", 10));
+        let cands = complete_at(&ws, file, at(SRC, "SetX(1.0, ", 10));
         for c in &cands {
             if c.kind == CandidateKind::NamedArg {
                 assert!(
@@ -1204,9 +1292,9 @@ void F()
     Print(\"x\", Duration=1.0, 
 }
 ";
-        let idx = build(&[("unique://cmp/prov.as", SRC)]);
+        let ws = build(&[("unique://cmp/prov.as", SRC)]);
         let file = file_of("unique://cmp/prov.as");
-        let cands = complete_at(&idx, file, at(SRC, "Duration=1.0, ", 15));
+        let cands = complete_at(&ws, file, at(SRC, "Duration=1.0, ", 15));
         let named: Vec<&str> =
             cands.iter().filter(|c| c.kind == CandidateKind::NamedArg).map(|c| c.label.as_str()).collect();
         assert!(!named.contains(&"Duration"), "已提供的不重复: {named:?}");
@@ -1229,11 +1317,11 @@ class C
     }
 }
 ";
-        let idx = build(&[("unique://cmp/plain.as", SRC)]);
+        let ws = build(&[("unique://cmp/plain.as", SRC)]);
         let file = file_of("unique://cmp/plain.as");
         // 前缀 Lo → LocalOne（局部层）在最前；关键字 local 同前缀属预期
         //（大小写不敏感匹配）
-        let cands = complete_at(&idx, file, at(SRC, "= Lo", 4));
+        let cands = complete_at(&ws, file, at(SRC, "= Lo", 4));
         let ls = labels(&cands);
         assert_eq!(ls.first(), Some(&"LocalOne".to_string()), "局部层最前: {ls:?}");
         assert!(ls.contains(&"local".to_string()), "关键字 local 同前缀: {ls:?}");
@@ -1248,9 +1336,9 @@ class C
     }
 }
 ";
-        let idx2 = build(&[("unique://cmp/plain2.as", SRC2)]);
+        let ws2 = build(&[("unique://cmp/plain2.as", SRC2)]);
         let file2 = file_of("unique://cmp/plain2.as");
-        let cands = complete_at(&idx2, file2, at(SRC2, "int X = ", 8));
+        let cands = complete_at(&ws2, file2, at(SRC2, "int X = ", 8));
         let ls = labels(&cands);
         for want in ["ParamOne", "MemberField", "this", "return"] {
             assert!(ls.contains(&want.to_string()), "应含 {want}: {ls:?}");
@@ -1266,10 +1354,10 @@ void F()
     FString S = \"inside string\";
 }
 ";
-        let idx = build(&[("unique://cmp/noise.as", SRC)]);
+        let ws = build(&[("unique://cmp/noise.as", SRC)]);
         let file = file_of("unique://cmp/noise.as");
-        assert!(complete_at(&idx, file, at(SRC, "// comment", 5)).is_empty(), "注释内不补");
-        assert!(complete_at(&idx, file, at(SRC, "\"inside", 3)).is_empty(), "字符串内不补");
+        assert!(complete_at(&ws, file, at(SRC, "// comment", 5)).is_empty(), "注释内不补");
+        assert!(complete_at(&ws, file, at(SRC, "\"inside", 3)).is_empty(), "字符串内不补");
     }
 
     // ------------------------------------------------------------------
@@ -1288,14 +1376,14 @@ class C
 UFUNCTION(
 void F() {}
 ";
-        let idx = build(&[("unique://cmp/spec.as", SRC)]);
+        let ws = build(&[("unique://cmp/spec.as", SRC)]);
         let file = file_of("unique://cmp/spec.as");
         // UCLASS(Pla| ：光标在 Pla 尾端点（needle 10 字符）→ 前缀 Pla
-        let cands = complete_at(&idx, file, at(SRC, "UCLASS(Pla", 10));
+        let cands = complete_at(&ws, file, at(SRC, "UCLASS(Pla", 10));
         let ls = labels(&cands);
         assert_eq!(ls, vec!["Placeable"], "前缀 Pla: {ls:?}");
         // UFUNCTION(| ：全表（首项按 label 序）
-        let cands = complete_at(&idx, file, at(SRC, "UFUNCTION(", 10));
+        let cands = complete_at(&ws, file, at(SRC, "UFUNCTION(", 10));
         let ls = labels(&cands);
         assert!(ls.contains(&"BlueprintCallable".to_string()), "UFUNCTION 表: {ls:?}");
         assert!(ls.contains(&"Meta".to_string()), "UFUNCTION 表: {ls:?}");
@@ -1309,10 +1397,10 @@ void F() {}
 UFUNCTION(Category=\"Math\")
 void F() {}
 ";
-        let idx = build(&[("unique://cmp/specval.as", SRC)]);
+        let ws = build(&[("unique://cmp/specval.as", SRC)]);
         let file = file_of("unique://cmp/specval.as");
         // "Math" 字符串内
-        assert!(complete_at(&idx, file, at(SRC, "\"Math", 3)).is_empty(), "宏值字符串内不给");
+        assert!(complete_at(&ws, file, at(SRC, "\"Math", 3)).is_empty(), "宏值字符串内不给");
     }
 
     #[test]
@@ -1321,10 +1409,10 @@ void F() {}
 UFUNCTION(Blue
 void F() {}
 ";
-        let idx = build(&[("unique://cmp/specpfx.as", SRC)]);
+        let ws = build(&[("unique://cmp/specpfx.as", SRC)]);
         let file = file_of("unique://cmp/specpfx.as");
         // 光标在 Blue 尾端点（needle 14 字符）→ 前缀 Blue
-        let cands = complete_at(&idx, file, at(SRC, "UFUNCTION(Blue", 14));
+        let cands = complete_at(&ws, file, at(SRC, "UFUNCTION(Blue", 14));
         let ls = labels(&cands);
         for want in ["BlueprintCallable", "BlueprintEvent", "BlueprintOverride", "BlueprintPure", "BlueprintProtected"] {
             assert!(ls.contains(&want.to_string()), "前缀 Blue 应含 {want}: {ls:?}");
@@ -1353,10 +1441,10 @@ class C
     }
 }
 ";
-        let idx = build(&[("unique://cmp/fname.as", SRC)]);
+        let ws = build(&[("unique://cmp/fname.as", SRC)]);
         let file = file_of("unique://cmp/fname.as");
         // 光标在 n"My 之后（第 2 实参、前缀 My）
-        let cands = complete_at(&idx, file, at(SRC, "n\"My", 4));
+        let cands = complete_at(&ws, file, at(SRC, "n\"My", 4));
         let ls = labels(&cands);
         assert_eq!(ls, vec!["MyEvent"], "UFUNCTION 名单 + 前缀 My: {ls:?}");
     }
@@ -1370,9 +1458,9 @@ void F()
     FName N = n\"Any
 }
 ";
-        let idx = build(&[("unique://cmp/fname2.as", SRC)]);
+        let ws = build(&[("unique://cmp/fname2.as", SRC)]);
         let file = file_of("unique://cmp/fname2.as");
-        assert!(complete_at(&idx, file, at(SRC, "n\"Any", 5)).is_empty());
+        assert!(complete_at(&ws, file, at(SRC, "n\"Any", 5)).is_empty());
     }
 
     #[test]
@@ -1387,9 +1475,9 @@ void F()
 }
 void Print(const FString&in Message, float64 Duration = 0.0) {}
 ";
-        let idx = build(&[("unique://cmp/carg.as", SRC)]);
+        let ws = build(&[("unique://cmp/carg.as", SRC)]);
         let file = file_of("unique://cmp/carg.as");
-        let cands = complete_at(&idx, file, at(SRC, "Print(", 6));
+        let cands = complete_at(&ws, file, at(SRC, "Print(", 6));
         let ls = labels(&cands);
         assert!(ls.contains(&"Duration".to_string()), "命名实参: {ls:?}");
         assert!(ls.contains(&"LocalVal".to_string()), "局部也可见: {ls:?}");
