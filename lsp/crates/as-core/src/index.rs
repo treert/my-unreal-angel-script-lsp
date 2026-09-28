@@ -16,7 +16,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use rayon::prelude::*;
 
 use as_syntax::tree_sitter::Node;
-use as_syntax::SyntaxError;
 
 use crate::decl_tags::{parse_comment_texts, TagKind, TagValue};
 use crate::config::IndexConfig;
@@ -68,12 +67,15 @@ pub fn filename_to_module_name(rel_path: &str) -> String {
 }
 
 /// 每文件的持久快照（CST + 行首表是 Phase 2 产物，规划 §4）。
+///
+/// 不含错误节点清单：`.d.as` 导出物必然合法，启动期全量收集纯属浪费
+/// （借鉴 mylua）——错误收集挪到诊断期按需（`as_syntax::verify_tree`
+/// 的 `has_error()` 剪枝对合法文件 O(1)），数据源是当时的树。
 pub struct FileSnapshot {
     pub kind: FileKind,
     pub source: String,
     pub tree: as_syntax::tree_sitter::Tree,
     pub lines: LineIndex,
-    pub errors: Vec<SyntaxError>,
     /// UseSite 记录（Phase 2 产物 / D5：`(name, span, 语法角色)`，不解析）。
     /// 解析（Phase 3）由 `references::resolve_file_uses` 请求驱动 + 按文件缓存。
     pub uses: Vec<UseSite>,
@@ -139,7 +141,6 @@ impl WorkspaceIndex {
         let mut parsed: Vec<(
             FileInput,
             as_syntax::tree_sitter::Tree,
-            Vec<SyntaxError>,
             LineIndex,
             std::time::Duration,
         )> = inputs
@@ -148,9 +149,8 @@ impl WorkspaceIndex {
                 let t = std::time::Instant::now();
                 let tree = as_syntax::parse(&input.source, None);
                 let parse_dur = t.elapsed();
-                let errors = as_syntax::verify_tree(&tree);
                 let lines = LineIndex::new(&input.source);
-                (input, tree, errors, lines, parse_dur)
+                (input, tree, lines, parse_dur)
             })
             .collect();
         let t_parse = t0.elapsed();
@@ -159,7 +159,7 @@ impl WorkspaceIndex {
         if crate::logger::enabled() {
             let mut slowest: Vec<(std::time::Duration, String)> = parsed
                 .iter()
-                .map(|(input, _, _, _, d)| {
+                .map(|(input, _, _, d)| {
                     (
                         *d,
                         crate::intern::file_path(input.file)
@@ -179,7 +179,7 @@ impl WorkspaceIndex {
         // .d.as）还是均匀分布——决定优化方向（单文件热点 vs 整阶段并行化）
         let mut per_file: Vec<(std::time::Duration, std::time::Duration, String)> = Vec::new();
         let logging = crate::logger::enabled();
-        for (input, tree, errors, lines, _) in parsed {
+        for (input, tree, lines, _) in parsed {
             let path = logging
                 .then(|| {
                     crate::intern::file_path(input.file)
@@ -187,7 +187,7 @@ impl WorkspaceIndex {
                         .unwrap_or_else(|| "<unknown>".to_string())
                 })
                 .unwrap_or_default();
-            let (t_extract, t_uses) = idx.add_file(input, tree, errors, lines);
+            let (t_extract, t_uses) = idx.add_file(input, tree, lines);
             if logging {
                 per_file.push((t_extract, t_uses, path));
             }
@@ -269,7 +269,6 @@ impl WorkspaceIndex {
         &mut self,
         input: FileInput,
         tree: as_syntax::tree_sitter::Tree,
-        errors: Vec<SyntaxError>,
         lines: LineIndex,
     ) -> (std::time::Duration, std::time::Duration) {
         let file = input.file;
@@ -314,7 +313,6 @@ impl WorkspaceIndex {
                 source: input.source,
                 tree,
                 lines,
-                errors,
                 uses,
                 group,
                 cache_format,
@@ -810,14 +808,8 @@ impl WorkspaceIndex {
         let before = self.decl_surface(file);
         self.remove_file_defs(file);
         let tree = as_syntax::parse(&source, None);
-        let errors = as_syntax::verify_tree(&tree);
         let lines = LineIndex::new(&source);
-        self.add_file(
-            FileInput { file, kind, module, source },
-            tree,
-            errors,
-            lines,
-        );
+        self.add_file(FileInput { file, kind, module, source }, tree, lines);
         crate::expand::expand_all(self);
         self.build_closures();
         self.resolve_decl_types_in(Some(file));

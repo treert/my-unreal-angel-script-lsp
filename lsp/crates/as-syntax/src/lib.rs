@@ -67,13 +67,25 @@ pub fn verify(src: &str) -> Vec<SyntaxError> {
 }
 
 /// 校验既有 CST（复用树时避免重复 parse）。
+///
+/// `has_error()` 剪枝（借鉴 mylua）：tree-sitter 每节点维护「子树含错」位，
+/// 合法文件的根即 false ⇒ 整棵树 O(1) 跳过——错误收集按需（诊断期）调用
+/// 时，合法文件零遍历。遍历全程共用一个 `TreeCursor`（每节点 `node.walk()`
+/// 的 FFI malloc/free 是 `.d.as` 量级的性能热点，见 uses.rs 同款修复）。
 pub fn verify_tree(tree: &Tree) -> Vec<SyntaxError> {
     let mut out = Vec::new();
-    walk_errors(tree.root_node(), &mut out);
+    let root = tree.root_node();
+    if root.has_error() {
+        let mut c = root.walk();
+        walk_errors(&mut c, &mut out);
+    }
     out
 }
 
-fn walk_errors(node: tree_sitter::Node<'_>, out: &mut Vec<SyntaxError>) {
+/// `cursor` 定位在待检节点上（is_error / is_missing 的节点不深入——
+/// 既有契约：不深入 ERROR 子树重复计数）。
+fn walk_errors(c: &mut tree_sitter::TreeCursor, out: &mut Vec<SyntaxError>) {
+    let node = c.node();
     if node.is_missing() {
         out.push(SyntaxError {
             kind: SyntaxErrorKind::Missing,
@@ -92,14 +104,18 @@ fn walk_errors(node: tree_sitter::Node<'_>, out: &mut Vec<SyntaxError>) {
         });
         return;
     }
-    let mut cursor = node.walk();
-    if cursor.goto_first_child() {
+    // 清洁子树剪枝：has_error() false ⇒ 子树内无 ERROR/MISSING，跳过
+    if !node.has_error() {
+        return;
+    }
+    if c.goto_first_child() {
         loop {
-            walk_errors(cursor.node(), out);
-            if !cursor.goto_next_sibling() {
+            walk_errors(c, out);
+            if !c.goto_next_sibling() {
                 break;
             }
         }
+        c.goto_parent();
     }
 }
 

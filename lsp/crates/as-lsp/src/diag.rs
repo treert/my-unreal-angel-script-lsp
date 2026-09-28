@@ -2,7 +2,7 @@
 //!
 //! 时序：
 //! - `didOpen` / `didChange` 后（**Ready 时**）同步计算该文件诊断并推送——
-//!   `verify_tree` 是 O(文件) 树走、毫秒级，**不做防抖**；
+//!   `verify_tree` 经 `has_error()` 剪枝（合法文件 O(1)），**不做防抖**；
 //! - `didClose` → 推空数组清空（Loading 期清空同样安全）；
 //! - **Loading 期不推**；Ready 发布瞬间（`publish_and_replay`）经 diag 通道
 //!   补推全部已打开文档——覆盖 Loading 期打开的文件，且 AS0902 的 decl

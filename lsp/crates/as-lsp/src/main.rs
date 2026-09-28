@@ -432,8 +432,8 @@ impl LanguageServer for Backend {
                     store.apply_changes(file, params.text_document.version, changes);
                 }
             }
-            // M6（D36）：Ready 时同步推送（verify_tree O(文件) 树走毫秒级，
-            // 不做防抖；体感卡顿再补）
+            // M6（D36）：Ready 时同步推送（verify_tree 经 has_error 剪枝，
+            // 合法文件 O(1)；不做防抖，体感卡顿再补）
             if self.ws.is_ready() {
                 diag::publish_file(&self.client, &self.docs, &self.ws, &path).await;
             }

@@ -17,7 +17,7 @@ use clap::{Parser, Subcommand};
 
 use as_core::as_syntax::tree_sitter::{Node, Tree};
 use as_core::as_syntax::{self, SyntaxErrorKind};
-use as_core::id::DefId;
+use as_core::id::{DefId, FileId};
 use as_core::intern::{file_path, intern_file};
 use as_core::{DefFlags, DefKind, FileInput, FileKind, IndexConfig, WorkspaceIndex};
 
@@ -278,24 +278,29 @@ fn dump_index(
     println!("config: float_is_float64={float_is_float64}");
     let idx = WorkspaceIndex::build(config, inputs);
 
-    // 文件统计
+    // 文件统计（错误节点清单已不在快照里——诊断期按需收集（mylua 同款）；
+    // CLI 的批量校验口径不变：has_error 剪枝对合法文件 O(1)）
     let (mut n_script, mut n_decl, mut n_err) = (0usize, 0usize, 0usize);
+    let err_counts: Vec<(FileId, usize)> = idx
+        .files
+        .iter()
+        .filter_map(|(file, snap)| {
+            let n = as_syntax::verify_tree(&snap.tree).len();
+            (n > 0).then_some((*file, n))
+        })
+        .collect();
     for snap in idx.files.values() {
         match snap.kind {
             FileKind::Script => n_script += 1,
             FileKind::Decl => n_decl += 1,
         }
-        if !snap.errors.is_empty() {
-            n_err += 1;
-        }
     }
+    n_err = err_counts.len();
     println!("files: {} (script {n_script}, decl {n_decl}, parse-error {n_err})", idx.files.len());
     if n_err > 0 {
-        for (file, snap) in &idx.files {
-            if !snap.errors.is_empty() {
-                let path = file_path(*file).unwrap_or("?");
-                println!("  ERR {path}: {} error node(s)", snap.errors.len());
-            }
+        for (file, n) in &err_counts {
+            let path = file_path(*file).unwrap_or("?");
+            println!("  ERR {path}: {n} error node(s)");
         }
     }
 
