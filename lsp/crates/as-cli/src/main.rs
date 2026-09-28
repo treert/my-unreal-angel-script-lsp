@@ -306,7 +306,9 @@ fn dump_index(
                     (file, s)
                 })
                 .collect();
-        let agg = as_core::Aggregation::build(&summaries);
+        let agg = as_core::Aggregation::build(
+            &summaries.iter().map(|(f, s)| (*f, s)).collect::<std::collections::HashMap<_, _>>(),
+        );
         let new_elapsed = t_new.elapsed();
 
         // 对账 ①：非合成声明总数（旧侧 SYNTHETIC = 内建 + delegate 展开

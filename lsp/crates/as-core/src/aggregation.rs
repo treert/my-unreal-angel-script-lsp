@@ -63,11 +63,12 @@ fn sort_key(r: &DeclRef) -> (u32, FileId, u32) {
 
 impl Aggregation {
     /// 冷启动：全部 summary 就绪后一遍扫描（mylua `build_initial` 同款——
-    /// 消除批序依赖）。O(总声明数)。
-    pub fn build(files: &HashMap<FileId, FileSummary>) -> Aggregation {
+    /// 消除批序依赖）。O(总声明数)。签名收**借用值** map（workspace.rs 的
+    /// FileEntry 持有 summary，避免整表 clone）。
+    pub fn build(files: &HashMap<FileId, &FileSummary>) -> Aggregation {
         let mut agg = Aggregation::default();
-        for (file, s) in files {
-            agg.absorb(*file, s);
+        for (&file, &s) in files {
+            agg.absorb(file, s);
         }
         // 单遍吸收后统一排序（确定性：排序键与插入序无关）
         for bucket in agg.main.values_mut().chain(agg.mixin_by_name.values_mut()) {
@@ -210,8 +211,9 @@ mod tests {
         files.insert(script, mk_summary("struct FVector3 {}\nvoid F() {}\n", None));
         files.insert(decl_a, mk_summary("struct FVector3 {}\n", None));
         files.insert(decl_b, mk_summary("struct FVector3 {}\n", None));
+        let borrowed: HashMap<_, _> = files.iter().map(|(f, s)| (*f, s)).collect();
 
-        let agg = Aggregation::build(&files);
+        let agg = Aggregation::build(&borrowed);
         let hits = agg.main.get(&intern_sym("FVector3")).unwrap();
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].file, script, "脚本根优先");
@@ -232,7 +234,8 @@ void AlsoMixin4(const FVector4&in V) mixin {}
         let f = intern_file("unique://aggm/m.as", 0);
         let mut files = HashMap::new();
         files.insert(f, mk_summary(src, None));
-        let agg = Aggregation::build(&files);
+        let borrowed: HashMap<_, _> = files.iter().map(|(f, s)| (*f, s)).collect();
+        let agg = Aggregation::build(&borrowed);
         let hits = agg.mixin_by_name.get(&intern_sym("FVector4")).unwrap();
         assert_eq!(hits.len(), 2, "前置与后置两种声明形式都进倒排");
         assert_eq!(agg.mixin_by_name.get(&intern_sym("TMissing")).unwrap().len(), 1);
@@ -249,7 +252,8 @@ void AlsoMixin4(const FVector4&in V) mixin {}
         let mut files = HashMap::new();
         files.insert(f1, v1.clone());
         files.insert(f2, other);
-        let mut agg = Aggregation::build(&files);
+        let borrowed: HashMap<_, _> = files.iter().map(|(f, s)| (*f, s)).collect();
+        let mut agg = Aggregation::build(&borrowed);
 
         // f1: F 删、G 增、Keep 不变；f2 的同名条目不受影响
         agg.replace_file(f1, &v1, &v2);
@@ -276,7 +280,8 @@ void AlsoMixin4(const FVector4&in V) mixin {}
         let mut files = HashMap::new();
         files.insert(decl, mk_summary("void F() {}\n", Some("MyMod")));
         files.insert(script, mk_summary("void F() {}\n", Some("MyMod")));
-        let mut agg = Aggregation::build(&files);
+        let borrowed: HashMap<_, _> = files.iter().map(|(f, s)| (*f, s)).collect();
+        let mut agg = Aggregation::build(&borrowed);
         assert_eq!(
             agg.module_file(intern_sym("MyMod")),
             Some(script),

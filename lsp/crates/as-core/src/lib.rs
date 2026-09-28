@@ -39,6 +39,7 @@ pub mod syntax;
 pub mod tokens;
 pub mod types;
 pub mod uses;
+pub mod workspace;
 
 pub use as_syntax;
 
