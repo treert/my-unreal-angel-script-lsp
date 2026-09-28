@@ -621,14 +621,43 @@ impl LanguageServer for Backend {
         &self,
         params: SemanticTokensParams,
     ) -> RpcResult<Option<SemanticTokensResult>> {
-        let Some((file, store)) = self.doc_of(&params.text_document.uri) else {
+        let Some(file) = uri_path(&params.text_document.uri)
+            .and_then(|p| as_core::intern::file_id_of_path(&p))
+        else {
             return Ok(None);
         };
-        let Some(doc) = store.get(file) else {
-            return Ok(None);
+        // 索引 Ready → 语义着色（使用点解析，tokens::semantic_tokens_indexed）。
+        // 注意：ensure_file_fresh 内部锁 docs，此处不可持有 DocStore 锁。
+        if self.ws.is_ready() {
+            self.ws.ensure_file_fresh(file, &self.docs);
+            let data = self
+                .ws
+                .with(|idx| {
+                    let entry = idx.files.get(&file)?;
+                    let raw = tokens::semantic_tokens_indexed(idx, file)?;
+                    Some(delta_encode(&raw, &entry.source, &entry.lines))
+                })
+                .flatten();
+            if let Some(data) = data {
+                return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+                    result_id: None,
+                    data,
+                })));
+            }
+        }
+        // Loading / 未入索引：回落 M2 CST 直映射（§6.1）
+        let (raw, text, lines) = {
+            let store = self.docs.lock().unwrap();
+            let Some(doc) = store.get(file) else {
+                return Ok(None);
+            };
+            (
+                tokens::semantic_tokens(doc.tree.root_node(), &doc.text),
+                doc.text.clone(),
+                doc.lines.clone(),
+            )
         };
-        let raw = tokens::semantic_tokens(doc.tree.root_node(), &doc.text);
-        let data = delta_encode(&raw, &doc.text, &doc.lines);
+        let data = delta_encode(&raw, &text, &lines);
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,
             data,

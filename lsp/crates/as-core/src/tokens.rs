@@ -3,18 +3,25 @@
 //! legend 对齐 Hazelight 扩展（`semantic_highlighting.ts` 的 SemanticTypeList，
 //! 19 类、同序）——验收即「与 Hazelight 同文件截图对照」（§9 M2）。
 //!
-//! M2 定性：**CST 直映射**（§6.1：冷启动 Loading 期间即可服务，不依赖索引）。
-//! 因此本层能给出的分类是语法可判定的子集：
-//! - 类型位（`type` 子树 / 基类 / asset 类型 / 构造调用的模板头）→ typename 族；
-//! - 声明名 → function/variable 族（按声明语境，不解析作用域）；
-//! - 表达式位的裸标识符**不着色**（需要查找链消歧局部/成员/全局——M3 起语义
-//!   着色接入后补，届时 actor/component 等分类也由索引给出）。
+//! 两层：
+//! - **M2 CST 直映射**（[`semantic_tokens`]，§6.1：冷启动 Loading 期间即可
+//!   服务，不依赖索引）——语法可判定的子集：类型位（`type` 子树 / 基类 /
+//!   asset 类型 / 构造调用的模板头）→ typename 族；声明名 → function/variable
+//!   族（按声明语境，不解析作用域）。
+//! - **M3 语义着色**（[`semantic_tokens_indexed`]，索引 Ready 后）：表达式位
+//!   裸标识符经查找链（`resolve`）消歧局部/形参/成员/全局后补 token——
+//!   使用点与声明同色。actor/component 等 subtype 分类（typename 族细分）
+//!   需基类链归类，仍留待后续。
 //!
 //! 产出为字节偏移 token；UTF-16 换算与 delta 编码归 as-lsp 边界。
 
 use as_syntax::tree_sitter::Node;
 
+use crate::id::FileId;
+use crate::resolve;
+use crate::symbol::DefKind;
 use crate::syntax;
+use crate::workspace::Workspace;
 
 /// Legend（**wire 名**，`as_` 前缀 + 与 Hazelight `SemanticTypeList` 同序——
 /// 其 server.ts 在声明 legend 时对内部名单做 `"as_" + t` 映射；索引即
@@ -83,6 +90,117 @@ pub fn semantic_tokens(root: Node<'_>, src: &str) -> Vec<SemanticToken> {
     walk(root, src, false, Ctx::Global, &mut out);
     out.sort_by_key(|t| (t.start, t.len));
     out
+}
+
+/// M3 语义着色：CST 直映射 + 使用点解析（索引 Ready 后的完整版）。
+///
+/// 遍历收集 CST 层未着色的 identifier（表达式位裸标识符 / 限定段 / 成员
+/// 访问段），逐个走查找链解析，按落点 DefKind 映射 legend 类型补 token。
+/// 解析失败（未定义 / 歧义不出唯一解）保持不着色；声明名等已有 CST
+/// token 的位置按 span 覆盖去重（解析它们只会得到同色，白费一次查找）。
+///
+/// 文件不在索引中（未入收集根）→ None（调用方回落 CST 直映射）。
+pub fn semantic_tokens_indexed(ws: &Workspace, file: FileId) -> Option<Vec<SemanticToken>> {
+    let entry = ws.files.get(&file)?;
+    let src = &entry.source;
+    let root = entry.tree.root_node();
+
+    // 覆盖判定只看 CST 基础 token（保持有序；语义 token 收集到独立 vec，
+    // 最后合并——混入同一 vec 会破坏 covered 的有序前提，M3 期实测曾因此
+    // 误跳过成员链上的 identifier）
+    let mut out = semantic_tokens(root, src);
+    let mut cands: Vec<Node<'_>> = Vec::new();
+    collect_usage_idents(root, src, &mut cands);
+    let mut usage: Vec<SemanticToken> = Vec::new();
+    for ident in cands {
+        let (s, e) = (ident.start_byte() as u32, ident.end_byte() as u32);
+        // 叶子节点与任意 token 的 span 只能是包含或不相交：起点早于 s 且
+        // 终点晚于 s 的 token（只可能是祖先）必已完整覆盖
+        if covered(&out, s) {
+            continue;
+        }
+        let Some(res) = resolve::resolve_at_node(ws, file, src, ident) else {
+            continue;
+        };
+        let Some(ty) = res.targets.first().and_then(|t| target_token_ty(ws, t)) else {
+            continue;
+        };
+        usage.push(SemanticToken { start: s, len: e - s, ty });
+    }
+    out.extend(usage);
+    out.sort_by_key(|t| (t.start, t.len));
+    Some(out)
+}
+
+/// 收集全部 identifier 节点（ERROR 子树不下钻——其内容本不该正常着色；
+/// 覆盖去重与 specifier 语境过滤在解析侧完成）。
+/// `this` 跳过：关键字表达式而非符号使用点（resolve 会给类声明，
+/// 着成 typename 是误导；`Super`/`super` 指代基类本身，保持 typename）。
+fn collect_usage_idents<'a>(node: Node<'a>, src: &str, out: &mut Vec<Node<'a>>) {
+    if node.is_error() {
+        return;
+    }
+    if node.kind() == "identifier" {
+        if syntax::text(node, src) != "this" {
+            out.push(node);
+        }
+        return;
+    }
+    for (_, child) in syntax::children_with_fields(node) {
+        collect_usage_idents(child, src, out);
+    }
+}
+
+/// `out` 已按 start 升序：存在 start ≤ s 且 end > s 的 token 即被覆盖。
+fn covered(out: &[SemanticToken], s: u32) -> bool {
+    let i = out.partition_point(|t| t.start <= s);
+    out[..i].iter().rev().any(|t| t.start + t.len > s)
+}
+
+/// 解析落点 → legend 下标（使用点与声明位同色：CST 层声明名的分类依据）。
+fn target_token_ty(ws: &Workspace, t: &resolve::Target) -> Option<u8> {
+    match t {
+        resolve::Target::Def(r) => {
+            let d = ws.decl(r);
+            Some(match d.kind {
+                DefKind::Namespace | DefKind::Module => NAMESPACE,
+                DefKind::Class | DefKind::Enum | DefKind::TypeParam => TYPENAME,
+                DefKind::Struct => TYPENAME_STRUCT,
+                DefKind::Delegate => TYPENAME_DELEGATE,
+                DefKind::Event => TYPENAME_EVENT,
+                DefKind::Function => GLOBAL_FUNCTION,
+                DefKind::Method
+                | DefKind::Constructor
+                | DefKind::Destructor
+                | DefKind::Operator => MEMBER_FUNCTION,
+                DefKind::GlobalVar | DefKind::AssetDecl => GLOBAL_VARIABLE,
+                DefKind::Field | DefKind::EnumValue => MEMBER_VARIABLE,
+                DefKind::Param => PARAMETER,
+                DefKind::LocalVar => LOCAL_VARIABLE,
+                // 虚属性按父声明归类：类型体成员 → member，否则 global
+                DefKind::VirtualProperty => {
+                    let in_type = d.parent.is_some_and(|p| {
+                        ws.files.get(&r.file).is_some_and(|e| {
+                            e.summary.decls.get(p as usize).is_some_and(|pd| pd.kind.is_type_decl())
+                        })
+                    });
+                    if in_type { MEMBER_ACCESSOR } else { GLOBAL_ACCESSOR }
+                }
+            })
+        }
+        // 合成成员（delegate/event 展开的 Execute 等 / StaticClass）：
+        // 依其 kind 同口径映射
+        resolve::Target::Synthetic(m) => Some(match m.kind {
+            DefKind::Method | DefKind::Function | DefKind::Constructor => MEMBER_FUNCTION,
+            DefKind::Field => MEMBER_VARIABLE,
+            _ => return None,
+        }),
+        resolve::Target::Local(l) => Some(match l.kind {
+            DefKind::Param => PARAMETER,
+            DefKind::LocalVar => LOCAL_VARIABLE,
+            _ => return None,
+        }),
+    }
 }
 
 fn push(out: &mut Vec<SemanticToken>, node: Node<'_>, ty: u8) {
@@ -415,11 +533,135 @@ void Main()
 
     #[test]
     fn expression_identifiers_not_colored() {
-        // M2：表达式位裸标识符不着色（查找链 M3 接入）
+        // M2 CST 层：表达式位裸标识符不着色（语义着色见下方 indexed 用例）
         let src = "void Main() { Foo(Bar); }\n";
         let tokens = tokens_of(src);
         assert!(!tokens.iter().any(|(t, _)| t == "Foo" || t == "Bar"));
         assert_has(&tokens, "Main", GLOBAL_FUNCTION);
+    }
+
+    // ---- M3 语义着色（索引版）----
+
+    use crate::config::IndexConfig;
+    use crate::intern::intern_file;
+    use crate::workspace::{FileInput, FileKind};
+
+    fn indexed_tokens_of(src: &str) -> Vec<(String, u8)> {
+        let path = "unique://tokens/usage.as";
+        let file = intern_file(path, 0);
+        let inputs = vec![FileInput {
+            file,
+            kind: FileKind::Script,
+            module: None,
+            source: src.to_string(),
+        }];
+        let ws = Workspace::build(IndexConfig::default(), inputs);
+        semantic_tokens_indexed(&ws, file)
+            .expect("单文件已入索引")
+            .into_iter()
+            .map(|t| {
+                let text = &src[t.start as usize..(t.start + t.len) as usize];
+                (text.to_string(), t.ty)
+            })
+            .collect()
+    }
+
+    fn assert_count(tokens: &[(String, u8)], text: &str, ty: u8, n: usize) {
+        let hit = tokens.iter().filter(|(t, k)| t == text && *k == ty).count();
+        assert_eq!(hit, n, "expected {n}x ({text}, {ty}) in {tokens:?}");
+    }
+
+    #[test]
+    fn global_function_usage_colored() {
+        // 声明 + 使用点同色（用户报告的缺口：g_func 调用处不着色）
+        let src = "void g_func(int d);\nvoid l_test() {\n    g_func(123);\n}\n";
+        let tokens = indexed_tokens_of(src);
+        assert_count(&tokens, "g_func", GLOBAL_FUNCTION, 2);
+        assert_count(&tokens, "l_test", GLOBAL_FUNCTION, 1);
+    }
+
+    #[test]
+    fn locals_params_and_members_usage_colored() {
+        let src = "\
+struct FVector { float X; }
+class Holder {
+    int Health;
+    void Tick(float Delta) { Health = int(Delta) + 1; }
+    void Call() { this.Tick(0.5); }
+}
+void Main() {
+    int Local = 1;
+    Local = Local + 1;
+}
+";
+        let tokens = indexed_tokens_of(src);
+        // 声明 + 使用点同色
+        assert_count(&tokens, "Health", MEMBER_VARIABLE, 2);
+        assert_count(&tokens, "Delta", PARAMETER, 2);
+        assert_count(&tokens, "Local", LOCAL_VARIABLE, 3);
+        assert_count(&tokens, "Tick", MEMBER_FUNCTION, 2);
+    }
+
+    #[test]
+    fn qualified_enum_and_type_usage_colored() {
+        let src = "\
+enum EMode { Off, On }
+struct FVector { float X; }
+EMode M = EMode::Off;
+FVector V = FVector();
+";
+        let tokens = indexed_tokens_of(src);
+        // 使用位的 EMode（限定首段）与构造调用名同色于声明
+        assert_count(&tokens, "EMode", TYPENAME, 3);
+        assert_count(&tokens, "Off", MEMBER_VARIABLE, 2);
+        // 声明名 + 构造调用 → struct；类型位（CST 层）保持 typename
+        assert_count(&tokens, "FVector", TYPENAME_STRUCT, 2);
+        assert_count(&tokens, "FVector", TYPENAME, 1);
+    }
+
+    #[test]
+    fn unresolved_usage_stays_uncolored() {
+        let src = "void Main() { Foo(Bar); }\n";
+        let tokens = indexed_tokens_of(src);
+        assert!(!tokens.iter().any(|(t, _)| t == "Foo" || t == "Bar"));
+    }
+
+    #[test]
+    fn member_function_usage_patterns() {
+        // 接收者形态全景：this / 隐式 this / 调用链 / 局部 / 形参 /
+        // 字段 / 继承 / cast
+        let src = "\
+class Helper {
+    void Clean() {}
+}
+class Base { void Bm() {} }
+class AActor : Base {
+    Helper H;
+    Helper GetHelper() { return H; }
+    void Tick() {}
+    void Test(Helper p) {
+        this.Tick();
+        Tick();
+        GetHelper().Clean();
+        Helper local;
+        local.Clean();
+        p.Clean();
+        H.Clean();
+        Bm();
+    }
+}
+void g(AActor a) {
+    a.Tick();
+    a.Bm();
+}
+";
+        let tokens = indexed_tokens_of(src);
+        // Tick：声明 + this. + 隐式 + a.（×2）
+        assert_count(&tokens, "Tick", MEMBER_FUNCTION, 4);
+        // Clean：声明 + 调用链 + local + p + 字段 H
+        assert_count(&tokens, "Clean", MEMBER_FUNCTION, 5);
+        // Bm：Base 声明 + 隐式继承调用 + a.Bm
+        assert_count(&tokens, "Bm", MEMBER_FUNCTION, 3);
     }
 
     #[test]
