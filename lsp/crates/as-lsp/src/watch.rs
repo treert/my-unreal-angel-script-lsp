@@ -170,11 +170,16 @@ pub fn run_rebuild(
     let t0 = std::time::Instant::now();
     as_log!("rebuild: building (scriptRoots={:?}, declDirs={:?})…", cfg.script_roots, cfg.decl_dirs);
     let idx = workspace::build_index(&cfg, &folders, &overlays);
+    let t_build = t0.elapsed();
     let files = idx.files.len();
+    let t_pub = std::time::Instant::now();
     ws.publish_and_replay(idx, docs);
+    let t_pub = t_pub.elapsed();
     let elapsed = t0.elapsed();
     ws.notify_ready(cfg.float_is_float64, files, elapsed.as_millis());
-    as_log!("rebuild: published {files} files in {elapsed:?}");
+    as_log!(
+        "rebuild: published {files} files in {elapsed:?} (build {t_build:?} + publish/replay {t_pub:?})"
+    );
     ws.building.store(false, Ordering::SeqCst);
 }
 

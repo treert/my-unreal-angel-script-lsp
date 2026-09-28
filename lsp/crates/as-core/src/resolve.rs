@@ -347,12 +347,8 @@ pub(crate) enum Role<'t> {
     Plain,
 }
 
-pub(crate) fn role_of<'t>(ident: Node<'t>, parent: Node<'t>) -> Role<'t> {
-    let field = syntax::children_with_fields(parent)
-        .into_iter()
-        .find(|(_, c)| c.id() == ident.id())
-        .and_then(|(f, _)| f);
-    match (parent.kind(), field.as_deref()) {
+pub(crate) fn role_of<'t>(parent: Node<'t>, field: Option<&str>) -> Role<'t> {
+    match (parent.kind(), field) {
         ("type", Some("name")) | ("template_type", Some("name")) => Role::TypeUse,
         ("qualified_identifier", Some("scope")) => Role::ScopedFirst,
         ("qualified_identifier", Some("name")) => Role::ScopedLast {
@@ -411,7 +407,8 @@ pub fn resolve_at_node(
     }
 
     let parent = ident.parent()?;
-    let mut res = match role_of(ident, parent) {
+    let field = syntax::field_of_child(parent, ident);
+    let mut res = match role_of(parent, field) {
         Role::TypeUse => resolve_type_use(idx, &ctx, name),
         Role::ScopedFirst => {
             // `Super::` 首段 = 显式父类（§4.5 第 0 级）

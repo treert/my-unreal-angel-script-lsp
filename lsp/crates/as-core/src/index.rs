@@ -131,24 +131,92 @@ pub struct WorkspaceIndex {
 impl WorkspaceIndex {
     /// Phase 1 + Phase 2：并行全量 parse，顺序提取声明，建表。
     pub fn build(config: IndexConfig, inputs: Vec<FileInput>) -> WorkspaceIndex {
-        // Phase 1：rayon 并行 parse（441 文件量级秒级，不设轻扫描——D4）
-        let mut parsed: Vec<(FileInput, as_syntax::tree_sitter::Tree, Vec<SyntaxError>, LineIndex)> =
-            inputs
-                .into_par_iter()
-                .map(|input| {
-                    let tree = as_syntax::parse(&input.source, None);
-                    let errors = as_syntax::verify_tree(&tree);
-                    let lines = LineIndex::new(&input.source);
-                    (input, tree, errors, lines)
+        // Phase 1：rayon 并行 parse（441 文件量级秒级，不设轻扫描——D4）。
+        // 耗时统计（仅 fileLog 开启时有成本）：parse 墙钟 / 顺序提取 / finish，
+        // 外加单文件 parse 最慢 Top 5（热点定位）。
+        let t0 = std::time::Instant::now();
+        let file_count = inputs.len();
+        let mut parsed: Vec<(
+            FileInput,
+            as_syntax::tree_sitter::Tree,
+            Vec<SyntaxError>,
+            LineIndex,
+            std::time::Duration,
+        )> = inputs
+            .into_par_iter()
+            .map(|input| {
+                let t = std::time::Instant::now();
+                let tree = as_syntax::parse(&input.source, None);
+                let parse_dur = t.elapsed();
+                let errors = as_syntax::verify_tree(&tree);
+                let lines = LineIndex::new(&input.source);
+                (input, tree, errors, lines, parse_dur)
+            })
+            .collect();
+        let t_parse = t0.elapsed();
+        parsed.sort_by_key(|(input, ..)| input.file);
+        // 单文件 parse 耗时 Top 5（消费 parsed 前取快照）
+        if crate::logger::enabled() {
+            let mut slowest: Vec<(std::time::Duration, String)> = parsed
+                .iter()
+                .map(|(input, _, _, _, d)| {
+                    (
+                        *d,
+                        crate::intern::file_path(input.file)
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "<unknown>".to_string()),
+                    )
                 })
                 .collect();
-        parsed.sort_by_key(|(input, ..)| input.file);
+            slowest.sort_by(|a, b| b.0.cmp(&a.0));
+            for (d, path) in slowest.iter().take(5) {
+                crate::as_log!("index: slow-parse {d:?}  {path}");
+            }
+        }
 
         let mut idx = WorkspaceIndex::new(config);
-        for (input, tree, errors, lines) in parsed {
-            idx.add_file(input, tree, errors, lines);
+        // Phase 2 单文件耗时 Top 5（fileLog）：确认热点是集中（个别巨型
+        // .d.as）还是均匀分布——决定优化方向（单文件热点 vs 整阶段并行化）
+        let mut per_file: Vec<(std::time::Duration, std::time::Duration, String)> = Vec::new();
+        let logging = crate::logger::enabled();
+        for (input, tree, errors, lines, _) in parsed {
+            let path = logging
+                .then(|| {
+                    crate::intern::file_path(input.file)
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string())
+                })
+                .unwrap_or_default();
+            let (t_extract, t_uses) = idx.add_file(input, tree, errors, lines);
+            if logging {
+                per_file.push((t_extract, t_uses, path));
+            }
+        }
+        let t_extract_phase = t0.elapsed();
+        if logging {
+            let mut sum_extract = std::time::Duration::ZERO;
+            let mut sum_uses = std::time::Duration::ZERO;
+            for (te, tu, _) in &per_file {
+                sum_extract += *te;
+                sum_uses += *tu;
+            }
+            let mut slowest = per_file.clone();
+            slowest.sort_by(|a, b| (b.0 + b.1).cmp(&(a.0 + a.1)));
+            for (te, tu, path) in slowest.iter().take(5) {
+                crate::as_log!("index: slow-extract decl {te:?} + uses {tu:?}  {path}");
+            }
+            crate::as_log!(
+                "index: phase2 totals | decl extract {sum_extract:?} | use-site collect {sum_uses:?} (sequential)"
+            );
         }
         idx.finish();
+        let t_finish = t0.elapsed();
+        crate::as_log!(
+            "index: {file_count} files | parse {:?} (rayon) | extract+uses {:?} (seq wall) | finish {:?}",
+            t_parse,
+            t_extract_phase - t_parse,
+            t_finish - t_extract_phase,
+        );
         idx
     }
 
@@ -195,13 +263,15 @@ impl WorkspaceIndex {
         }
     }
 
+    /// 返回值 =（Phase 2a 声明提取耗时，Phase 2b UseSite 提取耗时）——
+    /// 冷启动性能剖析用（fileLog 关闭时 Instant 成本可忽略）。
     fn add_file(
         &mut self,
         input: FileInput,
         tree: as_syntax::tree_sitter::Tree,
         errors: Vec<SyntaxError>,
         lines: LineIndex,
-    ) {
+    ) -> (std::time::Duration, std::time::Duration) {
         let file = input.file;
         let src = &input.source;
 
@@ -222,16 +292,20 @@ impl WorkspaceIndex {
         });
 
         // Phase 2a：声明提取（顺序遍历，parent 先于 children 压栈）
+        let t = std::time::Instant::now();
         let cursor_root = tree.root_node();
         for (_field, child) in syntax::children_with_fields(cursor_root) {
             self.extract_decl(child, src, file, None, DeclCtx::Global);
         }
+        let t_extract = t.elapsed();
 
         // Phase 2b：UseSite 提取 + 引用倒排（D5：只记录，不解析）
+        let t = std::time::Instant::now();
         let uses = crate::uses::collect_use_sites(cursor_root, src);
         for site in &uses {
             self.ref_index.entry(site.name).or_default().insert(file);
         }
+        let t_uses = t.elapsed();
 
         self.files.insert(
             file,
@@ -246,6 +320,7 @@ impl WorkspaceIndex {
                 cache_format,
             },
         );
+        (t_extract, t_uses)
     }
 
     // -----------------------------------------------------------------------

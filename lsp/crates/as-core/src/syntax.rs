@@ -37,6 +37,25 @@ pub fn children_with_fields<'t>(node: Node<'t>) -> Vec<(Option<String>, Node<'t>
     out
 }
 
+/// [`children_with_fields`] 的零分配变体：只查**单个**子节点的字段名
+/// （热路径专用——`uses::use_site_of` 每标识符调用，Vec+逐 child String
+/// 分配在 `.d.as` 数十万标识符量级下是 Phase 2 的最大热点）。`child`
+/// 必须是 `parent` 的直接子节点，否则返回 None。
+pub fn field_of_child(parent: Node<'_>, child: Node<'_>) -> Option<&'static str> {
+    let mut c = parent.walk();
+    if c.goto_first_child() {
+        loop {
+            if c.node().id() == child.id() {
+                return c.field_name();
+            }
+            if !c.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    None
+}
+
 pub fn text<'s>(node: Node<'_>, src: &'s str) -> &'s str {
     node.utf8_text(src.as_bytes()).unwrap_or("")
 }

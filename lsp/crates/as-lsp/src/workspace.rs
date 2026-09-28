@@ -302,6 +302,8 @@ pub fn build_index(
     folders: &[String],
     overlays: &[(FileId, i32, String)],
 ) -> WorkspaceIndex {
+    // 分阶段耗时（fileLog）：目录 walk / 逐文件读盘 / 索引构建
+    let t0 = std::time::Instant::now();
     let roots = collect_roots(cfg, folders);
 
     let mut seen: HashSet<String> = HashSet::new();
@@ -310,20 +312,28 @@ pub fn build_index(
         collect(root, root, &mut seen, &mut files, 0);
     }
     files.sort_by(|a, b| a.1.cmp(&b.1));
+    let t_walk = t0.elapsed();
 
     let mut inputs = Vec::with_capacity(files.len());
+    let walked = files.len();
+    let mut total_bytes = 0usize;
+    let mut overlay_hits = 0usize;
     for (root, path) in files {
         let Some(path_str) = path.to_str() else { continue };
         let kind = kind_of_path(path_str);
         let source = match file_id_of_path(path_str).and_then(|f| {
             overlays.iter().find(|(of, _, _)| *of == f).map(|(_, _, t)| t.clone())
         }) {
-            Some(t) => t,
+            Some(t) => {
+                overlay_hits += 1;
+                t
+            }
             None => match std::fs::read_to_string(&path) {
                 Ok(t) => t,
                 Err(_) => continue,
             },
         };
+        total_bytes += source.len();
         let file = intern_file(path_str, 0);
         let module = path
             .strip_prefix(&root)
@@ -334,8 +344,19 @@ pub fn build_index(
             });
         inputs.push(FileInput { file, kind, module, source });
     }
+    let t_read = t0.elapsed();
+    as_log!(
+        "rebuild: phase0 walk {walked} files in {:?}, read {} KB (overlay {}) in {:?}",
+        t_walk,
+        total_bytes / 1024,
+        overlay_hits,
+        t_read - t_walk,
+    );
 
-    WorkspaceIndex::build(IndexConfig { float_is_float64: cfg.float_is_float64 }, inputs)
+    let t_build = std::time::Instant::now();
+    let idx = WorkspaceIndex::build(IndexConfig { float_is_float64: cfg.float_is_float64 }, inputs);
+    as_log!("rebuild: phase1+2 index built in {:?}", t_build.elapsed());
+    idx
 }
 
 /// 深度受限的递归收集（.d.as → Decl、其余 .as → Script；去重）。

@@ -54,25 +54,57 @@ pub struct UseSite {
 }
 
 /// 提取一个文件的全部「标识符使用点」（Phase 2；与声明提取同趟消费）。
+///
+/// 遍历实现（性能关键）：**全树共用一个 `TreeCursor` 的迭代 DFS**——
+/// `Node::walk()` 每次构造都经 FFI 在 C 侧 malloc/free 一个 cursor
+/// （含内部栈），递归每节点新建的写法在 `.d.as` 数十万节点量级下是
+/// Phase 2 最大热点。单 cursor + `goto_first_child` / `goto_next_sibling`
+/// / `goto_parent` 三动作即可完整 DFS，且当前节点的字段名从
+/// `cursor::field_name()` 白拿。specifier 语境判定（原
+/// `in_specifier_context` 的祖先链上溯）改为**下降时维护标志位**——
+/// 进入 `macro_argument` / `function_attribute` / `*_specifiers` 子树即
+/// 记账，O(1) 替代每标识符 O(depth) 的上溯。
 pub fn collect_use_sites(root: Node<'_>, src: &str) -> Vec<UseSite> {
     let mut out = Vec::new();
-    walk_identifiers(root, src, &mut out);
-    out
-}
+    let mut c = root.walk();
+    // 祖先链上「specifier 子树入口」记账：栈元素 = 对应祖先边是否进入
+    // specifier 子树；spec_count > 0 ⇔ 当前处于 specifier 语境。
+    let mut spec_stack: Vec<bool> = Vec::new();
+    let mut spec_count: usize = 0;
 
-fn walk_identifiers(node: Node<'_>, src: &str, out: &mut Vec<UseSite>) {
-    if node.kind() == "identifier" {
-        if let Some(site) = use_site_of(node, src) {
-            out.push(site);
+    loop {
+        let node = c.node();
+        let kind = node.kind();
+        if kind == "identifier" {
+            if spec_count == 0 {
+                if let Some(site) = use_site_of(node, c.field_name(), src) {
+                    out.push(site);
+                }
+            }
+            // identifier 是叶子，不下降
+        } else {
+            let enter_spec = spec_count > 0
+                || kind == "macro_argument"
+                || kind == "function_attribute"
+                || kind.ends_with("_specifiers");
+            if c.goto_first_child() {
+                spec_stack.push(enter_spec);
+                if enter_spec {
+                    spec_count += 1;
+                }
+                continue;
+            }
         }
-        return; // identifier 是叶子
-    }
-    let mut c = node.walk();
-    if c.goto_first_child() {
+        // 前进：有兄弟走兄弟，否则逐层回溯（回溯时同步弹出 specifier 记账）
         loop {
-            walk_identifiers(c.node(), src, out);
-            if !c.goto_next_sibling() {
+            if c.goto_next_sibling() {
                 break;
+            }
+            if !c.goto_parent() {
+                return out; // 回到根之上：遍历完成
+            }
+            if spec_stack.pop() == Some(true) {
+                spec_count -= 1;
             }
         }
     }
@@ -103,18 +135,9 @@ fn is_decl_name(parent: Node<'_>, field: Option<&str>) -> bool {
     )
 }
 
-fn use_site_of(ident: Node<'_>, src: &str) -> Option<UseSite> {
+fn use_site_of(ident: Node<'_>, field: Option<&str>, src: &str) -> Option<UseSite> {
     let parent = ident.parent()?;
-    let field = syntax::children_with_fields(parent)
-        .into_iter()
-        .find(|(_, c)| c.id() == ident.id())
-        .and_then(|(f, _)| f);
-    let field = field.as_deref();
 
-    // specifier 语境（UPROPERTY 宏参数 / 方法属性 / 说明符列表）不是使用点
-    if syntax::in_specifier_context(ident) {
-        return None;
-    }
     // `access:Editor` 的 level 名不是符号使用点
     if parent.kind() == "access_specifier" {
         return None;
@@ -129,12 +152,7 @@ fn use_site_of(ident: Node<'_>, src: &str) -> Option<UseSite> {
     // namespace 声明的 scoped_name：尾段是声明名（decl_name_node 同规则），
     // 前段是 namespace 使用点；access_grant 目标里的 scoped_name 全段是使用点
     if parent.kind() == "scoped_name" {
-        let is_last = syntax::children_with_fields(parent)
-            .into_iter()
-            .filter(|(_, c)| c.kind() == "identifier")
-            .last()
-            .map(|(_, c)| c.id() == ident.id())
-            .unwrap_or(false);
+        let is_last = is_last_identifier_child(parent, ident);
         let in_ns_decl = parent.parent().map_or(false, |g| g.kind() == "namespace_declaration");
         if in_ns_decl && is_last {
             return None;
@@ -146,7 +164,7 @@ fn use_site_of(ident: Node<'_>, src: &str) -> Option<UseSite> {
         return None;
     }
 
-    let role = match role_of(ident, parent) {
+    let role = match role_of(parent, field) {
         Role::TypeUse => UseRole::TypeUse,
         Role::ScopedFirst => UseRole::ScopedFirst,
         Role::ScopedLast { .. } => UseRole::ScopedLast,
@@ -155,6 +173,24 @@ fn use_site_of(ident: Node<'_>, src: &str) -> Option<UseSite> {
         Role::Plain => UseRole::Plain,
     };
     Some(UseSite { name, span, role })
+}
+
+/// `scoped_name` 尾段判定（零分配）：ident 是否为 parent 的最后一个
+/// identifier 子节点。
+fn is_last_identifier_child(parent: Node<'_>, ident: Node<'_>) -> bool {
+    let mut c = parent.walk();
+    let mut last = None;
+    if c.goto_first_child() {
+        loop {
+            if c.node().kind() == "identifier" {
+                last = Some(c.node().id());
+            }
+            if !c.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    last == Some(ident.id())
 }
 
 #[cfg(test)]
