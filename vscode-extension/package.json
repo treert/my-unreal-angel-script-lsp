@@ -3,9 +3,12 @@
   "displayName": "my-as-lsp (Unreal Angelscript)",
   "description": "Unreal Angelscript language support backed by tree-sitter + Rust LSP (my-as-lsp)",
   "version": "0.1.0",
-  "publisher": "my-as-lsp",
+  "publisher": "onemore",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/treert/my-unreal-angel-script-lsp.git"
+  },
   "license": "MIT",
-  "private": true,
   "engines": {
     "vscode": "^1.80.0"
   },
@@ -123,7 +126,7 @@
         "myAngelScriptLsp.serverPath": {
           "type": "string",
           "default": "",
-          "description": "as-lsp 可执行文件的绝对路径。留空时（开发模式）自动 `cargo run -p as-lsp`（profile 由 tools/test-extension.ps1 的 -Release 决定，缺省 debug）。"
+          "description": "as-lsp 可执行文件的绝对路径。留空时：生产模式（商店安装）使用扩展内置的 server/as-lsp(.exe)；开发模式自动 `cargo run -p as-lsp`（profile 由 tools/test-extension.ps1 的 -Release 决定，缺省 debug）。"
         },
         "myAngelScriptLsp.typeDeclarationDirs": {
           "type": "array",
@@ -165,11 +168,16 @@
   "scripts": {
     "vscode:prepublish": "node esbuild.js --production",
     "compile": "node esbuild.js",
-    "watch": "node esbuild.js --watch"
+    "watch": "node esbuild.js --watch",
+    "prepackage": "node scripts/prepackage.mjs",
+    "package": "node scripts/package.mjs",
+    "build:local": "node scripts/build-local.mjs",
+    "release": "node scripts/publish.mjs"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
     "@types/vscode": "^1.80.0",
+    "@vscode/vsce": "^3.2.1",
     "esbuild": "^0.23.0",
     "typescript": "^5.4.0"
   },

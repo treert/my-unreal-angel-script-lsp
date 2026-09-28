@@ -11,6 +11,7 @@ out/
 target/
 build/
 *.vsix
+vscode-extension/server/
 
 # IDE / OS
 .idea/

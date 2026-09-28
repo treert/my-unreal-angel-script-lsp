@@ -77,6 +77,24 @@ function resolveServerOptions(
     };
   }
 
+  // 生产模式（商店安装 / .vsix 侧载）：运行打包进扩展的 server/as-lsp(.exe)
+  // （scripts/prepackage.mjs 在打包前从 lsp/target/<triple>/release/ 拷入）。
+  if (context.extensionMode === vscode.ExtensionMode.Production) {
+    const bin = process.platform === 'win32' ? 'as-lsp.exe' : 'as-lsp';
+    const serverBin = path.join(context.extensionPath, 'server', bin);
+    if (!fs.existsSync(serverBin)) {
+      log(`production server binary missing: ${serverBin}`);
+      setStatus(
+        '⚠️ my-as-lsp',
+        `my-as-lsp：未找到 server 二进制（${serverBin}）— 点击打开设置`,
+      );
+    }
+    return {
+      command: serverBin,
+      args: [],
+    };
+  }
+
   // 开发模式：从本仓库的 lsp workspace 用 cargo 起 server（增量编译后启动）。
   // profile 由 tools/test-extension.ps1 写入 lsp/target/.build-profile
   //（-Release 开关），缺省 debug——不用环境变量：`code` CLI 在 VS Code

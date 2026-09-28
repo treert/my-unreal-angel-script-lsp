@@ -1,0 +1,13 @@
+# Exclude everything not needed at runtime. dist/extension.js is
+# esbuild-bundled (vscode-languageclient included), so
+# node_modules stays out entirely; server/as-lsp(.exe) is copied
+# in by scripts/prepackage.mjs right before `vsce package`.
+.vscode/**
+src/**
+scripts/**
+node_modules/**
+esbuild.js
+tsconfig.json
+package-lock.json
+Build.md
+**/*.map
