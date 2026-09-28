@@ -32,6 +32,7 @@ pub mod scope;
 pub mod search;
 pub mod signature;
 pub mod specifiers;
+pub mod summary;
 pub mod symbol;
 pub mod syntax;
 pub mod tokens;
