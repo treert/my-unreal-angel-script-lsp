@@ -17,8 +17,9 @@ use std::sync::{Arc, Mutex};
 use tower_lsp_server::ls_types::{self as ls, *};
 use tower_lsp_server::Client;
 
-use as_core::diag::{filter_suppressions, script_diags, Diag, DiagSeverity};
+use as_core::diag::{filter_suppressions, script_diags, undefined_call_diags, Diag, DiagSeverity};
 use as_core::id::FileId;
+use as_core::workspace::Workspace;
 use as_core::{as_syntax, FileKind, LineIndex};
 
 use crate::diagnostic_scheduler::DiagnosticScheduler;
@@ -34,16 +35,23 @@ pub struct DrainFacts {
 }
 
 /// per-file 统一入口（打开 / 未打开同构，P9）：
-/// parse-error ∪ missing-type-decls（`decl_missing && Script`）∪ cyclic-inheritance，经抑制过滤。
+/// parse-error ∪ missing-type-decls（`decl_missing && Script`）∪
+/// undefined-function（`Script && !decl_missing`——decl 全缺失时引擎函数一概
+/// 不可解析，missing-type-decls 已在解释，语义诊断整类跳过）∪
+/// cyclic-inheritance，经抑制过滤。
 fn file_ls_diags(
+    ws: &Workspace,
+    file: FileId,
     tree: &as_syntax::tree_sitter::Tree,
     text: &str,
     lines: &LineIndex,
     is_script: bool,
     facts: &DrainFacts,
-    file: FileId,
 ) -> Vec<ls::Diagnostic> {
     let mut diags = script_diags(tree, text, is_script && facts.decl_missing);
+    if is_script && !facts.decl_missing {
+        diags.extend(undefined_call_diags(ws, file, tree, text));
+    }
     if let Some(cs) = facts.cycle_diags.get(&file) {
         diags.extend(cs.iter().cloned());
     }
@@ -115,21 +123,35 @@ pub async fn drain(
             cycle_diags: idx.cycle_diags(),
         })
         .unwrap_or(DrainFacts { decl_missing: false, cycle_diags: HashMap::new() });
-    // ④ pop 循环：热优先 → 队列；打开取 overlay（带 version），未打开取索引
-    //    FileEntry（version=None）；都不在（并发删除）→ 跳过。
-    //    锁序 docs → index 读（既有约定）。
+    // ④ pop 循环：热优先 → 队列；打开取 overlay（带 version）+ 索引（语义
+    //    诊断需要工作区），未打开取索引 FileEntry（version=None）；都不在
+    //    （并发删除）→ 跳过。锁序 docs → index 读（既有约定）：打开文档
+    //    路径在 docs 守卫内取 index 读（publish/reindex 侧无反向嵌套）。
     while let Some(file) = sched.pop() {
         let Some(path) = as_core::intern::file_path(file) else { continue };
         let Some(uri) = ls::Uri::from_file_path(path) else { continue };
         let is_script = kind_of_path(path) == FileKind::Script;
         let computed = {
             let store = docs.lock().unwrap();
-            store.get(file).map(|doc| {
-                (
-                    file_ls_diags(&doc.tree, &doc.text, &doc.lines, is_script, &facts, file),
-                    Some(doc.version),
-                )
-            })
+            match store.get(file) {
+                Some(doc) => ws
+                    .with(|idx| {
+                        Some((
+                            file_ls_diags(
+                                idx,
+                                file,
+                                &doc.tree,
+                                &doc.text,
+                                &doc.lines,
+                                is_script,
+                                &facts,
+                            ),
+                            Some(doc.version),
+                        ))
+                    })
+                    .flatten(),
+                None => None,
+            }
         };
         let computed = match computed {
             Some(x) => Some(x),
@@ -137,7 +159,7 @@ pub async fn drain(
                 .with(|idx| {
                     idx.files.get(&file).map(|e| {
                         (
-                            file_ls_diags(&e.tree, &e.source, &e.lines, is_script, &facts, file),
+                            file_ls_diags(idx, file, &e.tree, &e.source, &e.lines, is_script, &facts),
                             None,
                         )
                     })
@@ -154,7 +176,6 @@ pub async fn drain(
 mod tests {
     use super::*;
     use crate::docs::DocStore;
-    use crate::workspace::WorkspaceState;
 
     // 单测用例内置于源码（D1）。
 
@@ -173,17 +194,15 @@ mod tests {
 
     #[test]
     fn file_ls_diags_maps_code_and_severity() {
-        let ws = WorkspaceState::new();
         let mut store = DocStore::new();
         // 未闭合宏（parse-error）+ 索引 0 个 .d.as（missing-type-decls）
         let src = "UFUNCTION(Blueprint\nvoid F() {}\n".to_string();
         let file = store.open("unique://lspdiag/a.as", 1, src);
-        // 空索引发布 → Ready（dirty 空，重放为空操作）
+        // 空索引：decl_missing ⇒ 语义诊断整类跳过（脚本无需入索引）
         let idx = as_core::workspace::Workspace::build(as_core::IndexConfig::default(), vec![]);
-        ws.publish_and_replay(idx, &Mutex::new(DocStore::new()));
         let doc = store.get(file).unwrap();
         let facts = DrainFacts { decl_missing: true, cycle_diags: HashMap::new() };
-        let diags = file_ls_diags(&doc.tree, &doc.text, &doc.lines, true, &facts, file);
+        let diags = file_ls_diags(&idx, file, &doc.tree, &doc.text, &doc.lines, true, &facts);
         let decl_diag = diags.iter().find(|d| d.code == code("missing-type-decls")).unwrap();
         assert_eq!(decl_diag.severity, Some(DiagnosticSeverity::WARNING));
         assert_eq!(decl_diag.range.start, Position { line: 0, character: 0 });
@@ -195,20 +214,30 @@ mod tests {
 
     #[test]
     fn file_ls_diags_no_missing_type_decls_when_decls_present() {
-        let ws = WorkspaceState::new();
         let mut store = DocStore::new();
-        let file = store.open("unique://lspdiag/b.as", 1, "int X = 1;\n".to_string());
-        let inputs = vec![as_core::FileInput {
-            file: as_core::intern::intern_file("unique://lspdiag/decl.d.as", 0),
-            kind: FileKind::Decl,
-            source: "struct FVector { float X; }\n".to_string(),
-            module: None,
-        }];
+        let src = "int X = 1;\n";
+        let file = store.open("unique://lspdiag/b.as", 1, src.to_string());
+        let inputs = vec![
+            as_core::FileInput {
+                file: as_core::intern::intern_file("unique://lspdiag/decl.d.as", 0),
+                kind: FileKind::Decl,
+                source: "struct FVector { float X; }\n".to_string(),
+                module: None,
+            },
+            as_core::FileInput {
+                // 语义诊断需要脚本在索引内（SemCtx 查 scope_tree）
+                file,
+                kind: FileKind::Script,
+                source: src.to_string(),
+                module: None,
+            },
+        ];
         let idx = as_core::workspace::Workspace::build(as_core::IndexConfig::default(), inputs);
-        ws.publish_and_replay(idx, &Mutex::new(DocStore::new()));
         let doc = store.get(file).unwrap();
         let facts = DrainFacts { decl_missing: false, cycle_diags: HashMap::new() };
-        assert!(file_ls_diags(&doc.tree, &doc.text, &doc.lines, true, &facts, file).is_empty());
+        assert!(
+            file_ls_diags(&idx, file, &doc.tree, &doc.text, &doc.lines, true, &facts).is_empty()
+        );
     }
 
     #[test]
@@ -225,7 +254,7 @@ mod tests {
         let facts = DrainFacts { decl_missing: false, cycle_diags: ws_idx.cycle_diags() };
         let a = as_core::intern::intern_file("unique://lspdiag/cyc_a.as", 0);
         let e = ws_idx.files.get(&a).unwrap();
-        let diags = file_ls_diags(&e.tree, &e.source, &e.lines, true, &facts, a);
+        let diags = file_ls_diags(&ws_idx, a, &e.tree, &e.source, &e.lines, true, &facts);
         assert!(diags.is_empty(), "cyclic-inheritance 被同行 as-ignore 抑制，且无其他诊断");
 
         // 去掉抑制注释 → cyclic-inheritance 出现
@@ -239,10 +268,53 @@ mod tests {
         let facts2 = DrainFacts { decl_missing: false, cycle_diags: ws_idx2.cycle_diags() };
         let a2 = as_core::intern::intern_file("unique://lspdiag/cyc2_a.as", 0);
         let e2 = ws_idx2.files.get(&a2).unwrap();
-        let diags = file_ls_diags(&e2.tree, &e2.source, &e2.lines, true, &facts2, a2);
+        let diags = file_ls_diags(&ws_idx2, a2, &e2.tree, &e2.source, &e2.lines, true, &facts2);
         assert_eq!(diags.len(), 1, "只有一条 cyclic-inheritance");
         assert_eq!(diags[0].code, code("cyclic-inheritance"));
         assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(diags[0].range.start.line, 0, "落在 base 所在行");
+    }
+
+    #[test]
+    fn file_ls_diags_undefined_function_and_suppression() {
+        // 用户 case 同款：Print 在 Decl 文件声明 → 不报；Printxxx → 报（Error，
+        // 落名字所在行）；同行 as-ignore: undefined-function 可抑制
+        const DECL: &str = concat!(
+            "void Print(FString Text, float32 Duration = 5.f);\n",
+            "struct FString { int Len; }\n",
+        );
+        const SRC: &str = "\
+void test_001()
+{
+    Print(\"123\");
+    Printxxx(\"123\");
+    Printyyy(\"123\"); // as-ignore: undefined-function
+}
+";
+        let inputs = vec![
+            as_core::FileInput {
+                file: as_core::intern::intern_file("unique://lspdiaguf/global.d.as", 0),
+                kind: FileKind::Decl,
+                source: DECL.to_string(),
+                module: None,
+            },
+            as_core::FileInput {
+                file: as_core::intern::intern_file("unique://lspdiaguf/test.as", 0),
+                kind: FileKind::Script,
+                source: SRC.to_string(),
+                module: None,
+            },
+        ];
+        let idx = as_core::workspace::Workspace::build(as_core::IndexConfig::default(), inputs);
+        let file = as_core::intern::intern_file("unique://lspdiaguf/test.as", 0);
+        let e = idx.files.get(&file).unwrap();
+        let facts = DrainFacts { decl_missing: false, cycle_diags: HashMap::new() };
+        let diags = file_ls_diags(&idx, file, &e.tree, &e.source, &e.lines, true, &facts);
+        assert_eq!(diags.len(), 1, "只报 Printxxx（Print 解析成功，Printyyy 被抑制）：{diags:?}");
+        assert_eq!(diags[0].code, code("undefined-function"));
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(diags[0].range.start.line, 3, "落在 Printxxx 所在行");
+        assert_eq!(diags[0].range.end.line, 3);
+        assert_eq!(diags[0].source.as_deref(), Some("my-as-lsp"));
     }
 }

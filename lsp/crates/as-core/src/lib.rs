@@ -46,7 +46,7 @@ pub mod workspace;
 pub use as_syntax;
 
 pub use decl_tags::{DocBlock, SemanticTag, TagKind, TagValue};
-pub use diag::{script_diags, Diag, DiagCode, DiagSeverity, Suppression};
+pub use diag::{script_diags, undefined_call_diags, Diag, DiagCode, DiagSeverity, Suppression};
 pub use hover::{hover_markdown, render_doc, render_syn, signature};
 pub use id::{FileId, Sym};
 pub use aggregation::{Aggregation, DeclRef};

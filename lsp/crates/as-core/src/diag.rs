@@ -12,9 +12,18 @@
 //! 抑制解析按**原始文本逐行扫描**：字符串字面量里恰好写 `// as-ignore…`
 //! 会误报抑制（已知失真，文档化接受——比「ERROR 区吞掉注释节点导致漏抑制」
 //! 的树扫描方案失真面更小）。
+//!
+//! P5 首条符号解析类诊断：[`undefined_call_diags`]（`undefined-function`）——
+//! 裸 callee 调用点走完整查找链（局部 → 成员/访问器/mixin → 命名空间 →
+//! 全局，`resolve_callee` 同链），无命中即报。与 hover / goto-definition
+//! 共用同一解析真值：能跳转的不报，无 hover 的报。
 
 use crate::as_syntax;
+use crate::id::FileId;
 use crate::range::{LineIndex, TextRange};
+use crate::resolve::resolve_at_node;
+use crate::syntax;
+use crate::workspace::Workspace;
 use as_syntax::tree_sitter::Tree;
 
 /// 诊断码——**kebab-case 有意义名**（D42：弃数字码，名字自解释，可作
@@ -32,6 +41,10 @@ pub enum DiagCode {
     /// `cyclic-inheritance`：继承环（`Workspace::cycle_diags` 检出的环成员类，
     /// range = base 名字区间——Phase D / D40）。
     CyclicInheritance,
+    /// `undefined-function`：调用点解析失败（裸 callee 走完整查找链——局部 /
+    /// 成员 / 访问器 / mixin / 命名空间 / 全局——无命中；P5 首条符号解析类
+    /// 诊断，与 hover / goto-definition 同一解析管线）。
+    UndefinedFunction,
     // 素材（引擎约束取证，码表 §3）不预登记——P5 实现时再命名变体（D22/D42）。
 }
 
@@ -43,6 +56,7 @@ impl DiagCode {
             "missing-type-decls" => Some(DiagCode::MissingTypeDecls),
             "parse-error" => Some(DiagCode::ParseError),
             "cyclic-inheritance" => Some(DiagCode::CyclicInheritance),
+            "undefined-function" => Some(DiagCode::UndefinedFunction),
             _ => None,
         }
     }
@@ -54,6 +68,7 @@ impl std::fmt::Display for DiagCode {
             DiagCode::MissingTypeDecls => "missing-type-decls",
             DiagCode::ParseError => "parse-error",
             DiagCode::CyclicInheritance => "cyclic-inheritance",
+            DiagCode::UndefinedFunction => "undefined-function",
         };
         f.write_str(s)
     }
@@ -197,6 +212,82 @@ pub fn filter_suppressions(mut diags: Vec<Diag>, text: &str) -> Vec<Diag> {
         })
     });
     diags
+}
+
+// ---------------------------------------------------------------------------
+// undefined-function（P5 首条符号解析类诊断）
+// ---------------------------------------------------------------------------
+
+/// 一个文件的**裸 callee 调用点**全集（`call_expression` 的 `function` 字段
+/// 为 `identifier`）。共用一个 TreeCursor（`node.walk` 的 FFI 开销，
+/// `verify_tree` 同款）；**不深入 ERROR 子树**——错误恢复区域的调用点
+/// 语义语境不可靠（parse-error 已在报，双重噪音无意义）。
+fn collect_bare_callees<'t>(tree: &'t Tree) -> Vec<as_syntax::tree_sitter::Node<'t>> {
+    let mut out = Vec::new();
+    let mut c = tree.root_node().walk();
+    walk_bare_callees(&mut c, &mut out);
+    out
+}
+
+fn walk_bare_callees<'t>(
+    c: &mut as_syntax::tree_sitter::TreeCursor<'t>,
+    out: &mut Vec<as_syntax::tree_sitter::Node<'t>>,
+) {
+    let node = c.node();
+    if node.is_error() || node.is_missing() {
+        return;
+    }
+    if node.kind() == "call_expression" {
+        if let Some(f) = node.child_by_field_name("function") {
+            if f.kind() == "identifier" {
+                out.push(f);
+            }
+        }
+    }
+    // 嵌套调用（`F(G())`）仍要深入
+    if c.goto_first_child() {
+        loop {
+            walk_bare_callees(c, out);
+            if !c.goto_next_sibling() {
+                break;
+            }
+        }
+        c.goto_parent();
+    }
+}
+
+/// `undefined-function`（未经抑制过滤——由 as-lsp 侧统一滤，与
+/// cyclic-inheritance 同构）：逐裸 callee 走 [`resolve_at_node`]
+/// （`resolve_callee` 同链：局部 → 成员/访问器/mixin → 命名空间 → 全局），
+/// 解析 None 即报。
+///
+/// 范围与已知边界：
+/// - 只查**裸标识符 callee**（`Printxxx("x")`）：成员调用（`A.B()`）依赖
+///   接收者定型（D14 宁缺毋假——接收者不可定型时无从判定真伪，不查）、
+///   模板构造（`TArray<int>(x)`）文法独立成 `template_type`，均不在内；
+/// - `FVector(1,2,3)` 构造调用 / 局部委托变量 `D(5)` / 隐式 this 成员
+///   `Tick()` / `Super(...)` 均在链内，解析成功不报；
+/// - 引擎函数存在但未导出（数据源缺口，future-work 4.x）时会误报——
+///   已知失真，靠 `.d.as` 重新导出自愈，可 `as-ignore` 抑制；
+/// - 性能：与 references 同一成本形态（逐站点全链解析），只跑 Script 文件。
+pub fn undefined_call_diags(ws: &Workspace, file: FileId, tree: &Tree, text: &str) -> Vec<Diag> {
+    let mut out = Vec::new();
+    for callee in collect_bare_callees(tree) {
+        if resolve_at_node(ws, file, text, callee).is_none() {
+            out.push(Diag {
+                code: DiagCode::UndefinedFunction,
+                range: syntax::span(callee),
+                severity: DiagSeverity::Error,
+                message: format!(
+                    "未定义的函数 '{}'：局部 / 成员 / 命名空间 / 全局作用域中均未找到\
+                     该名字（函数、委托或可构造类型）。若这是引擎侧函数，请检查 \
+                     .d.as 类型声明是否已导出并配置。",
+                    syntax::text(callee, text)
+                ),
+            });
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -359,5 +450,109 @@ mod tests {
         assert_eq!(DiagCode::CyclicInheritance.to_string(), "cyclic-inheritance");
         assert_eq!(DiagCode::parse("cyclic-inheritance"), Some(DiagCode::CyclicInheritance));
         assert_eq!(DiagCode::parse("missing-type-decl"), None); // 未登记（近形名不模糊匹配）
+    }
+
+    // ------------------------------------------------------------------
+    // undefined-function（P5 首条符号解析类诊断）
+    // ------------------------------------------------------------------
+
+    fn build_ws(srcs: &[(&str, &str)]) -> Workspace {
+        let inputs = srcs
+            .iter()
+            .map(|(path, src)| crate::workspace::FileInput {
+                file: crate::intern::intern_file(path, 0),
+                kind: if path.ends_with(".d.as") {
+                    crate::workspace::FileKind::Decl
+                } else {
+                    crate::workspace::FileKind::Script
+                },
+                module: None,
+                source: (*src).to_string(),
+            })
+            .collect();
+        Workspace::build(crate::config::IndexConfig::default(), inputs)
+    }
+
+    /// 用户 case 的最小化：Global.d.as 声明 Print；脚本调 Print（可解析）
+    /// 与 Printxxx（全链落空）——只报后者，range 落名字区间。
+    #[test]
+    fn undefined_function_flags_missing_global_only() {
+        const DECL: &str = "void Print(float32 Duration);\n";
+        const SRC: &str = "\
+void test_001()
+{
+    Print(1.0f);
+    Printxxx(\"123\");
+}
+";
+        let ws = build_ws(&[
+            ("unique://diag/global.d.as", DECL),
+            ("unique://diag/test.as", SRC),
+        ]);
+        let file = crate::intern::intern_file("unique://diag/test.as", 0);
+        let e = ws.files.get(&file).unwrap();
+        let diags = undefined_call_diags(&ws, file, &e.tree, &e.source);
+        assert_eq!(diags.len(), 1, "只有 Printxxx 报：{diags:?}");
+        let d = &diags[0];
+        assert_eq!(d.code, DiagCode::UndefinedFunction);
+        assert_eq!(d.severity, DiagSeverity::Error);
+        let start = SRC.find("Printxxx").unwrap() as u32;
+        assert_eq!(d.range, TextRange::new(start, start + "Printxxx".len() as u32));
+        assert!(d.message.contains("Printxxx"));
+    }
+
+    /// 各可解析形态不报：同文件引用 / 构造调用 / 委托局部 / 隐式 this 成员 /
+    /// 命名空间内函数 / 嵌套调用内层命中。
+    #[test]
+    fn undefined_function_resolves_known_shapes() {
+        const SRC: &str = "\
+struct FVector { float X; }
+delegate void FDel(int X);
+class C
+{
+    int Field;
+    void Tick()
+    {
+        Tick();
+        Field = 1;
+        FDel D;
+        D(5);
+        FVector V = FVector();
+        Helper(Later());
+    }
+}
+namespace NS
+{
+    void NsFn() { NsFn(); }
+}
+void Later() {}
+void Helper(int V) {}
+";
+        let ws = build_ws(&[("unique://diag/shapes.as", SRC)]);
+        let file = crate::intern::intern_file("unique://diag/shapes.as", 0);
+        let e = ws.files.get(&file).unwrap();
+        let diags = undefined_call_diags(&ws, file, &e.tree, &e.source);
+        assert!(diags.is_empty(), "全部可解析形态不应报：{diags:?}");
+    }
+
+    /// ERROR 子树内的调用点不查（错误恢复区域的语义语境不可靠）。
+    #[test]
+    fn undefined_function_skips_error_subtree() {
+        const SRC: &str = "void F()\n{\n    ??? Printxxx(1);\n}\n";
+        let ws = build_ws(&[("unique://diag/err.as", SRC)]);
+        let file = crate::intern::intern_file("unique://diag/err.as", 0);
+        let e = ws.files.get(&file).unwrap();
+        assert!(!as_syntax::verify_tree(&e.tree).is_empty(), "前置：该源确有 parse-error");
+        assert!(
+            undefined_call_diags(&ws, file, &e.tree, &e.source).is_empty(),
+            "ERROR 子树内的 Printxxx 不报"
+        );
+    }
+
+    #[test]
+    fn diag_code_undefined_function_display_and_parse() {
+        assert_eq!(DiagCode::UndefinedFunction.to_string(), "undefined-function");
+        assert_eq!(DiagCode::parse("undefined-function"), Some(DiagCode::UndefinedFunction));
+        assert_eq!(DiagCode::parse("undefined-function2"), None); // 近形名不模糊匹配
     }
 }
