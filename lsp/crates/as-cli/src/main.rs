@@ -63,6 +63,12 @@ enum Command {
         /// 对全部文件的 UseSite 跑引用解析内核并计时（M4 验收：站点数 / 解析率 / 耗时）
         #[arg(long)]
         ref_stats: bool,
+
+        /// 双轨对账（Phase A 验收，D37）：同时构建新架构（summary +
+        /// Aggregation）与旧 WorkspaceIndex，比对声明数 / 名字集合，
+        /// 任何不一致 → 退出码非 0；并打印两侧耗时
+        #[arg(long)]
+        new_arch: bool,
     },
 }
 
@@ -70,8 +76,8 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::DumpTree { paths, trees } => dump_tree(&paths, trees),
-        Command::DumpIndex { paths, float_is_float32, sym, resolve_stats, ref_stats } => {
-            dump_index(&paths, !float_is_float32, sym, resolve_stats, ref_stats)
+        Command::DumpIndex { paths, float_is_float32, sym, resolve_stats, ref_stats, new_arch } => {
+            dump_index(&paths, !float_is_float32, sym, resolve_stats, ref_stats, new_arch)
         }
     }
 }
@@ -238,6 +244,7 @@ fn dump_index(
     sym_filter: Option<String>,
     resolve_stats: bool,
     ref_stats: bool,
+    new_arch: bool,
 ) -> ExitCode {    let files = match collect_inputs(paths) {
         Ok(files) => files,
         Err(msg) => {
@@ -276,7 +283,80 @@ fn dump_index(
 
     let config = IndexConfig { float_is_float64 };
     println!("config: float_is_float64={float_is_float64}");
+    // 双轨对账（Phase A，D37）：旧侧先建（inputs 被 move）；新侧用
+    // 独立 parse（source 克隆一份），两侧同源同配置。
+    let new_arch_sources: Vec<(as_core::id::FileId, as_core::FileKind, Option<as_core::id::Sym>, String)> =
+        inputs
+            .iter()
+            .map(|i| (i.file, i.kind, i.module, i.source.clone()))
+            .collect();
+    let t_old = std::time::Instant::now();
     let idx = WorkspaceIndex::build(config, inputs);
+    let old_elapsed = t_old.elapsed();
+    if new_arch {
+        use rayon::prelude::*;
+        use std::collections::HashMap;
+        let t_new = std::time::Instant::now();
+        let summaries: HashMap<as_core::id::FileId, as_core::summary::FileSummary> =
+            new_arch_sources
+                .into_par_iter()
+                .map(|(file, kind, module, source)| {
+                    let tree = as_core::as_syntax::parse(&source, None);
+                    let s = as_core::summary::extract_summary(&tree, &source, kind, module, &config);
+                    (file, s)
+                })
+                .collect();
+        let agg = as_core::Aggregation::build(&summaries);
+        let new_elapsed = t_new.elapsed();
+
+        // 对账 ①：非合成声明总数（旧侧 SYNTHETIC = 内建 + delegate 展开
+        // + namespace 合成，均为索引期产物，新侧不迁移）
+        let new_decls: usize = summaries.values().map(|s| s.decls.len()).sum();
+        let old_real = idx
+            .symbols
+            .iter()
+            .filter(|(_, d)| !d.flags.contains(as_core::DefFlags::SYNTHETIC))
+            .count();
+        // 对账 ②：名字集合（旧侧桶内须有非合成成员——合成 namespace 不计）
+        let old_names: std::collections::BTreeSet<as_core::id::Sym> = idx
+            .main
+            .iter()
+            .filter(|(_, defs)| {
+                defs.iter().any(|&id| {
+                    !idx.symbols.get(id).flags.contains(as_core::DefFlags::SYNTHETIC)
+                })
+            })
+            .map(|(s, _)| *s)
+            .collect();
+        let new_names: std::collections::BTreeSet<as_core::id::Sym> =
+            agg.main.keys().copied().collect();
+
+        println!("---- new-arch reconcile ----");
+        println!(
+            "decls total: new {new_decls} vs old {old_real} | {}",
+            if new_decls == old_real { "OK" } else { "MISMATCH" }
+        );
+        println!(
+            "main keys: new {} vs old {} | {}",
+            new_names.len(),
+            old_names.len(),
+            if new_names == old_names { "OK" } else { "MISMATCH" }
+        );
+        if new_names != old_names {
+            use std::fmt::Write as _;
+            let mut sample = String::new();
+            for s in new_names.symmetric_difference(&old_names).take(8) {
+                let _ = write!(sample, " {}", as_core::intern::sym_str(*s));
+            }
+            println!("  diff sample:{sample}");
+        }
+        println!(
+            "timing: old {old_elapsed:?} | new {new_elapsed:?} (parse+summary+aggregation, rayon)"
+        );
+        if new_decls != old_real || new_names != old_names {
+            return ExitCode::FAILURE;
+        }
+    }
 
     // 文件统计（错误节点清单已不在快照里——诊断期按需收集（mylua 同款）；
     // CLI 的批量校验口径不变：has_error 剪枝对合法文件 O(1)）

@@ -1,6 +1,6 @@
 # 索引架构（per-file summary + 薄聚合层 + 按需定型）
 
-> 版本 v1.1（2026-09-28）
+> 版本 v1.2（2026-09-28）
 >
 > **定位**：索引层的**重构设计稿**。现行架构（三阶段流水线、全局扁平符号 arena、
 > use-site 预收集）的替代方案。驱动因素：冷启动性能（414 `.d.as` ~1s 仍偏慢且
@@ -160,7 +160,7 @@ pub struct Scope {
 
 pub struct LocalDecl {
     pub name: Sym,
-    pub kind: LocalKind,                // Var / Param / IterVar / LocalFn
+    pub kind: LocalKind,                // Var / Param / IterVar（AS 无嵌套函数，无 LocalFn）
     pub name_span: TextRange,           // 声明锚点（rename/definition）
     /// 预推导类型（§3.3.1）；推不出 = None（查询期补）
     pub ty: Option<SynType>,
@@ -182,10 +182,15 @@ pub struct LocalDecl {
 
 | 模式 | 结果 |
 |---|---|
-| `Cast<T>(x)` | `Named(T)` —— 名字直接抄，不解 |
-| `auto X = FVector(1,2,3)` | 构造调用 → 显式类型名（本文件可见） |
+| `Cast<T>(x)` | `Named(T)` —— 名字直接抄，不解（文法侧 `'Cast'` 是匿名 token，type 字段直接是 T） |
 | `auto X = OtherLocal` | 复制已定型局部的名字（同趟顺序扫描） |
-| 字面量 | `1`→int、`1.5`→float（按配置归一）、`n"…"`→FName、f-string→FString（D25） |
+| 字面量 | `1`→int、`1.5`→float（按配置归一）、`n"…"`→FName、f-string/字符串→FString（D25） |
+
+**实现期裁决（Phase A 落地时定，与初稿两处差异）**：
+- **构造调用不做**——`auto X = Ident(args)` 无法与函数调用语法区分，
+  宁缺毋假（宁少推不推错）；
+- **显式声明类型保留裸 `float`**（归一化是 L3 消费期的事）；字面量无
+  源码类型名，直接给规范名（float64/float32）——两层各自一致。
 
 **推不出的**（跨文件传播，如 `auto X = Actor.GetComponent()`）：保留
 `None`，L3 查询期补。**预推导是加速器，不是真值源**——命中率高低不影响
@@ -208,8 +213,10 @@ pub struct Aggregation {
     pub main: HashMap<Sym, Vec<DeclRef>>,
     /// mixin 名字倒排：首参类型名 → mixin 声明锚点
     pub mixin_by_name: HashMap<Sym, Vec<DeclRef>>,
-    /// 模块名 → 文件（local 函数可见域过滤）
-    pub module_files: HashMap<Sym, FileId>,
+    /// 模块名 → 成员文件集（local 函数可见域过滤）；映射经
+    /// `module_file(Sym) -> Option<FileId>` 访问器取（root 优先序最优，
+    /// 实现期定：成员表而非单值映射——接替者在删除时自动重选）
+    module_members: HashMap<Sym, BTreeSet<FileId>>,
     /// per-file 贡献倒排（增量更新的钥匙，mylua uri_to_paths 同款）
     contributions: HashMap<FileId, Vec<ContributionKey>>,
 }
@@ -454,5 +461,6 @@ append-only 内存单调涨与重映射复杂度——旧设计不迁就（用�
 
 | 版本 | 日期 | 内容 |
 |---|---|---|
+| v1.2 | 2026-09-28 | **Phase A 落地同步**（实现期三处裁决）：① LocalKind 无 LocalFn（AS 无嵌套函数，v1.1 笔误）；② auto 预推导不做构造调用（`auto X = Ident(args)` 与函数调用无法语法区分，宁缺毋假）+ 显式声明保留裸 `float` / 字面量给规范名的双层口径（§3.3.1）；③ 聚合层模块映射改成员表 + `module_file` 访问器（删除时接替者自动重选，§4.1）。Phase A 验收：414 `.d.as` 双轨对账零差异（decls 101134 / main keys 53711），新架构 531ms vs 旧 956ms（-44%） |
 | v1.1 | 2026-09-28 | **scope_tree 升级为 FileSummary 必含组件**（§3.3 重写）：否决「扁平局部表」倾向——遮蔽语义下每次查询都要现场重建树形关系（区间包含 + 深度比较），resolve 第 1 级 / completion 局部候选 / references 逐点验证 / inlay 全依赖它，不如提取期一次建好；结构定案（Scope arena + parent 链 + LocalDecl 含预推导类型）、两查询原语（`resolve_local` / `locals_visible`）、AS 简化点（无 lambda ⇒ 无捕获记账；`local` 函数模块级可见性归 L2）；风险 4（扁平表验证项）随之移除 |
 | v1.0 | 2026-09-28 | 首版：三层模型（per-file summary / 薄聚合层 / 按需定型）；D5/D23/D29 翻案裁决；mixin 名字倒排简化；auto-only 推导边界与局部定型表；references 查询期化；DefId → DeclRef 一步到位；实施切分 7 步 |

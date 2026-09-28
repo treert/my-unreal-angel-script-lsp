@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 as-core = { path = "../as-core" }
+rayon = "1"
