@@ -92,7 +92,8 @@ as-core/src/
 ├── overload.rs    # 重载解析与排序（一等模块；含 M4 调用点消歧判定）
 ├── decl_tags.rs   # .d.as 注解标签解析与 tag/doc 分流（架构设计 §2.4.3/§2.4.4）
 ├── diag.rs        # 诊断内核（M6 已落地：DiagCode/Diag/DiagSeverity + 行级抑制
-│                  #   解析 + AS0902/AS0903/AS0907 规则本体；码号只在诊断码表登记，
+│                  #   解析 + missing-type-decls/parse-error/cyclic-inheritance
+│                  #   规则本体；诊断名只在诊断码表登记（实现时命名，D42），
 │                  #   §12 G5；发布管道在 as-lsp 侧 diag.rs + 调度器，D40）
 └── range.rs       # TextRange（字节）+ 行首偏移表；UTF-16 换算原语（移植 mylua 方案）
 ```
@@ -155,7 +156,7 @@ struct DefData {
 | 类型别名式 | `Delegate` / `Event`（声明本体；展开出的成员另计，见 §3.1） |
 | 可调用 | `Function` / `Method` / `Constructor` / `Destructor` / `Operator` |
 | 数据 | `GlobalVar` / `Field` / `Param` / `LocalVar` / `TypeParam` / `AssetDecl` |
-| 访问器 | `VirtualProperty`（`int X { get {...} }`，顶层与类内均可出现，`AS0005` 依赖它） |
+| 访问器 | `VirtualProperty`（`int X { get {...} }`，顶层与类内均可出现；bodyless 形态的语义诊断素材依赖它，P5 按需） |
 
 - `Operator` 与 `Method` 分开：引擎内部语法 §1.5 要求对 `opCast`/`opImplCast` 等降权，
   补全排序需要按 kind 区分，事后用名字前缀判断不可靠。
@@ -555,7 +556,7 @@ pub fn resolve_overload(cands: &[DefId], args: &[TypeId]) -> Vec<Ranked>;
 | `completion` | 查找链上下文 + 成员 + UFUNCTION 名单（`AddUFunction(this, n"\|`）+ 说明符 schema + 命名参数 | M5 |
 | `signatureHelp` | 重载集排序 | M5 |
 | `inlayHint` | auto 变量推导类型展示（依赖 §4.2 表达式定型） | M5 |
-| `publishDiagnostics` | M6 落地 + **Phase D（D40）升级为调度队列**：as-core `diag.rs`（规则本体 + 抑制过滤）+ as-lsp `diagnostic_scheduler.rs`（热文件 300ms 防抖 + 结构变化全量 + 打开优先 + 插队）+ `diag.rs`（`drain` 消费侧）；`AS0902`/`AS0903`/`AS0907` + `// as-ignore:` 行级抑制；P5 全量规则 | M6 |
+| `publishDiagnostics` | M6 落地 + **Phase D（D40）升级为调度队列**：as-core `diag.rs`（规则本体 + 抑制过滤）+ as-lsp `diagnostic_scheduler.rs`（热文件 300ms 防抖 + 结构变化全量 + 打开优先 + 插队）+ `diag.rs`（`drain` 消费侧）；`missing-type-decls`/`parse-error`/`cyclic-inheritance` + `// as-ignore:` 行级抑制；P5 全量规则 | M6 |
 | `didChangeConfiguration` | `floatIsFloat64` 等索引级配置变更 → 全量重建（§5.3） | M2 |
 
 ## 9. 里程碑与验收
@@ -570,7 +571,7 @@ pub fn resolve_overload(cands: &[DefId], args: &[TypeId]) -> Vec<Ranked>;
 | M3 | 查找链 + hover/definition | as-core 内置单测覆盖查找链 0-6 级命中序（§10）。四类专项用例：`super`、struct 单层、访问器反向默认、**mixin 五条准入条件**（真实成员优先于 mixin 而短路 / 全局函数体内不命中 / `NS::Foo(obj)` 不命中 / 父命名空间的 mixin 可命中 / 首参为接收者祖先类时命中）；as-cli 对语料批量 dump-index 校验 |
 | M4 | references/rename/workspaceSymbol + 重载消歧 | 重载函数引用消歧用例（成功/失败双路径）；`$/progress` 长任务；文件增删改名后索引一致性用例（§5.3） |
 | M5 | completion/signatureHelp/inlayHint | `X.` 成员补全、`n"\|` UFUNCTION 名单、`UCLASS(` 说明符补全、命名参数补全四类截图验收 + `auto` 变量 inlay 类型展示；**命名实参补全跳过 `InArgN` 占位**（架构设计 §2.4.6） |
-| M6 | 诊断起步 | ✅ 完成（2026-09，形态见 D36；**Phase D / D40 更新**：发布时序改为调度队列——didOpen/didChange 标热 + 300ms 防抖、结构变化（surface 含 bases）触发全量重诊断（打开优先、固定 Full）、didClose 清空 + invalidate、Loading 不推 + 快照发布经 diag 通道 request_full 兜底；新增 `AS0907` 继承环；AS0902 发布面扩到全部 Script 文件）：诊断框架——as-core `diag.rs`（`enum DiagCode` 仅收已实现码、`Diag`/`DiagSeverity`、行级抑制解析）+ as-lsp `diagnostic_scheduler.rs` 调度器与 `diag.rs` 消费侧；两规则生效——`AS0903`（Error，`ERROR`/`MISSING` 节点）/ `AS0902`（Warning，decl 缺失，(0,0)）。验收：151 单测 + smoke 三段断言（初始 `AS0902`+`AS0903` → 修复 → 抑制空数组）+ 双 e2e + 对账 13814/63338 不回归。具体规则进 P5 按需设计（D22） |
+| M6 | 诊断起步 | ✅ 完成（2026-09，形态见 D36；**Phase D / D40 更新**：发布时序改为调度队列——didOpen/didChange 标热 + 300ms 防抖、结构变化（surface 含 bases）触发全量重诊断（打开优先、固定 Full）、didClose 清空 + invalidate、Loading 不推 + 快照发布经 diag 通道 request_full 兜底；新增 `cyclic-inheritance` 继承环；missing-type-decls 发布面扩到全部 Script 文件）：诊断框架——as-core `diag.rs`（`enum DiagCode` 仅收已实现码、`Diag`/`DiagSeverity`、行级抑制解析）+ as-lsp `diagnostic_scheduler.rs` 调度器与 `diag.rs` 消费侧；两规则生效——`parse-error`（Error，`ERROR`/`MISSING` 节点）/ `missing-type-decls`（Warning，decl 缺失，(0,0)）。验收：151 单测 + smoke 三段断言（初始 `missing-type-decls`+`parse-error` → 修复 → 抑制空数组）+ 双 e2e + 对账 13814/63338 不回归。具体规则进 P5 按需设计（D22） |
 
 对应架构设计 §6：M0-M2 ≈ P3 前半，M3-M5 ≈ P3 后半 + P4，M6 衔接 P5。
 扩展（模块四）在 M2 提前就位最小版（languageId + client + 配置项骨架），后续里程碑增量加命令。
@@ -618,6 +619,7 @@ pub fn resolve_overload(cands: &[DefId], args: &[TypeId]) -> Vec<Ranked>;
 
 | 版本 | 内容 |
 |---|
+| v1.7 | **诊断码改命名制连带**（D42）：§2.2 `diag.rs` 行、§3.1 访问器行、§8.1 publishDiagnostics 行、§9 M6 行的诊断码换名（`AS0902`→`missing-type-decls`、`AS0903`→`parse-error`、`AS0907`→`cyclic-inheritance`）；「先占号」表述改为「实现时命名登记」。历史变更行保留旧码，按码表 §4 对照解读 |
 | v1.6 | **Phase D 落地登记（D40，D36 时序翻案）**：§2.2 `diag.rs` 描述更新（AS0907 + as-lsp 侧调度器）；§8.1 publishDiagnostics 行标注调度队列形态；§9 M6 行补 Phase D 更新说明。发布时序：didOpen/didChange 标热 + 300ms 防抖、结构变化（`decl_surface` 扩含 bases）触发全量重诊断（打开优先、固定 Full、`.d.as` 剔除）、drain 中途新事件即刻插队、didClose 清空 + invalidate、Loading 不推 + 快照发布经 diag 通道 request_full 兜底。验收：176 单测全绿 + 语料三旗标精确一致（94.9% / 25505 / 101322，cycles 0） |
 | v1.5 | **M6 落地登记**：§2.2 `diag.rs` 描述更新（已建：DiagCode/Diag/抑制解析 + AS0902/AS0903 规则本体；发布管道在 as-lsp 侧 `diag.rs`）；§8.1 publishDiagnostics 行标注已落地；§9 M6 完成登记。实现期定案 **D36**（见决策记录）：DiagCode 只收已实现码、AS0903 语义泛化（ERROR/MISSING 节点即报）、AS0902 发布形态（打开文档 (0,0) Warning）、抑制注释四形态、发布时序（Loading 不推 / Ready 补推 / 无防抖）。验收：151 单测全绿；smoke 增 publishDiagnostics 三段断言（初始 `AS0902`+`AS0903` → 修复 → 抑制空数组）；双 e2e 与对账 13814/63338 不回归 |
 | v1.4 | **M5 落地登记**：§2.2 补 `expr.rs` / `completion.rs` / `signature.rs` / `inlay.rs` / `specifiers.rs`；§4.2 补 M5 落地形态（ExprTy、运算符重载消歧、最小提升近似 D32、引擎类型非内建 D31、模板实参替换 D33、auto 边收集边入栈）。实现期定案 D31-D35（见决策记录）；**顺带修 M3 潜伏 bug**：`publish_and_replay` 把 overlay 版本预填进 `indexed_versions` ⇒ 冷启动发布后 pending_dirty 重放被「版本相等」短路成空操作——didOpen 文本 ≠ 磁盘内容时索引里一直是磁盘旧文本（hover 恒 null）；M4 未暴露是因为 e2e 的 didOpen 文本恰等于磁盘内容；修为发布后清空、重放对每个 dirty 文件真正 reindex。验收：136 单测全绿；resolve-stats 94.3% → **94.9%**（命中 1009 → 1027）；ref-stats 68763 / 99.4% / 0.6s 与对账 13814/63338 不回归；e2e 补 Scoped（FVector::Zero 前缀 → 唯一 ZeroVector）与 Member（FVector 87 项含 X/Y/Z/DotProduct）断言；smoke 增 completion（Plain/前缀/说明符）+ signatureHelp（槽位/命名实参）+ inlayHint（auto Total → `: int`）断言 |---|

@@ -51,9 +51,9 @@
 
 | # | 事项 | 说明 | 登记处 |
 |---|---|---|---|
-| 4.1 | **导出器 group 文件名冲突** | 434 group → 414 文件，20 个被覆盖（类型丢失）。LSP 不读 manifest 无从检出（`AS0905` retired，D20）——**只能在导出器侧修**（`MakeGroupFileName` 去重）。用户症状：少数模块类型找不到且无提示 | 架构设计 §8 风险 7 |
+| 4.1 | **导出器 group 文件名冲突** | 434 group → 414 文件，20 个被覆盖（类型丢失）。LSP 不读 manifest 无从检出（group 冲突检出已随 D20 取消）——**只能在导出器侧修**（`MakeGroupFileName` 去重）。用户症状：少数模块类型找不到且无提示 | 架构设计 §8 风险 7 |
 | 4.2 | **EnhancedInput 插件类型不在本机 AS-Cache** | resolve-stats 未命中主因（94.9% 的缺口大头）；属数据源缺口非 bug——引擎侧把插件类型导出后自愈 | M3/M5 验收段注记 |
-| 4.3 | **f-string 嵌套格式说明符**（`f"{a:{fmt}}"`） | 文法不支持，落入错误恢复 ⇒ 现由 AS0903 报 Error（M6 已覆盖「报错」半边）；「支持解析」半边待 grammar 升级 | grammar/README 偏差 §9 |
+| 4.3 | **f-string 嵌套格式说明符**（`f"{a:{fmt}}"`） | 文法不支持，落入错误恢复 ⇒ 现由 parse-error 报 Error（M6 已覆盖「报错」半边）；「支持解析」半边待 grammar 升级 | grammar/README 偏差 §9 |
 
 ## 5. 扩展侧（模块四）
 
@@ -62,7 +62,7 @@
 | 5.1 | **VSCode 体感验收（M2-M6 五批）** | 唯一**积欠**的验收硬项：semanticTokens 渲染对照（M2）、hover/F12（M3）、references/F2/Ctrl+T（M4）、四类补全 + inlay + InArgN 断言（M5）、诊断红线 + 抑制注释（M6）。执行方式见 lsp/README 各里程碑验收段第 ⑤ 步 | 各里程碑验收段 |
 | 5.2 | `Export Type Declarations` 命令转发 | 架构设计 §5 列的三个命令只落了 `restartServer`；此命令依赖引擎在线通道（P6）或提示用户在 UE 编辑器执行 | 架构设计 §5 |
 | 5.3 | `Dump Syntax Tree` 调试命令 | 同上未做；可先行（调 as-cli，不依赖 P6） | 架构设计 §5 |
-| 5.4 | `.d.as` 目录自动发现 | **已搁置**（D24）：需先解消多副本双源冲突（`Saved/AS-Cache` 与版本库过期副本同时入索引 ⇒ 双定义 + 静默错误）；消解规则占新码 ~~`AS0907`~~ `AS0908`（原预占号被 Phase D 继承环占用，码表 v1.0 为准）。继续用 `typeDeclarationDirs` 显式配置 | D24 搁置项 / docs/README 待办表 #5 |
+| 5.4 | `.d.as` 目录自动发现 | **已搁置**（D24）：需先解消多副本双源冲突（`Saved/AS-Cache` 与版本库过期副本同时入索引 ⇒ 双定义 + 静默错误）；消解规则需届时命名登记新诊断（D42：实现时才命名，不预登记）。继续用 `typeDeclarationDirs` 显式配置 | D24 搁置项 / docs/README 待办表 #5 |
 
 ## 6. 文档修缮 ✎
 

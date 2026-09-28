@@ -147,7 +147,7 @@ Get-ChildItem test\corpus\*.txt | ForEach-Object {
    （调用位跳过 out 参数的引擎构造），压过 `primitive_type` 的 `void` ⇒
    无名的 `(void)` 不可能走 `parameter_list` 路径。实测两种落点：
    `void F(void) {}`（有函数体）→ **ERROR 节点**（错误恢复吞掉，M6 起由
-   `AS0903` 诊断兜底）；`void D(void);`（无体声明）→ 被变量声明的
+   `parse-error` 诊断兜底）；`void D(void);`（无体声明）→ 被变量声明的
    `variable_declarator name(arguments)` 构造吞掉（读作「类型 `void` 的
    变量 `D`，构造实参 `(void)`」，不报错但语义非预期）。
    带名的 `void X` 形参**可达**（parameter 是唯一完整解析，prec 不参与），
@@ -199,7 +199,7 @@ Get-ChildItem test\corpus\*.txt | ForEach-Object {
 | **`.as` 里的模板声明头** `class TFoo<T> {...}` | 本文法接受（`type_parameters` 为 `.d.as` 而设，同一 parser 无法按后缀关闭）。引擎侧 `ParseClass` 在标识符后不认 `<` → **parse error `Expected '{'`**；UE 预处理器的类名正则也不含 `<>`（`AngelscriptPreprocessor.cpp:723`）。若要报错须由语义层做，**是否实现按需决定**（素材见 `docs/诊断码表.md` §2 末段）。 |
 | **`.as` 里的 `?` / `unresolved_object`** | 同理：为 `.d.as` 而设的节点在 `.as` 中一律非法（引擎内部语法 §1.4 / §3.2）。 |
 
-> lambda 与 import 原先也在此表（语法放行 + `AS0107`/`AS0904` 语义诊断），
+> lambda 与 import 原先也在此表（语法放行 + 对应语义诊断），
 > 2026-09 决策改为**文法层直接不实现**（见偏差 §8），两个诊断码随之 retired。
 
 虚属性访问器的属性集与普通方法相同（`ParseVirtualPropertyDecl` 直接调

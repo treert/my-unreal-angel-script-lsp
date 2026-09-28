@@ -117,9 +117,9 @@ if (isStruct) {
 
 ### 2.3 语法层只差一条
 
-`struct` 内不允许 `default` 语句（`as_parser.cpp:3828` 用 `!isStruct` 守卫）→ `AS0001`。
+`struct` 内不允许 `default` 语句（`as_parser.cpp:3828` 用 `!isStruct` 守卫）。
 其余成员形态（方法、构造/析构、运算符重载、虚属性、`access` 声明）**完全一致**；
-`: Base` 继承列表 parser 也接受，由上层拒绝 → `AS0201`。
+`: Base` 继承列表 parser 也接受，由上层拒绝。
 
 > **文法决策**：`struct F : G {}` 在 tree-sitter 层应当**正常解析成功**，
 > 继承违规由 LSP 报语义诊断（见 [`诊断码表.md` §4](../docs/诊断码表.md#4-as02xx--ue-反射约束)）。`grammar.js` 现状符合此约定。
@@ -207,7 +207,7 @@ if (PropertyType.RequiresProperty())
 ```
 
 struct 里只要成员**可能**含 UObject 引用，即使没写 `UPROPERTY()` 也会被强制生成属性；
-生成不了就直接编译报错（`AS0301`，见 [`诊断码表.md` §5](../docs/诊断码表.md#5-as03xx--gc--属性生成)）。
+生成不了就直接编译报错（取证见 [`诊断码表.md`](../docs/诊断码表.md) 素材表）。
 这与 UE C++ 中「`USTRUCT` 内必须 `UPROPERTY()` 才被 GC 追踪」是同一模型。
 
 ## 4. 其它已确认的机制级差异
@@ -245,11 +245,11 @@ struct 里只要成员**可能**含 UObject 引用，即使没写 `UPROPERTY()` 
 
 | 构造 | 层 | 机制 | 证据 | LSP 处置 |
 |---|---|---|---|---|
-| **lambda** `function(...) {...}` | L2 | 编译器对 lambda 的唯一出口是隐式转换到 funcdef（`ImplicitConvLambdaToFunc` 开头即 `asASSERT(to.IsFuncdef() && ctx->IsLambda())`）；而 funcdef 是死 token（§1.1），且 AngelscriptCode 从不注册脚本可见的 funcdef → lambda 恒报 `Invalid expression: stand-alone anonymous function` | `[ENGINE]as_compiler.cpp:8339`（断言）、`6291`（报错点）、`as_texts.h:150`；AngelscriptCode 全模块无 `RegisterFuncDef` | **文法不实现**（parse error，2026-09 决策）：语法层拒绝与「实际跑不起来」一致；原 `AS0107` 随之 retired |
+| **lambda** `function(...) {...}` | L2 | 编译器对 lambda 的唯一出口是隐式转换到 funcdef（`ImplicitConvLambdaToFunc` 开头即 `asASSERT(to.IsFuncdef() && ctx->IsLambda())`）；而 funcdef 是死 token（§1.1），且 AngelscriptCode 从不注册脚本可见的 funcdef → lambda 恒报 `Invalid expression: stand-alone anonymous function` | `[ENGINE]as_compiler.cpp:8339`（断言）、`6291`（报错点）、`as_texts.h:150`；AngelscriptCode 全模块无 `RegisterFuncDef` | **文法不实现**（parse error，2026-09 决策）：语法层拒绝与「实际跑不起来」一致；原预登记的语义诊断随之取消 |
 | **裸 enum 值** `Value`（非 `MyEnum::Value`） | L2 | `asEP_REQUIRE_ENUM_SCOPE = 1`：符号查找跳过「不写枚举类型名」的兜底分支，落入通用「未找到」错误 | `[UE]Private/AngelscriptManager.cpp:337`；`[ENGINE]as_compiler.cpp:11815`（`!engine->ep.requireEnumScope` 守卫） | 归入 `AS04xx`（符号解析，P3/P4 落地时占号） |
 | **mixin class** `mixin class Foo {...}` | L2 | `mixin` token 活着，但 `ParseMixin` 已被重定义为「mixin + **函数**声明」；`as_builder` 里的 mixin class 机器（`RegisterMixinClass` / `IncludeMethodsFromMixins` 等）是上游遗留、不可达 | `[ENGINE]as_parser.cpp:3700-3714`（"A mixin token must be followed by a function declaration"）；`as_builder.cpp:2022 / 2872 / 3827` | parse error 是**正确**行为：grammar 不实现 mixin class，与引擎一致。**但 mixin 函数是活功能且语义完整**，见 [§5.4](#54-mixin-函数活功能与-mixin-class-无关) |
-| **import** `import void f() from "mod";` | L4 | token 活、`ParseScript` 正常分发（`ttImport` → `ParseImport`）、VM 编译通过；但宿主必须调 `BindAllImportedFunctions` 才可用——AngelscriptCode 全模块 **0** 调用 → 调用时运行期报 `Unbound function called` | `[ENGINE]as_tokendef.h:275`、`as_parser.cpp:2471`、`as_texts.h:363` | **文法不实现**（parse error，2026-09 决策）：语法层拒绝比「放行再等运行期炸」更诚实；原 `AS0904` 随之 retired |
-| **虚属性（带 body）** `int X { get { ... } }` | L3 | VM 把访问器编译成 opGet/opSet 方法，但预处理器 / ClassGenerator 对 VirtualProperty **零处理**，UClass 侧无人认领；官方 pegjs 无此语法，引擎/插件全部脚本零使用 | AngelscriptCode 全模块 `VirtualProperty` **0** 命中；`grammar.js` / BNF §2.3.7 注释已记录 | 语法放行；语义层**暂不报错**（使用率为零，低优先级）；bodyless 形态已有 `AS0005` |
+| **import** `import void f() from "mod";` | L4 | token 活、`ParseScript` 正常分发（`ttImport` → `ParseImport`）、VM 编译通过；但宿主必须调 `BindAllImportedFunctions` 才可用——AngelscriptCode 全模块 **0** 调用 → 调用时运行期报 `Unbound function called` | `[ENGINE]as_tokendef.h:275`、`as_parser.cpp:2471`、`as_texts.h:363` | **文法不实现**（parse error，2026-09 决策）：语法层拒绝比「放行再等运行期炸」更诚实；原预登记的语义诊断随之取消 |
+| **虚属性（带 body）** `int X { get { ... } }` | L3 | VM 把访问器编译成 opGet/opSet 方法，但预处理器 / ClassGenerator 对 VirtualProperty **零处理**，UClass 侧无人认领；官方 pegjs 无此语法，引擎/插件全部脚本零使用 | AngelscriptCode 全模块 `VirtualProperty` **0** 命中；`grammar.js` / BNF §2.3.7 注释已记录 | 语法放行；语义层**暂不报错**（使用率为零，低优先级）；bodyless 形态引擎必报错 |
 
 ### 5.3 对照：Hazelight 官方 LSP 的「有效语法集合」
 
@@ -257,7 +257,7 @@ struct 里只要成员**可能**含 UObject 引用，即使没写 `UPROPERTY()` 
 里没有：lambda、interface、funcdef、import、mixin class、虚属性、`@`。
 这个集合基本是「真正可用」的**下界**。本 LSP 的取向（2026-09 决策）：**文法与实际可运行
 的集合对齐**——lambda / import / mixin class / `@` 一律不实现（parse error，与 pegjs 一致）；
-例外是虚属性（AS VM 自身完整支持，拦截发生在 UE 认领层，且 bodyless 形态有 `AS0005`
+例外是虚属性（AS VM 自身完整支持，拦截发生在 UE 认领层，且 bodyless 形态引擎必报错
 诊断依赖），语法放行、语义层暂不报错。
 
 ### 5.4 mixin 函数：活功能，与 mixin class 无关
@@ -359,16 +359,16 @@ LSP 侧的落地约定见 [`架构设计.md` §4.5.1 / §4.5.2](../docs/架构�
 必须在类型模型里区分**值类型 / 引用类型**。值/引用二分衍生出的完整能力清单见
 [专题 §9.1](struct类型专题.md#91-类型系统模块三)，本文只列非 struct 相关的部分：
 
-| LSP 能力 | 依赖的本文结论 | 相关诊断码 |
-|---|---|---|
-| 浮点字面量宽度推导（`1.5` vs `1.5f`） | §1.3 | — |
-| `Cast<>` 只认大写形式 | §1.2 | — |
-| 命名实参同时支持 `:` 与 `=` | §4 | — |
-| 不提供 `@` / `null` / `is` / `and`/`or`/`xor` 的补全与高亮 | §1.1 | — |
-| `interface` / `funcdef` / `typedef` 不作为关键字 | §1.1 | — |
-| `fallthrough` 位置校验 | §4 | `AS0003` |
-| `local` 函数不进跨模块符号表 | §4 | — |
-| 虚属性（语法放行、UE 不认领） | §5.2 | `AS0005`（bodyless 形态） |
+| LSP 能力 | 依赖的本文结论 |
+|---|---|
+| 浮点字面量宽度推导（`1.5` vs `1.5f`） | §1.3 |
+| `Cast<>` 只认大写形式 | §1.2 |
+| 命名实参同时支持 `:` 与 `=` | §4 |
+| 不提供 `@` / `null` / `is` / `and`/`or`/`xor` 的补全与高亮 | §1.1 |
+| `interface` / `funcdef` / `typedef` 不作为关键字 | §1.1 |
+| `fallthrough` 位置校验 | §4 |
+| `local` 函数不进跨模块符号表 | §4 |
+| 虚属性（语法放行、UE 不认领） | §5.2 |
 
 ### 7.3 文档职责划分与同步约定
 

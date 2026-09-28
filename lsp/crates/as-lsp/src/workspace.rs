@@ -66,7 +66,7 @@ pub struct WorkspaceState {
     /// 里 spawn 的 tokio 转发任务。None = 通道未接（单测）
     ready_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>>,
     /// 诊断补推通道（M6，D36）：快照发布后通知 tokio 侧对全部已打开文档
-    /// 推一轮诊断（Loading 期打开的文件 + AS0902 随重建刷新）。
+    /// 推一轮诊断（Loading 期打开的文件 + missing-type-decls 随重建刷新）。
     /// None = 通道未接（单测）
     diag_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>,
 }
@@ -142,7 +142,7 @@ impl WorkspaceState {
             self.ensure_file_fresh(file, docs);
         }
         // M6（D36）：快照发布 → 对全部已打开文档补推一轮诊断（Loading 期
-        // 打开的文件 + AS0902 的 decl 计数随重建刷新）。后台线程经通道转发。
+        // 打开的文件 + missing-type-decls 的 decl 计数随重建刷新）。后台线程经通道转发。
         if let Some(tx) = self.diag_tx.lock().unwrap().as_ref() {
             let _ = tx.send(());
         }

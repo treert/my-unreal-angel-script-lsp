@@ -27,14 +27,14 @@ use crate::workspace::{kind_of_path, WorkspaceState};
 
 /// 一轮 drain 的工作区事实（每 drain 算一次，ms 级）。
 pub struct DrainFacts {
-    /// AS0902：索引中无真实 `.d.as`（builtin 伪文件不算——B2 口径）。
+    /// missing-type-decls：索引中无真实 `.d.as`（builtin 伪文件不算——B2 口径）。
     pub decl_missing: bool,
-    /// AS0907：文件 → 环诊断（未经抑制过滤，`file_ls_diags` 统一滤）。
+    /// cyclic-inheritance：文件 → 环诊断（未经抑制过滤，`file_ls_diags` 统一滤）。
     pub cycle_diags: HashMap<FileId, Vec<Diag>>,
 }
 
 /// per-file 统一入口（打开 / 未打开同构，P9）：
-/// AS0903 ∪ AS0902（`decl_missing && Script`）∪ AS0907，经抑制过滤。
+/// parse-error ∪ missing-type-decls（`decl_missing && Script`）∪ cyclic-inheritance，经抑制过滤。
 fn file_ls_diags(
     tree: &as_syntax::tree_sitter::Tree,
     text: &str,
@@ -48,7 +48,7 @@ fn file_ls_diags(
         diags.extend(cs.iter().cloned());
     }
     diags.sort_by_key(|d| d.range.start);
-    // AS0907 不经 script_diags 内部过滤，统一再滤（对已滤部分幂等）
+    // cyclic-inheritance 不经 script_diags 内部过滤，统一再滤（对已滤部分幂等）
     let diags = filter_suppressions(diags, text);
     diags
         .into_iter()
@@ -175,7 +175,7 @@ mod tests {
     fn file_ls_diags_maps_code_and_severity() {
         let ws = WorkspaceState::new();
         let mut store = DocStore::new();
-        // 未闭合宏（AS0903）+ 索引 0 个 .d.as（AS0902）
+        // 未闭合宏（parse-error）+ 索引 0 个 .d.as（missing-type-decls）
         let src = "UFUNCTION(Blueprint\nvoid F() {}\n".to_string();
         let file = store.open("unique://lspdiag/a.as", 1, src);
         // 空索引发布 → Ready（dirty 空，重放为空操作）
@@ -184,17 +184,17 @@ mod tests {
         let doc = store.get(file).unwrap();
         let facts = DrainFacts { decl_missing: true, cycle_diags: HashMap::new() };
         let diags = file_ls_diags(&doc.tree, &doc.text, &doc.lines, true, &facts, file);
-        let as0902 = diags.iter().find(|d| d.code == code("AS0902")).unwrap();
-        assert_eq!(as0902.severity, Some(DiagnosticSeverity::WARNING));
-        assert_eq!(as0902.range.start, Position { line: 0, character: 0 });
-        let as0903 = diags.iter().find(|d| d.code == code("AS0903")).unwrap();
-        assert_eq!(as0903.severity, Some(DiagnosticSeverity::ERROR));
-        assert_eq!(as0903.source.as_deref(), Some("my-as-lsp"));
-        assert_eq!(as0903.range.start.line, 0);
+        let decl_diag = diags.iter().find(|d| d.code == code("missing-type-decls")).unwrap();
+        assert_eq!(decl_diag.severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(decl_diag.range.start, Position { line: 0, character: 0 });
+        let parse_diag = diags.iter().find(|d| d.code == code("parse-error")).unwrap();
+        assert_eq!(parse_diag.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(parse_diag.source.as_deref(), Some("my-as-lsp"));
+        assert_eq!(parse_diag.range.start.line, 0);
     }
 
     #[test]
-    fn file_ls_diags_no_as0902_when_decls_present() {
+    fn file_ls_diags_no_missing_type_decls_when_decls_present() {
         let ws = WorkspaceState::new();
         let mut store = DocStore::new();
         let file = store.open("unique://lspdiag/b.as", 1, "int X = 1;\n".to_string());
@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn file_ls_diags_unopened_entry_path_with_cycle() {
         // 未打开文件路径（索引 FileEntry）：环诊断并入 + as-ignore 抑制
-        let src_a = "class A : B {} // as-ignore: AS0907\n";
+        let src_a = "class A : B {} // as-ignore: cyclic-inheritance\n";
         let ws_idx = as_core::workspace::Workspace::build(
             as_core::IndexConfig::default(),
             vec![
@@ -226,9 +226,9 @@ mod tests {
         let a = as_core::intern::intern_file("unique://lspdiag/cyc_a.as", 0);
         let e = ws_idx.files.get(&a).unwrap();
         let diags = file_ls_diags(&e.tree, &e.source, &e.lines, true, &facts, a);
-        assert!(diags.is_empty(), "AS0907 被同行 as-ignore 抑制，且无其他诊断");
+        assert!(diags.is_empty(), "cyclic-inheritance 被同行 as-ignore 抑制，且无其他诊断");
 
-        // 去掉抑制注释 → AS0907 出现
+        // 去掉抑制注释 → cyclic-inheritance 出现
         let ws_idx2 = as_core::workspace::Workspace::build(
             as_core::IndexConfig::default(),
             vec![
@@ -240,8 +240,8 @@ mod tests {
         let a2 = as_core::intern::intern_file("unique://lspdiag/cyc2_a.as", 0);
         let e2 = ws_idx2.files.get(&a2).unwrap();
         let diags = file_ls_diags(&e2.tree, &e2.source, &e2.lines, true, &facts2, a2);
-        assert_eq!(diags.len(), 1, "只有一条 AS0907");
-        assert_eq!(diags[0].code, code("AS0907"));
+        assert_eq!(diags.len(), 1, "只有一条 cyclic-inheritance");
+        assert_eq!(diags[0].code, code("cyclic-inheritance"));
         assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(diags[0].range.start.line, 0, "落在 base 所在行");
     }

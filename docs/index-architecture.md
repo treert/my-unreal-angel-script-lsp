@@ -321,8 +321,8 @@ v1.0 原案设想的「进程级缓存容器 + 统一失效」被实现期证伪
 
 | 层 | 依赖 | 时机 |
 |---|---|---|
-| 语法诊断（AS0903） | 仅该文件 CST（`has_error` 剪枝 O(1)） | 任意时刻 |
-| 语义诊断（AS0902、未来 AS04xx/AS02xx） | 聚合层就位 | Ready 后，mylua 式队列：修改文件 > 打开文件 > 其余，300ms 防抖 |
+| 语法诊断（parse-error） | 仅该文件 CST（`has_error` 剪枝 O(1)） | 任意时刻 |
+| 语义诊断（missing-type-decls、未来语义规则按需命名） | 聚合层就位 | Ready 后，mylua 式队列：修改文件 > 打开文件 > 其余，300ms 防抖 |
 
 Loading 期语义请求返回空的设计与本分层自洽（auto 跨文件传播推不出 =
 索引未就位的正确行为）。
@@ -330,7 +330,7 @@ Loading 期语义请求返回空的设计与本分层自洽（auto 跨文件传�
 > **Phase D 落地状态（v1.5，D40）**：语义诊断行已实施——as-lsp
 > `DiagnosticScheduler`（热文件 300ms 防抖 / **结构变化（`decl_surface`
 > 扩含 bases）触发全量重诊断** / 打开文件在前 / drain 中途新事件即刻插队；
-> D36「同步推无防抖」翻案）。AS0902 发布面扩到全部 Script 文件；AS0907
+> D36「同步推无防抖」翻案）。missing-type-decls 发布面扩到全部 Script 文件；cyclic-inheritance
 > （继承环，`cycle_diags()` = C4 预留素材接口的首个消费方）作为首个
 > 工作区级语义诊断落地。增量更新路径（贡献倒排消费）仍属 Phase E。
 
@@ -504,6 +504,7 @@ append-only 内存单调涨与重映射复杂度——旧设计不迁就（用�
 
 | 版本 | 日期 | 内容 |
 |---|---|---|
+| v1.7 | 2026-09-28 | **诊断码改命名制连带**（D42）：§诊断表与正文 `AS0902`/`AS0903`/`AS0907` 换名（`missing-type-decls`/`parse-error`/`cyclic-inheritance`）。历史变更行保留旧码，按码表 §4 对照解读 |
 | v1.6 | 2026-09-28 | **Phase E 落地同步（收官）**（D41）：SemCtx 局部源切 scope_tree（`locals_chain` 新原语 + ty 急切回填；删 `collect_block_locals`/`collect_declarators` 收集家族）；两处树修正（classic for 专属 scope / 无 body 函数根 scope）；`locals_visible` 删除（E3）；D29 定向失效消费方退役（E4，§8 生死清单相应更新）。验收：180 单测全绿、ref-stats 25505 逐位、decls 101322、94.9% 持平 |
 | v1.5 | 2026-09-28 | **Phase D 落地同步**（D40）：语义诊断调度——as-lsp `DiagnosticScheduler`（纯数据结构，mylua 同构薄化：热文件表统一 modified/explicit、无 scope 配置）；**D36 翻案**（didOpen/didChange 同步推无防抖 → 300ms 防抖单发布通道）；级联 = `decl_surface` 扩含 bases 的结构变化 → 全量重诊断（打开优先、固定 Full、`.d.as` 剔除）；插队 = 热表 pop 优先；AS0902 发布面扩到全部 Script 文件；AS0907 继承环（`cycle_diags()` C4 素材兑现，base span Error，Decl 成员跳过）。验收：176 单测全绿（160 基线 + 16）、三旗标精确一致 |
 | v1.4 | 2026-09-28 | **Phase C 落地同步**（D39）：最后三个 ⏳ 项收官，结论比原案更激进——**删除与零缓存**而非「按需 + 缓存」。C5（命名改祖先链语义：`base_class`/`ancestor_chain`——`closures` 系图论闭包命名易与 AS 无函数闭包混淆）；C6（继承零缓存：链由 bases 名 + agg 一跳完全推导，原方案的链缓存被否决；reindex 后立即现算无中间态）；C7（TypeId 体系退役：expr resolved 回落经语料取证 0 命中系死路径、活跃定型管线是 DeclRef + SynType 双件套——TypeTable/TypeKind/TypeId/resolve_syn/render_type/named_base 全删，types.rs 只留 SynType/RefKind，**D17/G7 翻案**）；C2（无缓存容器：v1.0 设想的 Mutex 派生缓存整体作废，§5.2/§5.4 重写）。验收：160 单测全绿（162 基线：-2 退休有继任、-3 随 TypeTable 机制消失、+1 reindex 即时反映、+2 expr 继任）、三旗标精确一致（resolve-stats 1028/1083=94.9%、ref-stats 25505 hits 逐位、decls 101322）、expr 死回落 441 文件语料取证 0 命中、as-lsp 零改动。代码净删 ~470 行 |

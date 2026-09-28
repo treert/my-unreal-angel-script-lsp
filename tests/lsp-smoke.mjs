@@ -147,10 +147,10 @@ send({ jsonrpc: '2.0', id: 16, method: 'textDocument/inlayHint',
   params: { textDocument: { uri }, range: { start: { line: 0, character: 0 }, end: { line: 13, character: 0 } } } });
 await sleep(400);
 // ---- M6: publishDiagnostics 生命周期 ----
-// ① didOpen 已推：AS0903（line 11 `UFUNCTION(Blueprint` 未闭合，ERROR 节点）
-//    + AS0902（workspace 空 → 无任何 .d.as）
-// ② didChange 修复 line 11（插入 "Callable)"）→ AS0903 消失、AS0902 保留
-// ③ didChange 行 0 插入抑制注释 → AS0902 也消失（最终空数组）
+// ① didOpen 已推：parse-error（line 11 `UFUNCTION(Blueprint` 未闭合，ERROR 节点）
+//    + missing-type-decls（workspace 空 → 无任何 .d.as）
+// ② didChange 修复 line 11（插入 "Callable)"）→ parse-error 消失、missing-type-decls 保留
+// ③ didChange 行 0 插入抑制注释 → missing-type-decls 也消失（最终空数组）
 send({
   jsonrpc: '2.0', method: 'textDocument/didChange',
   params: {
@@ -168,7 +168,7 @@ send({
     textDocument: { uri, version: 3 },
     contentChanges: [{
       range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
-      text: '// as-ignore: AS0902\n',
+      text: '// as-ignore: missing-type-decls\n',
     }],
   },
 });
@@ -336,21 +336,21 @@ if (forDoc.length === 0) {
   fail(`no publishDiagnostics for SmokeTest.as: ${JSON.stringify(pubs.map((n) => n.params?.uri))}`);
 }
 const hasCode = (n, c) => (n.params?.diagnostics ?? []).some((d) => d.code === c);
-// 初始推送：AS0902 + AS0903（range 起点在 line 11 或之后）
-const withErrIdx = forDoc.findIndex((n) => hasCode(n, 'AS0903'));
-if (withErrIdx < 0) fail(`initial publish should contain AS0903: ${JSON.stringify(forDoc.map((n) => n.params))}`);
-const errDiag = forDoc[withErrIdx].params.diagnostics.find((d) => d.code === 'AS0903');
-if (errDiag.severity !== 1) fail(`AS0903 severity expect 1 (Error): ${JSON.stringify(errDiag)}`);
-if (errDiag.range.start.line < 11) fail(`AS0903 range should be at line 11+: ${JSON.stringify(errDiag)}`);
-if (!forDoc.slice(0, withErrIdx + 1).some((n) => hasCode(n, 'AS0902'))) {
-  fail(`initial publish should contain AS0902 (empty workspace): ${JSON.stringify(forDoc[0].params)}`);
+// 初始推送：missing-type-decls + parse-error（range 起点在 line 11 或之后）
+const withErrIdx = forDoc.findIndex((n) => hasCode(n, 'parse-error'));
+if (withErrIdx < 0) fail(`initial publish should contain parse-error: ${JSON.stringify(forDoc.map((n) => n.params))}`);
+const errDiag = forDoc[withErrIdx].params.diagnostics.find((d) => d.code === 'parse-error');
+if (errDiag.severity !== 1) fail(`parse-error severity expect 1 (Error): ${JSON.stringify(errDiag)}`);
+if (errDiag.range.start.line < 11) fail(`parse-error range should be at line 11+: ${JSON.stringify(errDiag)}`);
+if (!forDoc.slice(0, withErrIdx + 1).some((n) => hasCode(n, 'missing-type-decls'))) {
+  fail(`initial publish should contain missing-type-decls (empty workspace): ${JSON.stringify(forDoc[0].params)}`);
 }
-const as0902Diag = forDoc[0].params.diagnostics.find((d) => d.code === 'AS0902');
-if (as0902Diag.severity !== 2) fail(`AS0902 severity expect 2 (Warning): ${JSON.stringify(as0902Diag)}`);
-// 修复后：只剩 AS0902、无 AS0903
-const fixedOnly = forDoc.slice(withErrIdx + 1).filter((n) => hasCode(n, 'AS0902') && !hasCode(n, 'AS0903'));
+const declsDiag = forDoc[0].params.diagnostics.find((d) => d.code === 'missing-type-decls');
+if (declsDiag.severity !== 2) fail(`missing-type-decls severity expect 2 (Warning): ${JSON.stringify(declsDiag)}`);
+// 修复后：只剩 missing-type-decls、无 parse-error
+const fixedOnly = forDoc.slice(withErrIdx + 1).filter((n) => hasCode(n, 'missing-type-decls') && !hasCode(n, 'parse-error'));
 if (fixedOnly.length === 0) {
-  fail(`after fixing line 11 expect AS0902-only publish: ${JSON.stringify(forDoc.map((n) => n.params?.diagnostics))}`);
+  fail(`after fixing line 11 expect missing-type-decls-only publish: ${JSON.stringify(forDoc.map((n) => n.params?.diagnostics))}`);
 }
 // 抑制注释后：最终推送为空数组
 const finalPub = forDoc[forDoc.length - 1];
@@ -358,6 +358,6 @@ if ((finalPub.params?.diagnostics ?? []).length !== 0) {
   fail(`final publish after suppression should be empty: ${JSON.stringify(finalPub.params)}`);
 }
 
-console.log(`SMOKE OK: legend ${legend.length} types, ${tokenCount} tokens, symbols OK, didOpen logged=${opened}, hover/definition/references/rename/workspaceSymbol/completion(+specifier)/signatureHelp/inlayHint OK, indexStatus files=${readyParams.files}, diagnostics pubs=${forDoc.length} (AS0902+AS0903→fix→suppress，D40 防抖调度)`);
+console.log(`SMOKE OK: legend ${legend.length} types, ${tokenCount} tokens, symbols OK, didOpen logged=${opened}, hover/definition/references/rename/workspaceSymbol/completion(+specifier)/signatureHelp/inlayHint OK, indexStatus files=${readyParams.files}, diagnostics pubs=${forDoc.length} (missing-type-decls+parse-error→fix→suppress，D40 防抖调度)`);
 p.kill();
 process.exit(0);

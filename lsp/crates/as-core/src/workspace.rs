@@ -247,7 +247,7 @@ impl Workspace {
             })
     }
 
-    /// 是否存在真实 `.d.as` 声明文件（builtin 伪文件不算——诊断 AS0902 的
+    /// 是否存在真实 `.d.as` 声明文件（builtin 伪文件不算——诊断 missing-type-decls 的
     /// 「decl 计数」口径与旧架构对齐）。
     pub fn has_decl_files(&self) -> bool {
         let builtin = intern_file(BUILTIN_FILE_PATH, u32::MAX);
@@ -545,13 +545,13 @@ impl Workspace {
         out
     }
 
-    /// AS0907 继承环诊断（Phase D / P2）：`cyclic_classes()` 每个环成员类在
+    /// cyclic-inheritance 继承环诊断（Phase D / P2）：`cyclic_classes()` 每个环成员类在
     /// 其 base 名字区间（`bases[0].span`）产一条 Error。
     /// **Decl 文件成员跳过**——导出器不产环，腐坏导出不在诊断面（spec P2）。
     /// 输出未经抑制过滤——消费方（as-lsp）与 script_diags 共用
     /// `diag::filter_suppressions` 统一滤。
     pub fn cycle_diags(&self) -> HashMap<FileId, Vec<Diag>> {
-        use crate::diag::{DiagCode, DiagSeverity, AS0907_MESSAGE};
+        use crate::diag::{DiagCode, DiagSeverity, CYCLIC_INHERITANCE_MESSAGE};
         let mut out: HashMap<FileId, Vec<Diag>> = HashMap::new();
         for r in self.cyclic_classes() {
             if self.files[&r.file].kind == FileKind::Decl {
@@ -559,10 +559,10 @@ impl Workspace {
             }
             if let Some(base) = self.decl(&r).bases.first() {
                 out.entry(r.file).or_default().push(Diag {
-                    code: DiagCode::As0907,
+                    code: DiagCode::CyclicInheritance,
                     range: base.span,
                     severity: DiagSeverity::Error,
-                    message: AS0907_MESSAGE.to_string(),
+                    message: CYCLIC_INHERITANCE_MESSAGE.to_string(),
                 });
             }
         }
@@ -842,7 +842,7 @@ class Orphan : TMissing {}
 
     #[test]
     fn cycle_diags_reports_members_at_base_span() {
-        // 双文件互继承 → 两侧各一条 AS0907，range 落在 base 名字区间
+        // 双文件互继承 → 两侧各一条 cyclic-inheritance，range 落在 base 名字区间
         let ws = ws_build(&[
             ("unique://cyc/a.as", "class A : B {}\n"),
             ("unique://cyc/b.as", "class B : A {}\n"),
@@ -853,7 +853,7 @@ class Orphan : TMissing {}
         assert_eq!(diags.len(), 2, "两个文件各一条");
         let da = &diags[&a];
         assert_eq!(da.len(), 1);
-        assert_eq!(da[0].code, crate::diag::DiagCode::As0907);
+        assert_eq!(da[0].code, crate::diag::DiagCode::CyclicInheritance);
         assert_eq!(da[0].severity, crate::diag::DiagSeverity::Error);
         assert_eq!(
             &"class A : B {}\n"[da[0].range.start as usize..da[0].range.end as usize],
@@ -878,16 +878,16 @@ class Orphan : TMissing {}
     }
 
     #[test]
-    fn as0907_suppressible_via_ignore() {
-        // 同套抑制语法：base 行同行尾注释可抑制 AS0907
-        let src_a = "class A : B {} // as-ignore: AS0907\n";
+    fn cyclic_inheritance_suppressible_via_ignore() {
+        // 同套抑制语法：base 行同行尾注释可抑制 cyclic-inheritance
+        let src_a = "class A : B {} // as-ignore: cyclic-inheritance\n";
         let ws = ws_build(&[
             ("unique://sup/a.as", src_a),
             ("unique://sup/b.as", "class B : A {}\n"),
         ]);
         let a = intern_file("unique://sup/a.as", 0);
         let diags = crate::diag::filter_suppressions(ws.cycle_diags().remove(&a).unwrap(), src_a);
-        assert!(diags.is_empty(), "同行 as-ignore 应抑制 AS0907");
+        assert!(diags.is_empty(), "同行 as-ignore 应抑制 cyclic-inheritance");
     }
 
     #[test]

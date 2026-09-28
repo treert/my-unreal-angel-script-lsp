@@ -80,8 +80,8 @@ else
 
 | 项 | `class` | `struct` | 证据 |
 |---|---|---|---|
-| `default X = ...;` | 支持 | **不支持**（唯一的 parser 级拒绝）→ `AS0001` | `as_parser.cpp:3828` `else if( !isStruct && IsClassDefaultStatement() )`；违规落到 `:3835` |
-| `: Base` 继承列表 | 支持 | **parser 接受**，被上层拒绝 → `AS0201` | `as_parser.cpp:3786-3803` |
+| `default X = ...;` | 支持 | **不支持**（唯一的 parser 级拒绝） | `as_parser.cpp:3828` `else if( !isStruct && IsClassDefaultStatement() )`；违规落到 `:3835` |
+| `: Base` 继承列表 | 支持 | **parser 接受**，被上层拒绝 | `as_parser.cpp:3786-3803` |
 | 方法 / 构造 / 析构 / 运算符重载 / 虚属性 / `access` 声明 | 支持 | 支持（完全一致） | `as_parser.cpp:3818-3827` |
 
 > **文法决策**：`struct F : G {}` 在 tree-sitter 层应当**正常解析成功**，
@@ -95,21 +95,21 @@ else
 | 维度 | `class` | `struct` | 证据 |
 |---|---|---|---|
 | 赋值语义 | 句柄重绑定 | `PerformCopy` **深拷贝** | `as_compiler.cpp:10230-10235`；`[UE]Private/ClassGenerator/ASStruct.cpp:170-179` |
-| 可否取句柄 | 隐式句柄（写不写都是） | **否** → `AS0103` | `as_compiler.cpp:13883-13888`（`TXT_OBJECT_HANDLE_NOT_SUPPORTED`） |
-| 可否 `Cast<>` | 是 | **否**（绑定层直接 return）→ `AS0106` | `[UE]Private/Binds/Bind_UObject.cpp:135-137`（注释原文 `// Structs cannot be cast to uobjects`） |
+| 可否取句柄 | 隐式句柄（写不写都是） | **否** | `as_compiler.cpp:13883-13888`（`TXT_OBJECT_HANDLE_NOT_SUPPORTED`） |
+| 可否 `Cast<>` | 是 | **否**（绑定层直接 return） | `[UE]Private/Binds/Bind_UObject.cpp:135-137`（注释原文 `// Structs cannot be cast to uobjects`） |
 | factory | 有 | **无**（有 constructor，无 factory） | `as_builder.cpp:2315-2323, 4192, 5219-5255` |
-| 实例化方式 | `NewObject`/`SpawnActor`/`UXxx::Create`；构造语法被禁 → `AS0104` | **声明即构造** | `as_compiler.cpp:12859-12861` |
+| 实例化方式 | `NewObject`/`SpawnActor`/`UXxx::Create`；构造语法被禁 | **声明即构造** | `as_compiler.cpp:12859-12861` |
 | 虚函数表 | 有，多态派发 | **无**，静态派发 | `as_builder.cpp:3720-3728`；`[UE]Private/StaticJIT/PrecompiledData.cpp:742-775` |
 | 继承 / 被继承 | 均可 | **均禁**（见 §6） | `AngelscriptPreprocessor.cpp:1122-1127`；`as_builder.cpp:2270, 3200-3207` |
 | 无显式父类时 | 隐式补 `: UObject` | `SetSuperStruct(nullptr)`，永远无父 | `AngelscriptPreprocessor.cpp:747-753`；`AngelscriptClassGenerator.cpp:2633` |
 | 内存布局基址 | `basePropertyOffset` = C++ 父类 `GetPropertiesSize()`，`shadowType` = C++ 类型 | 从 0 开始，无 shadow base | `as_builder.cpp:2283-2289`；`[UE]Private/AngelscriptManager.cpp:2974-2978` |
 | 作为成员时 | 指针（`GetSizeOnStackDWords()*4`） | **内嵌值**（`GetSizeInMemoryBytes()`） | `as_builder.cpp:3557-3563` |
-| 布局自递归 | 不可能（是指针） | **报错** → `AS0105` | `as_builder.cpp:3415-3427` |
+| 布局自递归 | 不可能（是指针） | **报错** | `as_builder.cpp:3415-3427` |
 | 命名前缀剥离 | `U` / `A` | `F` | `AngelscriptClassGenerator.cpp:133-141` |
 | 生成的静态符号 | `TSubclassOf<UObject> __StaticType_X` + `X::StaticClass()` | `TStructType<FScriptStructWildcard> __StaticType_X`（**无 `StaticClass()`**） | `AngelscriptPreprocessor.cpp:796-845` |
-| `UFUNCTION()` | 支持 | **禁止** → `AS0202` | `AngelscriptPreprocessor.cpp:1257-1262` |
+| `UFUNCTION()` | 支持 | **禁止** | `AngelscriptPreprocessor.cpp:1257-1262` |
 | `UPROPERTY()` | 支持 | 支持（默认 Edit 级别用 `DefaultPropertyEditSpecifierForStructs`） | `AngelscriptPreprocessor.cpp:2253-2254, 3360-3361` |
-| `NotReplicated` specifier | **禁止** → `AS0203` | **仅 struct 允许** | `AngelscriptPreprocessor.cpp:2471-2477` |
+| `NotReplicated` specifier | **禁止** | **仅 struct 允许** | `AngelscriptPreprocessor.cpp:2471-2477` |
 | CDO / 默认对象 | 有（`InitDefaultObject`） | **无** | `AngelscriptClassGenerator.cpp:5628-5647` |
 | Tick 设置 | 有 | **无** | `AngelscriptClassGenerator.cpp:5612-5618` |
 | 网络复制 | 支持（`GetLifetimeScriptReplicationList`） | 本身不是复制单元 | `[UE]Private/ClassGenerator/ASClass.cpp:857-883` |
@@ -240,8 +240,8 @@ USTRUCT() struct FTableRowBase { ... };   // 所有 DataTable 行的基类
 
 | 层 | 机制 | 位置 |
 |---|---|---|
-| 预处理器 | 显式报错 → `AS0201` | `AngelscriptPreprocessor.cpp:1123-1127` |
-| builder | `asOBJ_NOINHERIT` → struct **自动 final**，别人也不能继承它 → `AS0102` | `as_builder.cpp:2270`；`:3200-3207` |
+| 预处理器 | 显式报错 | `AngelscriptPreprocessor.cpp:1123-1127` |
+| builder | `asOBJ_NOINHERIT` → struct **自动 final**，别人也不能继承它 | `as_builder.cpp:2270`；`:3200-3207` |
 | builder | 无 `basePropertyOffset` / 无 `shadowType` | `as_builder.cpp:2283-2285` |
 | builder | 内部断言（有基类时不可能是 struct） | `as_builder.cpp:3596` `check(!bIsStruct)` |
 | ClassGenerator | `SetSuperStruct(nullptr)` 硬写死 | `AngelscriptClassGenerator.cpp:2633` |
@@ -321,7 +321,7 @@ hover 时应标注「此方法会被 UE 用于结构体比较 / 哈希 / 序列�
 ```
 
 即：struct 里只要成员**可能**含 UObject 引用，即使没写 `UPROPERTY()` 也会被强制生成属性；
-生成不了就直接编译报错（`AS0301`）。
+生成不了就直接编译报错。
 
 相关的 offset 处理差异：
 
@@ -339,29 +339,27 @@ hover 时应标注「此方法会被 UE 用于结构体比较 / 哈希 / 序列�
 
 ### 9.1 类型系统（模块三）
 
-| 要求 | 依据 | 相关诊断码 |
-|---|---|---|
-| 类型模型必须有**值 / 引用**二分标志 | §2 | — |
-| struct 成员查找是**单层**的，不爬继承链 | §6.3 展平 | — |
-| class 成员查找必须爬链，`.as` 无父类时补 `UObject` | §5.3 | — |
-| **`.d.as` 中 `class UObject` 无父类 → 必须做自环保护** | §5.3 要点 3 | — |
-| struct 不参与 `Cast<>` 候选 | §4 | `AS0106` |
-| struct 不接受句柄语法 | §4 | `AS0103` |
-| class 不接受构造语法 | §4 | `AS0104` |
-| `StaticClass()` 只在 class 上补全 | §4 生成的静态符号行 | — |
-| `default` 语句只在 class body 内补全 | §3 | `AS0001` |
-| 「所有实现 / override」查询跳过 struct | §4 虚函数表行 | — |
-| struct 成员 GC 可达性检查 | §8 | `AS0301` |
-| struct 布局自递归检查 | §4 | `AS0105` |
-| `opEquals` / `Hash` / `ToString` 在 struct 上标注特殊语义 | §7 | — |
+| 要求 | 依据 |
+|---|---|
+| 类型模型必须有**值 / 引用**二分标志 | §2 |
+| struct 成员查找是**单层**的，不爬继承链 | §6.3 展平 |
+| class 成员查找必须爬链，`.as` 无父类时补 `UObject` | §5.3 |
+| **`.d.as` 中 `class UObject` 无父类 → 必须做自环保护** | §5.3 要点 3 |
+| struct 不参与 `Cast<>` 候选 | §4 |
+| struct 不接受句柄语法 | §4 |
+| class 不接受构造语法 | §4 |
+| `StaticClass()` 只在 class 上补全 | §4 生成的静态符号行 |
+| `default` 语句只在 class body 内补全 | §3 |
+| 「所有实现 / override」查询跳过 struct | §4 虚函数表行 |
+| struct 成员 GC 可达性检查 | §8 |
+| struct 布局自递归检查 | §4 |
+| `opEquals` / `Hash` / `ToString` 在 struct 上标注特殊语义 | §7 |
 
 ### 9.2 struct 相关诊断
 
-本文涉及的码：`AS0001` `AS0102` `AS0103` `AS0105` `AS0106` `AS0201` `AS0202` `AS0203` `AS0301` `AS0302`。
-
-消息文本、range 与 quick fix 约定统一见 [`诊断码表.md`](../docs/诊断码表.md)
-（§2-§5 各段表 + [§8 range 与 quick fix 约定](../docs/诊断码表.md#8-range-与-quick-fix-约定)）。
-**本文不重复这些内容**，只提供触发它们的语义背景。
+本文涉及的引擎约束（§3-§8 各处「引擎必报错 / 必拒绝」形态）在
+[`诊断码表.md`](../docs/诊断码表.md) 的素材表中有集中取证；
+LSP 侧何时、以何种名字实现这些诊断由 P5 按需设计（实现时才命名登记）。
 
 ### 9.3 `.d.as` 导出插件（模块一）待补的元信息
 
@@ -369,7 +367,7 @@ hover 时应标注「此方法会被 UE 用于结构体比较 / 哈希 / 序列�
 
 | 缺失 | 影响的能力 | 建议方案 |
 |---|---|---|
-| **无法区分 USTRUCT 支撑 vs 纯 C++ 值类型**（§5.4） | `AS0301` GC 诊断的适用范围、`UPROPERTY()` 可用性判定、蓝图可用性提示、`Identical`/`GetTypeHash` 相关 hover | 导出时标注，如 `struct FVector /* @ustruct */`，或走 manifest 侧表 |
+| **无法区分 USTRUCT 支撑 vs 纯 C++ 值类型**（§5.4） | GC 可达性诊断的适用范围、`UPROPERTY()` 可用性判定、蓝图可用性提示、`Identical`/`GetTypeHash` 相关 hover | 导出时标注，如 `struct FVector /* @ustruct */`，或走 manifest 侧表 |
 | **展平后丢失字段来源**（§6.3） | hover 无法告知「`FActorTickFunction.TickGroup` 来自 `FTickFunction`」 | 导出时加 `// @inherited_from FTickFunction` 注释行 |
 
 这两项都是**导出插件多写一点元信息、LSP 就能多给一档体验**的典型，
