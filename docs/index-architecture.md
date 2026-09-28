@@ -1,6 +1,6 @@
 # 索引架构（per-file summary + 薄聚合层 + 按需定型）
 
-> 版本 v1.2（2026-09-28）
+> 版本 v1.4（2026-09-28）
 >
 > **定位**：索引层的**重构设计稿**。现行架构（三阶段流水线、全局扁平符号 arena、
 > use-site 预收集）的替代方案。驱动因素：冷启动性能（414 `.d.as` ~1s 仍偏慢且
@@ -261,7 +261,7 @@ pub struct DeclRef {
 重载消歧（D28）、表达式定型管线（D14、D31-D33）**逻辑全部保留**，只换
 数据后端：`idx.def(id)` / `idx.main` 查询改为 DeclRef → 源 summary 取数。
 
-### 5.2 继承闭包按需走链
+### 5.2 继承走链现算（C6：零缓存）
 
 `AActor` 的祖先链不再预计算（`closures` 表删除）：
 
@@ -275,11 +275,14 @@ walk_bases(class):
         chain.push(target); 递归
 ```
 
-- 缓存：进程级 `HashMap<FileId, Vec<DeclRef>>`（类 → 祖先链），失效
-  粒度 = 链上任一文件更新（简单做法：任一文件更新全清——链缓存重建
-  是纯查表走链，441 文件量级毫秒）。
-- AActor 链深 ~10，冷查 10 次哈希 + 每类一次缓存，微秒级。mylua 已
-  证实此模式无体感延迟。
+- **零缓存（Phase C 实现期裁决 C6，否决 v1.0 的链缓存方案）**：链由
+  `bases` 名 + agg 一跳**完全推导**（单继承链非树；AActor 深度 ~10 ≈
+  10 次哈希，µs 级）——缓存节省的是重复哈希，付出的是 Mutex 域 + 失效
+  时序 + prime 对账口径三件管理成本，负收益。接口 = `base_class`（单跳）
+  / `ancestor_chain`（整链，环在首次重复处截断）/ `cyclic_classes()`
+  （全扫环检测，诊断素材）。
+- 无缓存还白赚正确性收益：reindex 后链立即按新 agg 现算，不存在
+  「清空→重建」中间态。
 - 环检测从 `cycle_classes` 预计算改为走链时 visited 集合；环的存在不再
   是索引期错误，而是查询结果的一部分（诊断可后置消费）。
 
@@ -300,15 +303,17 @@ walk_bases(class):
 首参剥壳（`FVector&` / `const FVector&in`）在 `SynType` 语法层完成
 （`Ref/Const/Array` 包装逐层剥到 base name），不经过类型表。
 
-### 5.4 缓存与失效
+### 5.4 缓存与失效（Phase C 后：L3 无缓存）
 
-L3 全部缓存进一个进程级容器，失效规则统一：
+v1.0 原案设想的「进程级缓存容器 + 统一失效」被实现期证伪（C2/C6/C7）：
+祖先链一跳可推导不值得缓存、TypeId 体系是死代码、合成成员本就现推——
+**L3 全部现算，不存在任何缓存**，「失效」问题整体消失：
 
-| 缓存 | 键 | 失效 |
-|---|---|---|
-| 祖先链 | FileId（类所在文件） | 任一文件更新 → 全清（重建便宜） |
-| 合成成员（§7） | (DeclRef, 成员类) | 同上 |
-| auto 定型 / UseSite 解析结果 | — | **不存在了**（全部现算，见 §6） |
+| v1.0 设想 | 实际（v1.4） |
+|---|---|
+| 祖先链缓存（文件更新全清） | 现算（§5.2 零缓存） |
+| 合成成员缓存 | 本就现推（§7，B4 落地即查询期） |
+| auto 定型 / UseSite 解析缓存 | 不存在（全部现算，见 §6） |
 
 **不再有** as-lsp 侧 `use_cache` + D29 失效链——该机制整体删除。
 
@@ -391,6 +396,11 @@ synthetic_members(decl_ref):
 > 结果。与 v1.0 原案的两处偏差：closures / resolve_decl_types / TypeTable
 > 的按需化**延后到 Phase C**（B5：行为零变化优先）；D29 指纹**收缩为
 > reindex 返回值接口**而非整体删除（Phase E 消费，见 D38 处置修正）。
+>
+> **Phase C 落地状态（v1.4，D39）**：最后三个 ⏳ 项收官——且结论比原案
+> 更激进：不是「按需 + 缓存」而是**删除与零缓存**（继承链一跳可推导 C6；
+> resolved/TypeTable 是从未接线的平行世界残留 C7）。v1.0 设想的「进程级
+> 缓存容器 + 统一失效」随之整体作废（§5.4）。
 
 | 旧机制 | 去向 | 理由 | 状态（v1.3） |
 |---|---|---|---|
@@ -400,9 +410,9 @@ synthetic_members(decl_ref):
 | D23（mixin DefId 倒排，键不预展开） | **翻案 → §5.3** | 名字倒排 + 查询期剥壳，更简单 | ✅ 生效（`mixin_by_name` + `mixin_pending` 删除） |
 | D25（内建 primitive 合成 DefId） | **保留，改形式** | 内建类型表改常量映射（名字 → 固定合成锚点），不进 per-file arena | ✅ 落地改 B2 形态（builtin 伪文件 + SYNTHETIC RawDecl，同一代码路径） |
 | D29（声明面指纹） | **删除** | 职责被贡献倒排 + 缓存失效取代 | 🔶 收缩（返回值保留为增量接口，Phase E 消费——D38 修正） |
-| `closures` / `cycle_classes` | **删除** → §5.2 | 按需走链 + visited 环检测 | ⏳ Phase B 保持 eager（B5）；按需化 Phase C |
-| `resolve_decl_types`（3.2 万条预解析） | **删除** | 查询期从 SynType 现查聚合层（hover 本来就走查找链） | ⏳ Phase B 保持 eager（B5）；expr 的 resolved 回落路径仍消费 |
-| `TypeTable`（类型规范 intern） | **保留，填充改查询期** | 它是 Sym 级进程 intern，不是 per-file 数据 | ⏳ Phase B 保持 eager（B5）；填充按需化 Phase C |
+| `closures` / `cycle_classes` | **删除** → §5.2 | 按需走链 + visited 环检测 | ✅ Phase C 落地（C5/C6：`base_class`/`ancestor_chain` 走链现算**零缓存**——链缓存方案被否决；`cycle_classes` 字段删、`cyclic_classes()` 函数留作诊断素材） |
+| `resolve_decl_types`（3.2 万条预解析） | **删除** | 查询期从 SynType 现查聚合层（hover 本来就走查找链） | ✅ Phase C 删除（C7：唯一消费点 expr 回落经 441 文件语料取证 **0 命中**——触发条件与填充条件不相交，D38 所记「expr 回落仍消费」系未证实假设） |
+| `TypeTable`（类型规范 intern） | **保留，填充改查询期** → **退役** | ~~Sym 级进程 intern~~ 活跃定型管线是 DeclRef + SynType 双件套（expr 的 `syn_type_base`/`template_map`/`subst_syn`），TypeId 从未接线 | ✅ Phase C 退役（C7/D39：D17/G7 翻案；`types.rs` 只留 SynType/RefKind，M3 若需类型身份按当期需求重设计） |
 | `modules` 表 | **收缩** | per-file 自带模块名；聚合层只留 `Sym → FileId` 小表 | ✅ 落地（`Workspace::module_of` 走 summary；聚合层 module_members 选举） |
 | `live_def_ids` 幽灵过滤 | **删除** | per-file 替换即消失 | ✅ 落地（无 arena 即无幽灵） |
 | verify_tree 启动期收集 | **已删**（前序提交） | 诊断期 `has_error` 剪枝 | ✅ 维持 |
@@ -458,6 +468,14 @@ append-only 内存单调涨与重映射复杂度——旧设计不迁就（用�
 > = Phase E；步骤 7 = 本版 v1.3 + D38。验收基线：162 单测全绿
 > （171 基线中 9 条随已删机制退休、存活断言全平移），语料三重对账
 > 全一致（详见 D38）。
+>
+> **Phase C 实际执行映射（v1.4，D39）**：步骤 4 = Task 1-5（取证 →
+> 走链接口（新旧对照等价测试钉死后删 eager）→ 消费点七处切换 →
+> TypeId 体系退役 → 收尾）。与原案的偏差：**「按需 + 缓存」变「删除 +
+> 零缓存」**（C6/C7，消费者面逐点核实推翻 B5 时的假设）；验收 = 三旗标
+> 不回归（resolve-stats 1028/1083=94.9% 精确一致、ref-stats 25505 hits
+> 逐位一致、decls 101322）+ expr 死回落语料取证 0 命中 + 测试 160 全绿
+> （退休账目见 D39）。as-lsp crate 零改动。
 
 ---
 
@@ -477,6 +495,7 @@ append-only 内存单调涨与重映射复杂度——旧设计不迁就（用�
 
 | 版本 | 日期 | 内容 |
 |---|---|---|
+| v1.4 | 2026-09-28 | **Phase C 落地同步**（D39）：最后三个 ⏳ 项收官，结论比原案更激进——**删除与零缓存**而非「按需 + 缓存」。C5（命名改祖先链语义：`base_class`/`ancestor_chain`——`closures` 系图论闭包命名易与 AS 无函数闭包混淆）；C6（继承零缓存：链由 bases 名 + agg 一跳完全推导，原方案的链缓存被否决；reindex 后立即现算无中间态）；C7（TypeId 体系退役：expr resolved 回落经语料取证 0 命中系死路径、活跃定型管线是 DeclRef + SynType 双件套——TypeTable/TypeKind/TypeId/resolve_syn/render_type/named_base 全删，types.rs 只留 SynType/RefKind，**D17/G7 翻案**）；C2（无缓存容器：v1.0 设想的 Mutex 派生缓存整体作废，§5.2/§5.4 重写）。验收：160 单测全绿（162 基线：-2 退休有继任、-3 随 TypeTable 机制消失、+1 reindex 即时反映、+2 expr 继任）、三旗标精确一致（resolve-stats 1028/1083=94.9%、ref-stats 25505 hits 逐位、decls 101322）、expr 死回落 441 文件语料取证 0 命中、as-lsp 零改动。代码净删 ~470 行 |
 | v1.3 | 2026-09-28 | **Phase B 落地同步**（D38）：L3 后端切换 DefId → DeclRef 完成——B1-B7 实施裁决落入 §8/§11（references 查询期唯一路径；builtin 合成伪文件（B2，agg.main +15 内建键为预期差）；类直接兼任 namespace（B3，origin_fallback/合成 namespace 删除）；合成成员查询期 synthetic_members + Target::Synthetic/RefTarget::Synthetic（B4，D10 origin 以 DeclRef 保留）；closures/resolved/TypeTable 保持 eager 到 Phase C（B5）；members = by_parent + namespace 聚合（B7））。§8 生死清单标注落地状态；§11 补 Phase A/B 执行映射（步骤 5 提前并入 B1、步骤 3+5 合并于 B3 原子切换）。旧 WorkspaceIndex/DefId/DefData/SymbolTable/index.rs/expand.rs/uses.rs 全删。验收：162 单测全绿、resolve-stats 94.9% 精确一致、ref-stats 25505 hits 逐位一致（~305ms）、--new-arch decls 101134 一致 |
 | v1.2 | 2026-09-28 | **Phase A 落地同步**（实现期三处裁决）：① LocalKind 无 LocalFn（AS 无嵌套函数，v1.1 笔误）；② auto 预推导不做构造调用（`auto X = Ident(args)` 与函数调用无法语法区分，宁缺毋假）+ 显式声明保留裸 `float` / 字面量给规范名的双层口径（§3.3.1）；③ 聚合层模块映射改成员表 + `module_file` 访问器（删除时接替者自动重选，§4.1）。Phase A 验收：414 `.d.as` 双轨对账零差异（decls 101134 / main keys 53711），新架构 531ms vs 旧 956ms（-44%） |
 | v1.1 | 2026-09-28 | **scope_tree 升级为 FileSummary 必含组件**（§3.3 重写）：否决「扁平局部表」倾向——遮蔽语义下每次查询都要现场重建树形关系（区间包含 + 深度比较），resolve 第 1 级 / completion 局部候选 / references 逐点验证 / inlay 全依赖它，不如提取期一次建好；结构定案（Scope arena + parent 链 + LocalDecl 含预推导类型）、两查询原语（`resolve_local` / `locals_visible`）、AS 简化点（无 lambda ⇒ 无捕获记账；`local` 函数模块级可见性归 L2）；风险 4（扁平表验证项）随之移除 |
