@@ -44,6 +44,8 @@ struct Backend {
     /// 防抖线程——重建时读**当前**值（配置可能在防抖器存活期间变更）
     config: Arc<Mutex<WorkspaceConfig>>,
     ws: Arc<WorkspaceState>,
+    /// 诊断调度器（Phase D / D40：热文件 300ms 防抖 + 结构变化全量重诊断）
+    sched: Arc<diagnostic_scheduler::DiagnosticScheduler>,
     folders: Arc<Mutex<Vec<String>>>,
     /// 客户端是否支持 didChangeWatchedFiles 动态注册（initialize 时探测）
     watch_supported: Mutex<bool>,
@@ -78,19 +80,33 @@ async fn main() {
                 let _ = notifier.send_notification::<IndexStatus>(v).await;
             }
         });
-        // M6 诊断补推转发（同模式）：后台线程发布快照后 → 对全部已打开文档
-        // 推一轮 publishDiagnostics（Loading 期不推、Ready 补推，D36）
+        // Phase D（D40）：诊断调度。diag_tx 转发 = request_full（快照发布 →
+        // 全量重诊断，吃掉旧 publish_all_open）；consumer 被唤醒后按
+        // 「热优先 → 全量队列」drain（D36 的「同步推无防抖」翻案）
         let (diag_tx, mut diag_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let docs = Arc::new(Mutex::new(DocStore::new()));
         let ws = Arc::new(WorkspaceState::new());
-        let dclient = client.clone();
-        let ddocs = Arc::clone(&docs);
-        let dws = Arc::clone(&ws);
-        tokio::spawn(async move {
-            while diag_rx.recv().await.is_some() {
-                diag::publish_all_open(&dclient, &ddocs, &dws).await;
-            }
-        });
+        let sched = diagnostic_scheduler::DiagnosticScheduler::new();
+        {
+            let sched = Arc::clone(&sched);
+            tokio::spawn(async move {
+                while diag_rx.recv().await.is_some() {
+                    sched.request_full();
+                }
+            });
+        }
+        {
+            let cclient = client.clone();
+            let cdocs = Arc::clone(&docs);
+            let cws = Arc::clone(&ws);
+            let csched = Arc::clone(&sched);
+            tokio::spawn(async move {
+                loop {
+                    csched.notified().await;
+                    diag::drain(&cclient, &cdocs, &cws, &csched).await;
+                }
+            });
+        }
         ws.set_ready_tx(tx);
         ws.set_diag_tx(diag_tx);
         Backend {
@@ -98,6 +114,7 @@ async fn main() {
             docs,
             config: Arc::new(Mutex::new(WorkspaceConfig::default())),
             ws,
+            sched,
             folders: Arc::new(Mutex::new(Vec::new())),
             watch_supported: Mutex::new(false),
             debouncer: OnceLock::new(),
@@ -373,9 +390,10 @@ impl LanguageServer for Backend {
             if !self.ws.is_ready() {
                 self.ws.mark_dirty(file);
             }
-            // M6（D36）：Ready 时推送诊断；Loading 期不推（发布瞬间补推）
+            // Phase D（D40）：Ready 时标热 + 300ms 防抖（Loading 期不
+            // schedule，快照发布的 request_full 兜底）
             if self.ws.is_ready() {
-                diag::publish_file(&self.client, &self.docs, &self.ws, &path).await;
+                self.sched.schedule(file, false);
             }
         }
     }
@@ -392,16 +410,20 @@ impl LanguageServer for Backend {
             })
             .collect();
         if let Some(path) = uri_path(&params.text_document.uri) {
-            {
+            let file = {
                 let mut store = self.docs.lock().unwrap();
-                if let Some(file) = as_core::intern::file_id_of_path(&path) {
-                    store.apply_changes(file, params.text_document.version, changes);
+                let file = as_core::intern::file_id_of_path(&path);
+                if let Some(f) = file {
+                    store.apply_changes(f, params.text_document.version, changes);
                 }
-            }
-            // M6（D36）：Ready 时同步推送（verify_tree 经 has_error 剪枝，
-            // 合法文件 O(1)；不做防抖，体感卡顿再补）
-            if self.ws.is_ready() {
-                diag::publish_file(&self.client, &self.docs, &self.ws, &path).await;
+                file
+            };
+            // Phase D（D40，D36 翻案）：标热 + 300ms 防抖；结构变化（含改
+            // 基类，P6）在 drain 头的保鲜检测中展开全量重诊断
+            if let Some(f) = file {
+                if self.ws.is_ready() {
+                    self.sched.schedule(f, false);
+                }
             }
         }
     }
@@ -420,9 +442,11 @@ impl LanguageServer for Backend {
                 }
                 file
             };
-            // overlay 丢弃 → 下次语义请求前回落磁盘重读（§5.1）
+            // overlay 丢弃 → 下次语义请求前回落磁盘重读（§5.1）；
+            // 调度状态清理（Phase D）
             if let Some(f) = file {
                 self.ws.mark_stale(f);
+                self.sched.invalidate(f);
             }
             // M6：推空数组清空该文档诊断（Loading 期清空同样安全）
             if let Some(uri) = ls::Uri::from_file_path(&path) {
@@ -459,17 +483,23 @@ impl LanguageServer for Backend {
                 }
                 watch::WatchAction::ScriptCreate | watch::WatchAction::ScriptChange => {
                     // 读盘入索引（改名 = 删 + 增，模块名随新路径重算——
-                    // local 可见域随之改变，规划 §5.3）
+                    // local 可见域随之改变，规划 §5.3）。surface 变化 →
+                    // 级联全量重诊断（Phase D / P4）
                     let Ok(text) = std::fs::read_to_string(&path) else { continue };
                     let file = as_core::intern::intern_file(&path, 0);
                     let module = workspace::module_for_path(&roots, &path);
                     as_log!("watch: script create/change {path} -> index (module={module:?})");
-                    self.ws.add_file(file, workspace::kind_of_path(&path), module, text);
+                    let surface =
+                        self.ws.add_file(file, workspace::kind_of_path(&path), module, text);
+                    if self.ws.is_ready() {
+                        self.sched.schedule(file, surface);
+                    }
                 }
                 watch::WatchAction::ScriptDelete => {
                     as_log!("watch: ScriptDelete {path}");
                     if let Some(file) = file {
                         self.ws.remove_file(file);
+                        self.sched.invalidate(file);
                     }
                 }
                 watch::WatchAction::Ignore => {}

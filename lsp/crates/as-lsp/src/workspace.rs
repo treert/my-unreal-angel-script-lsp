@@ -150,14 +150,17 @@ impl WorkspaceState {
 
     /// 单文件保鲜（语义请求前）：
     /// ① didClose 后回落磁盘重读（§5.1）；② overlay 领先 → 惰性重索引。
-    pub fn ensure_file_fresh(&self, file: FileId, docs: &Mutex<DocStore>) {
+    /// 返回 = 本次是否发生声明面（含 bases，Phase D / P6）变化（P7——
+    /// 诊断调度的级联依据：消费方据此展开全量重诊断）。
+    pub fn ensure_file_fresh(&self, file: FileId, docs: &Mutex<DocStore>) -> bool {
         if !self.is_ready() {
-            return;
+            return false;
         }
+        let mut changed = false;
         if self.stale.lock().unwrap().remove(&file) {
             if let Some(path) = file_path(file) {
                 if let Ok(text) = std::fs::read_to_string(path) {
-                    self.reindex(file, kind_of_path(path), text);
+                    changed |= self.reindex(file, kind_of_path(path), text);
                     self.indexed_versions.lock().unwrap().remove(&file);
                 }
             }
@@ -170,17 +173,19 @@ impl WorkspaceState {
             if self.indexed_versions.lock().unwrap().get(&file) != Some(&v) {
                 if let Some(path) = file_path(file) {
                     let kind = kind_of_path(path);
-                    self.reindex(file, kind, text);
+                    changed |= self.reindex(file, kind, text);
                     self.indexed_versions.lock().unwrap().insert(file, v);
                 }
             }
         }
+        changed
     }
 
-    fn reindex(&self, file: FileId, kind: FileKind, text: String) {
+    fn reindex(&self, file: FileId, kind: FileKind, text: String) -> bool {
         // 声明面判定（D29 的继任：Workspace::reindex_file 的新旧 summary
-        // (name,kind,parent) 集 diff）。Phase B 下 references 是查询期路径，
-        // 无跨文件解析缓存需联动失效——返回值留给 Phase E 的增量消费方。
+        // (name,kind,parent,bases) 集 diff——Phase D 扩含 bases，P6）。
+        // Phase B 下 references 是查询期路径，无跨文件解析缓存需联动失效
+        // ——返回值是 Phase D 诊断级联的消费方（Phase E 定向失效另行消费）。
         let surface_changed = {
             let mut idx = self.index.write().unwrap();
             match idx.as_mut() {
@@ -191,19 +196,22 @@ impl WorkspaceState {
         if surface_changed {
             as_log!("reindex: decl surface changed (query-time references need no invalidation)");
         }
+        surface_changed
     }
 
     /// watched-files 新增 / 改名（规划 §5.3）：单文件入索引（FileId 由调用方
-    /// intern——同路径复活自动复用，D18）。
-    pub fn add_file(&self, file: FileId, kind: FileKind, module: Option<Sym>, text: String) {
+    /// intern——同路径复活自动复用，D18）。返回 = 声明面是否变化（P7）。
+    pub fn add_file(&self, file: FileId, kind: FileKind, module: Option<Sym>, text: String) -> bool {
         let bytes = text.len();
-        {
+        let changed = {
             let mut idx = self.index.write().unwrap();
-            if let Some(i) = idx.as_mut() {
-                i.reindex_file_full(file, kind, module, text);
+            match idx.as_mut() {
+                Some(i) => i.reindex_file_full(file, kind, module, text),
+                None => false,
             }
-        }
-        as_log!("add_file: indexed {bytes} bytes (kind={:?})", kind);
+        };
+        as_log!("add_file: indexed {bytes} bytes (kind={kind:?}, surface changed={changed})");
+        changed
     }
 
     /// watched-files 删除（规划 §5.3）：摘除全部查询表条目 + 墓碑（D18）。
@@ -380,5 +388,36 @@ pub fn kind_of_path(path: &str) -> FileKind {
         FileKind::Decl
     } else {
         FileKind::Script
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::docs::DocStore;
+    use as_core::intern::intern_file;
+
+    // 单测用例内置于源码（D1）。
+
+    #[test]
+    fn ensure_file_fresh_reports_surface_change() {
+        // Phase D / P6+P7：overlay 改基类（结构变化）→ ensure_file_fresh
+        // 返回 true；版本未变 → false。
+        let ws = WorkspaceState::new();
+        let file = intern_file("unique://fresh/a.as", 0);
+        let inputs = vec![as_core::FileInput {
+            file,
+            kind: FileKind::Script,
+            module: None,
+            source: "class A : B {}\nclass B {}\n".to_string(),
+        }];
+        let idx = as_core::workspace::Workspace::build(as_core::IndexConfig::default(), inputs);
+        ws.publish_and_replay(idx, &Mutex::new(DocStore::new()));
+        // 打开（version 1，基类 B → C：P6 的结构变化）
+        let mut store = DocStore::new();
+        store.open("unique://fresh/a.as", 1, "class A : C {}\nclass B {}\n".to_string());
+        let docs = Mutex::new(store);
+        assert!(ws.ensure_file_fresh(file, &docs), "改基类应报 surface 变化");
+        assert!(!ws.ensure_file_fresh(file, &docs), "版本未变不再重索引");
     }
 }
