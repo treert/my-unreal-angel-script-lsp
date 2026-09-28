@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-28
+
+### Added
+
+- Semantic coloring for identifier usage sites: bare identifiers, member access
+  chains (`Receiver.Method`), and qualified names (`EMode::Off`) are now resolved
+  through the full lookup chain and colored the same as their declarations
+  (`as_global_function`, `as_member_function`, `as_local_variable`, …). Falls
+  back to syntax-only highlighting while the index is loading. Unresolved
+  identifiers stay uncolored.
+
 ### Removed
 
 - `missing-type-decls` diagnostic (a warning on every script file when no
