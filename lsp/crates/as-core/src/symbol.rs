@@ -1,10 +1,12 @@
-//! 符号 arena：DefData / DefKind / DefFlags（LSP实现规划 §3.2）。
+//! 符号基础类型：DefKind / DefFlags / ParamDecl / BaseRef（LSP实现规划 §3.2）。
 //!
+//! Phase B（D37）：符号 arena（`DefData` / `SymbolTable` / `DefExtra`）随
+//! `WorkspaceIndex` 删除——声明的存储形态统一为 `summary::RawDecl`
+//! （per-file，parent = 文件内局部 id），跨文件锚点 = `aggregation::DeclRef`。
 //! 重载组不落库（查询时按 name+scope 聚合）；属性访问器视图是对既有
-//! Function DefId 的包装查询（§3.2），均不是新符号。
+//! Method 声明的包装查询（§3.2），均不是新符号。
 
-use crate::decl_tags::SemanticTag;
-use crate::id::{DefId, FileId, Sym};
+use crate::id::Sym;
 use crate::range::TextRange;
 use crate::types::SynType;
 
@@ -182,85 +184,3 @@ pub struct BaseRef {
     pub simple: bool,
 }
 
-/// kind 特化数据（规划 §3.2「放 variant」）。
-#[derive(Clone, Debug)]
-pub enum DefExtra {
-    None,
-    /// class / struct：基类名 + 模板形参（`.d.as` 模板声明头）
-    TypeDecl {
-        bases: Vec<BaseRef>,
-        template_params: Vec<Sym>,
-    },
-    /// 函数/方法/构造/析构/delegate/event：返回类型（语法层）+ 形参列表
-    Callable {
-        return_type: Option<SynType>,
-        params: Vec<ParamDecl>,
-    },
-    /// 字段/全局变量/asset/虚属性：声明类型（语法层）
-    Variable {
-        ty: Option<SynType>,
-    },
-    /// enum 成员：`= Expr` 的原文（表达式求值是 Phase 3 的事）
-    EnumValue {
-        value: Option<Box<str>>,
-    },
-}
-
-/// 一个符号声明（规划 §3.2 草案字段）。
-#[derive(Clone, Debug)]
-pub struct DefData {
-    pub name: Sym,
-    pub kind: DefKind,
-    pub file: FileId,
-    /// 名字 token（definition/rename/hover 锚点）
-    pub name_span: TextRange,
-    /// 整个声明
-    pub full_span: TextRange,
-    /// 所属 class / namespace；顶层为 None（模块归属表是 M3 的 local 隔离）
-    pub parent: Option<DefId>,
-    /// 合成符号 → 源头声明（D10）
-    pub origin: Option<DefId>,
-    pub flags: DefFlags,
-    pub extra: DefExtra,
-    /// 声明前 doc 注释（tag 已分流走）
-    pub doc: Option<Box<str>>,
-    /// 语义 tag（§2.4.3 白名单；flag 类同时镜像进 flags）
-    pub tags: Vec<SemanticTag>,
-}
-
-/// 符号 arena：`Vec<DefData>`，DefId 即下标（「相等即同一」）。
-#[derive(Debug, Default)]
-pub struct SymbolTable {
-    defs: Vec<DefData>,
-}
-
-impl SymbolTable {
-    pub fn new() -> Self {
-        SymbolTable { defs: Vec::new() }
-    }
-
-    pub fn push(&mut self, def: DefData) -> DefId {
-        let id = DefId::from_raw(self.defs.len() as u32);
-        self.defs.push(def);
-        id
-    }
-
-    pub fn get(&self, id: DefId) -> &DefData {
-        &self.defs[id.as_usize()]
-    }
-
-    pub fn len(&self) -> usize {
-        self.defs.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.defs.is_empty()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (DefId, &DefData)> {
-        self.defs
-            .iter()
-            .enumerate()
-            .map(|(i, def)| (DefId::from_raw(i as u32), def))
-    }
-}

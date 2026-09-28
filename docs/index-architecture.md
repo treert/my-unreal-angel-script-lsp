@@ -387,20 +387,25 @@ synthetic_members(decl_ref):
 
 ## 8. 旧机制生死清单（逐条裁决）
 
-| 旧机制 | 去向 | 理由 |
-|---|---|---|
-| D4（不设轻扫描，全量 parse） | **保留** | parse 仍是全量（并行），summary 提取并入同一并行段 |
-| D5（Phase 2 记录 use-site，Phase 3 惰性解析） | **翻案 → §6** | 查询期字符串搜 + 现解析；每次查询工作量反而下降 |
-| D18（append-only arena + 墓碑） | **收缩** | FileId 注册表照旧（路径 → id 复用不变）；DefId arena 整体消失，墓碑只剩 FileId 层 |
-| D23（mixin DefId 倒排，键不预展开） | **翻案 → §5.3** | 名字倒排 + 查询期剥壳，更简单 |
-| D25（内建 primitive 合成 DefId） | **保留，改形式** | 内建类型表改常量映射（名字 → 固定合成锚点），不进 per-file arena |
-| D29（声明面指纹） | **删除** | 职责被贡献倒排 + 缓存失效取代 |
-| `closures` / `cycle_classes` | **删除** → §5.2 | 按需走链 + visited 环检测 |
-| `resolve_decl_types`（3.2 万条预解析） | **删除** | 查询期从 SynType 现查聚合层（hover 本来就走查找链） |
-| `TypeTable`（类型规范 intern） | **保留，填充改查询期** | 它是 Sym 级进程 intern，不是 per-file 数据 |
-| `modules` 表 | **收缩** | per-file 自带模块名；聚合层只留 `Sym → FileId` 小表 |
-| `live_def_ids` 幽灵过滤 | **删除** | per-file 替换即消失 |
-| verify_tree 启动期收集 | **已删**（前序提交） | 诊断期 `has_error` 剪枝 |
+> **Phase B 落地状态（v1.3，D38）**：下表「状态」列为 2026-09-28 实际执行
+> 结果。与 v1.0 原案的两处偏差：closures / resolve_decl_types / TypeTable
+> 的按需化**延后到 Phase C**（B5：行为零变化优先）；D29 指纹**收缩为
+> reindex 返回值接口**而非整体删除（Phase E 消费，见 D38 处置修正）。
+
+| 旧机制 | 去向 | 理由 | 状态（v1.3） |
+|---|---|---|---|
+| D4（不设轻扫描，全量 parse） | **保留** | parse 仍是全量（并行），summary 提取并入同一并行段 | ✅ 落地（parse+summary 同一 rayon 段，~530ms） |
+| D5（Phase 2 记录 use-site，Phase 3 惰性解析） | **翻案 → §6** | 查询期字符串搜 + 现解析；每次查询工作量反而下降 | ✅ 生效（uses.rs / ref_index / use_cache 删除；ref-stats 25505 逐位一致） |
+| D18（append-only arena + 墓碑） | **收缩** | FileId 注册表照旧（路径 → id 复用不变）；DefId arena 整体消失，墓碑只剩 FileId 层 | ✅ 落地（DefId 类型本身删除） |
+| D23（mixin DefId 倒排，键不预展开） | **翻案 → §5.3** | 名字倒排 + 查询期剥壳，更简单 | ✅ 生效（`mixin_by_name` + `mixin_pending` 删除） |
+| D25（内建 primitive 合成 DefId） | **保留，改形式** | 内建类型表改常量映射（名字 → 固定合成锚点），不进 per-file arena | ✅ 落地改 B2 形态（builtin 伪文件 + SYNTHETIC RawDecl，同一代码路径） |
+| D29（声明面指纹） | **删除** | 职责被贡献倒排 + 缓存失效取代 | 🔶 收缩（返回值保留为增量接口，Phase E 消费——D38 修正） |
+| `closures` / `cycle_classes` | **删除** → §5.2 | 按需走链 + visited 环检测 | ⏳ Phase B 保持 eager（B5）；按需化 Phase C |
+| `resolve_decl_types`（3.2 万条预解析） | **删除** | 查询期从 SynType 现查聚合层（hover 本来就走查找链） | ⏳ Phase B 保持 eager（B5）；expr 的 resolved 回落路径仍消费 |
+| `TypeTable`（类型规范 intern） | **保留，填充改查询期** | 它是 Sym 级进程 intern，不是 per-file 数据 | ⏳ Phase B 保持 eager（B5）；填充按需化 Phase C |
+| `modules` 表 | **收缩** | per-file 自带模块名；聚合层只留 `Sym → FileId` 小表 | ✅ 落地（`Workspace::module_of` 走 summary；聚合层 module_members 选举） |
+| `live_def_ids` 幽灵过滤 | **删除** | per-file 替换即消失 | ✅ 落地（无 arena 即无幽灵） |
+| verify_tree 启动期收集 | **已删**（前序提交） | 诊断期 `has_error` 剪枝 | ✅ 维持 |
 
 ---
 
@@ -443,6 +448,17 @@ append-only 内存单调涨与重映射复杂度——旧设计不迁就（用�
 步骤 3 与 5 可互换；步骤 1-2 无行为变化；步骤 3 后旧 `WorkspaceIndex`
 即删。
 
+> **Phase A/B 实际执行映射（v1.3，D38）**：步骤 1-2 = Phase A（A1-A5，
+> 双轨对账零差异收官）；**步骤 5 的 references 查询期内核提前并入 Phase B
+> Task 1**（旧后端上先 A/B 对账验证，避免 use-site 死代码移植）；步骤 3
+> 与 步骤 5 的删除部分在 **Phase B Task 3 一次原子切换**（L3 十文件 +
+> 删 index.rs/expand.rs，as-cli 临时同批挂载——as-lsp 依赖旧 API 使
+> 「只动 as-core」会断编 workspace 测试）；步骤 5 的 as-lsp 侧 + uses.rs
+> 删除 = **Task 4**；步骤 4（按需化）= Phase C（B5 裁决延后）；步骤 6
+> = Phase E；步骤 7 = 本版 v1.3 + D38。验收基线：162 单测全绿
+> （171 基线中 9 条随已删机制退休、存活断言全平移），语料三重对账
+> 全一致（详见 D38）。
+
 ---
 
 ## 12. 风险与验证项
@@ -461,6 +477,7 @@ append-only 内存单调涨与重映射复杂度——旧设计不迁就（用�
 
 | 版本 | 日期 | 内容 |
 |---|---|---|
+| v1.3 | 2026-09-28 | **Phase B 落地同步**（D38）：L3 后端切换 DefId → DeclRef 完成——B1-B7 实施裁决落入 §8/§11（references 查询期唯一路径；builtin 合成伪文件（B2，agg.main +15 内建键为预期差）；类直接兼任 namespace（B3，origin_fallback/合成 namespace 删除）；合成成员查询期 synthetic_members + Target::Synthetic/RefTarget::Synthetic（B4，D10 origin 以 DeclRef 保留）；closures/resolved/TypeTable 保持 eager 到 Phase C（B5）；members = by_parent + namespace 聚合（B7））。§8 生死清单标注落地状态；§11 补 Phase A/B 执行映射（步骤 5 提前并入 B1、步骤 3+5 合并于 B3 原子切换）。旧 WorkspaceIndex/DefId/DefData/SymbolTable/index.rs/expand.rs/uses.rs 全删。验收：162 单测全绿、resolve-stats 94.9% 精确一致、ref-stats 25505 hits 逐位一致（~305ms）、--new-arch decls 101134 一致 |
 | v1.2 | 2026-09-28 | **Phase A 落地同步**（实现期三处裁决）：① LocalKind 无 LocalFn（AS 无嵌套函数，v1.1 笔误）；② auto 预推导不做构造调用（`auto X = Ident(args)` 与函数调用无法语法区分，宁缺毋假）+ 显式声明保留裸 `float` / 字面量给规范名的双层口径（§3.3.1）；③ 聚合层模块映射改成员表 + `module_file` 访问器（删除时接替者自动重选，§4.1）。Phase A 验收：414 `.d.as` 双轨对账零差异（decls 101134 / main keys 53711），新架构 531ms vs 旧 956ms（-44%） |
 | v1.1 | 2026-09-28 | **scope_tree 升级为 FileSummary 必含组件**（§3.3 重写）：否决「扁平局部表」倾向——遮蔽语义下每次查询都要现场重建树形关系（区间包含 + 深度比较），resolve 第 1 级 / completion 局部候选 / references 逐点验证 / inlay 全依赖它，不如提取期一次建好；结构定案（Scope arena + parent 链 + LocalDecl 含预推导类型）、两查询原语（`resolve_local` / `locals_visible`）、AS 简化点（无 lambda ⇒ 无捕获记账；`local` 函数模块级可见性归 L2）；风险 4（扁平表验证项）随之移除 |
 | v1.0 | 2026-09-28 | 首版：三层模型（per-file summary / 薄聚合层 / 按需定型）；D5/D23/D29 翻案裁决；mixin 名字倒排简化；auto-only 推导边界与局部定型表；references 查询期化；DefId → DeclRef 一步到位；实施切分 7 步 |

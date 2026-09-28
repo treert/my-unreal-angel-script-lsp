@@ -1,15 +1,16 @@
-//! ID 体系（LSP实现规划 §3）：四个 u32 索引贯穿全库，**相等即同一**，杜绝深比较。
+//! ID 体系（LSP实现规划 §3）：u32 索引贯穿全库，**相等即同一**，杜绝深比较。
 //!
 //! | ID | arena | 含义 |
 //! |----|-------|------|
 //! | `FileId` | 文件注册表（`intern.rs`） | 一个已加载的 `.as` / `.d.as` 文本 |
 //! | `Sym` | 字符串 intern（`intern.rs`） | 标识符 / 名字 |
-//! | `DefId` | `Vec<DefData>`（M1 `symbol.rs`） | 一个符号声明 |
-//! | `TypeId` | 类型表（M1 `types.rs`） | 一个归一化类型 |
+//! | `TypeId` | 类型表（`types.rs`） | 一个归一化类型 |
 //!
-//! 接口不变量类骨架（实现优化 §1.1 判据）：这些类型第一天就位，后续任何模块
-//! 都不得用裸字符串 / 裸下标替代。`DefId` / `TypeId` 在 M0 仅有类型定义，
-//! 其 arena 与构造入口随 M1 落地。
+//! Phase B（D37）：`DefId`（全局符号 arena 下标）删除——声明的存储形态是
+//! per-file 的 `summary::RawDecl`，跨文件锚点是 `aggregation::DeclRef`
+//! （`{file, local}` 二元组，文件重索引不扰动其他文件）。
+//! 接口不变量类骨架（实现优化 §1.1 判据）：这些类型第一天就位，任何模块
+//! 都不得用裸字符串 / 裸下标替代。
 
 use lasso::Spur;
 
@@ -41,11 +42,6 @@ macro_rules! define_u32_id {
 define_u32_id!(
     /// 已加载文件的 id。注册表见 `intern.rs`：append-only + 墓碑（D18）。
     FileId
-);
-
-define_u32_id!(
-    /// 符号声明的 id（arena `Vec<DefData>` 的下标，M1 落地）。
-    DefId
 );
 
 define_u32_id!(
