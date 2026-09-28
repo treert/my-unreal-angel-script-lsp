@@ -23,7 +23,7 @@ use crate::config::IndexConfig;
 use crate::expr::{is_auto_type, number_base_name};
 use crate::id::Sym;
 use crate::index::FileKind;
-use crate::intern::{intern_sym, sym_str};
+use crate::intern::intern_sym;
 use crate::range::TextRange;
 use crate::scope::{LocalDecl, LocalKind, Scope, ScopeTree};
 use crate::symbol::{BaseRef, DefFlags, DefKind, ParamDecl};
@@ -31,7 +31,7 @@ use crate::syntax::{self, DeclCtx};
 use crate::types::SynType;
 
 /// 每文件摘要：声明表 + 文件内名字倒排 + 局部作用域树 + 文件头 tag。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileSummary {
     pub kind: FileKind,
     pub module: Option<Sym>,
@@ -48,7 +48,7 @@ pub struct FileSummary {
 }
 
 /// 一条声明（≈ `DefData` 去跨文件字段）。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RawDecl {
     pub name: Sym,
     pub kind: DefKind,
@@ -69,7 +69,7 @@ pub struct RawDecl {
 }
 
 /// kind 特化数据（原 `DefExtra`，TypeDecl 内容上提为 RawDecl 字段）。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum RawExtra {
     None,
     /// 函数/方法/构造/析构/delegate/event：返回类型（语法层）+ 形参列表
@@ -121,6 +121,27 @@ pub fn extract_summary(
         decls: b.decls,
         by_name: b.by_name,
         scope_tree: ScopeTree::from_scopes(scopes),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 语法层剥壳（聚合层 mixin 名字倒排用，§5.3——不经类型表）
+// ---------------------------------------------------------------------------
+
+/// `SynType` 逐层剥壳取基名（`FVector&` / `const FVector&in` / `T[]` /
+/// 模板 → 各自的名字；`A::B` 取尾段）。Auto / Wildcard / Qualified 空段
+/// → None。
+pub fn syn_base_name(t: &SynType) -> Option<Sym> {
+    match t {
+        SynType::Named(n, _)
+        | SynType::Primitive(n, _)
+        | SynType::Template { name: n, .. } => Some(*n),
+        SynType::Ref(inner, _)
+        | SynType::Const(inner)
+        | SynType::Array(inner)
+        | SynType::UnresolvedObject(inner) => syn_base_name(inner),
+        SynType::Qualified(segs) => segs.last().map(|(n, _)| *n),
+        SynType::Auto | SynType::Wildcard => None,
     }
 }
 

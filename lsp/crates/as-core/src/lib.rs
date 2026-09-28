@@ -11,6 +11,7 @@
 //! 依赖方向：as-core → as-syntax；服务壳（as-lsp）与工具（as-cli）一律经
 //! `pub use as_syntax` 取语法能力，不直连 as-syntax。
 
+pub mod aggregation;
 pub mod config;
 pub mod completion;
 pub mod decl_tags;
@@ -45,6 +46,7 @@ pub use decl_tags::{DocBlock, SemanticTag, TagKind, TagValue};
 pub use diag::{script_diags, Diag, DiagCode, DiagSeverity, Suppression};
 pub use hover::{hover_markdown, render_doc, render_syn, signature};
 pub use id::{DefId, FileId, Sym, TypeId};
+pub use aggregation::{Aggregation, DeclRef};
 pub use config::IndexConfig;
 pub use index::{filename_to_module_name, FileInput, FileKind, WorkspaceIndex};
 pub use outline::{document_symbols, folding_ranges, Fold, FoldKind, OutlineKind, OutlineSymbol};
