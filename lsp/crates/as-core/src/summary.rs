@@ -20,11 +20,12 @@ use as_syntax::tree_sitter::Node;
 
 use crate::decl_tags::{parse_comment_texts, SemanticTag, TagKind, TagValue};
 use crate::config::IndexConfig;
+use crate::expr::{is_auto_type, number_base_name};
 use crate::id::Sym;
 use crate::index::FileKind;
-use crate::intern::intern_sym;
+use crate::intern::{intern_sym, sym_str};
 use crate::range::TextRange;
-use crate::scope::ScopeTree;
+use crate::scope::{LocalDecl, LocalKind, Scope, ScopeTree};
 use crate::symbol::{BaseRef, DefFlags, DefKind, ParamDecl};
 use crate::syntax::{self, DeclCtx};
 use crate::types::SynType;
@@ -88,7 +89,7 @@ pub fn extract_summary(
     source: &str,
     kind: FileKind,
     module: Option<Sym>,
-    _cfg: &IndexConfig,
+    cfg: &IndexConfig,
 ) -> FileSummary {
     let mut b = SummaryBuilder { decls: Vec::new(), by_name: HashMap::new() };
 
@@ -109,6 +110,9 @@ pub fn extract_summary(
         b.extract_decl(child, source, None, DeclCtx::Global);
     }
 
+    // 局部作用域树：独立一趟（与声明提取正交——函数体局部不进 decls）
+    let scopes = build_scopes(root, source, cfg);
+
     FileSummary {
         kind,
         module,
@@ -116,7 +120,203 @@ pub fn extract_summary(
         cache_format,
         decls: b.decls,
         by_name: b.by_name,
-        scope_tree: ScopeTree::empty(),
+        scope_tree: ScopeTree::from_scopes(scopes),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// scope_tree 构建 + auto 局部预推导（index-architecture §3.3）
+// ---------------------------------------------------------------------------
+
+/// 遍历全树找带体的函数/构造/析构声明，为每个建一棵 scope 子树（AS 无嵌套
+/// 函数 ⇒ 各子树独立，根 scope span = 声明整体、含形参）。
+fn build_scopes(root: Node<'_>, src: &str, cfg: &IndexConfig) -> Vec<Scope> {
+    let mut w = ScopeWalker { src, cfg, scopes: Vec::new() };
+    w.walk_root(root);
+    w.scopes
+}
+
+struct ScopeWalker<'a> {
+    src: &'a str,
+    cfg: &'a IndexConfig,
+    scopes: Vec<Scope>,
+}
+
+impl<'a> ScopeWalker<'a> {
+    /// 递归找函数体起点（namespace / class 体内均可）。
+    fn walk_root(&mut self, node: Node<'_>) {
+        match node.kind() {
+            "function_declaration" | "constructor_declaration" | "destructor_declaration" => {
+                if let Some(body) = node.child_by_field_name("body") {
+                    // 根 scope：span = 声明整体（形参在 body 外，必须被覆盖）
+                    let decls = syntax::param_decls(node, self.src)
+                        .into_iter()
+                        .map(|p| LocalDecl {
+                            name: p.name,
+                            kind: LocalKind::Param,
+                            name_span: p.span,
+                            ty: p.ty,
+                        })
+                        .collect();
+                    let idx = self.scopes.len() as u32;
+                    self.scopes.push(Scope { parent: None, span: syntax::span(node), decls });
+                    self.walk_stmts(body, idx);
+                    return; // body 已走完，不再整体下潜
+                }
+            }
+            _ => {}
+        }
+        for (_f, child) in syntax::children_with_fields(node) {
+            self.walk_root(child);
+        }
+    }
+
+    /// 语句级遍历：block / for-range 建新 scope，variable_declaration 记
+    /// 局部（auto 走预推导），其余语句下潜（表达式内无 block，安全）。
+    fn walk_stmts(&mut self, node: Node<'_>, scope: u32) {
+        match node.kind() {
+            "block" => {
+                let idx = self.scopes.len() as u32;
+                self.scopes.push(Scope {
+                    parent: Some(scope),
+                    span: syntax::span(node),
+                    decls: Vec::new(),
+                });
+                for (_f, child) in syntax::children_with_fields(node) {
+                    self.walk_stmts(child, idx);
+                }
+            }
+            "for_each_statement" => {
+                // 迭代变量 scope = 整个 for 语句（E 只在语句内可见，不泄漏外层）
+                let declared = node
+                    .child_by_field_name("type")
+                    .and_then(|t| syntax::parse_syn_type(t, self.src));
+                let mut decls = Vec::new();
+                if let Some(n) = node.child_by_field_name("name") {
+                    // auto 迭代变量：元素类型需查 range 表达式（跨文件）——保留 None
+                    let ty = match &declared {
+                        Some(t) if !is_auto_type(t) => declared.clone(),
+                        _ => None,
+                    };
+                    decls.push(LocalDecl {
+                        name: intern_sym(syntax::text(n, self.src)),
+                        kind: LocalKind::IterVar,
+                        name_span: syntax::span(n),
+                        ty,
+                    });
+                }
+                let idx = self.scopes.len() as u32;
+                self.scopes.push(Scope { parent: Some(scope), span: syntax::span(node), decls });
+                for (_f, child) in syntax::children_with_fields(node) {
+                    self.walk_stmts(child, idx);
+                }
+            }
+            "variable_declaration" => {
+                let declared = node
+                    .child_by_field_name("type")
+                    .and_then(|t| syntax::parse_syn_type(t, self.src));
+                for (_f, child) in syntax::children_with_fields(node) {
+                    if child.kind() != "variable_declarator" {
+                        continue;
+                    }
+                    let Some(name_node) = child.child_by_field_name("name") else { continue };
+                    let value = child.child_by_field_name("value");
+                    let ty = self.infer_var_ty(&declared, value, scope);
+                    self.scopes[scope as usize].decls.push(LocalDecl {
+                        name: intern_sym(syntax::text(name_node, self.src)),
+                        kind: LocalKind::Var,
+                        name_span: syntax::span(name_node),
+                        ty,
+                    });
+                }
+                // 初始化式是表达式（无 block / 无嵌套函数），不再下潜
+            }
+            _ => {
+                for (_f, child) in syntax::children_with_fields(node) {
+                    self.walk_stmts(child, scope);
+                }
+            }
+        }
+    }
+
+    /// 局部变量定型：显式类型原样保留（含裸 `float`——归一化是 L3 消费期的
+    /// 事，与字面量路径不同：字面量无源码类型名，直接给规范名）；
+    /// `auto`（含 `auto&`）→ 初始化式预推导；推不出 = None（宁缺毋假）。
+    fn infer_var_ty(
+        &self,
+        declared: &Option<SynType>,
+        value: Option<Node<'_>>,
+        scope: u32,
+    ) -> Option<SynType> {
+        let declared = declared.as_ref()?;
+        if !is_auto_type(declared) {
+            return Some(declared.clone());
+        }
+        self.infer_expr(value?, scope)
+    }
+
+    /// summary 期预推导（零全局依赖，产物一律 SynType 名字——加速器不是
+    /// 真值源，L3 查询期可推翻重算）：
+    /// - `Cast<T>(x)`：type 字段直接是 T（`'Cast'` 是匿名 token）
+    /// - 字面量：数字后缀/进制与 D25 同规则（number_base_name）、
+    ///   `"…"`/f-string/heredoc → FString、`n"…"` → FName、bool → bool
+    /// - 裸标识符：复制同作用域链上已定型局部（顺序扫描同趟可见）
+    /// - **不做**构造调用（`auto X = Ident(args)` 无法与函数调用语法区分，
+    ///   宁缺毋假）；跨文件传播（成员链/调用返回）留 L3
+    fn infer_expr(&self, node: Node<'_>, scope: u32) -> Option<SynType> {
+        match node.kind() {
+            "cast_expression" => node
+                .child_by_field_name("type")
+                .and_then(|t| syntax::parse_syn_type(t, self.src)),
+            "parenthesized_expression" => {
+                let inner = syntax::children_with_fields(node)
+                    .into_iter()
+                    .find(|(_, c)| c.is_named())
+                    .map(|(_, c)| c)?;
+                self.infer_expr(inner, scope)
+            }
+            "number" => {
+                let n = number_base_name(syntax::text(node, self.src), self.cfg.float_is_float64);
+                Some(SynType::Primitive(intern_sym(n), syntax::span(node)))
+            }
+            "string_literal" | "heredoc_string" | "format_string" => {
+                Some(SynType::Named(intern_sym("FString"), syntax::span(node)))
+            }
+            "name_literal" => Some(SynType::Named(intern_sym("FName"), syntax::span(node))),
+            "boolean_literal" => {
+                Some(SynType::Primitive(intern_sym("bool"), syntax::span(node)))
+            }
+            "identifier" => {
+                let name = intern_sym(syntax::text(node, self.src));
+                resolve_in_chain(&self.scopes, scope, node.start_byte() as u32, name)
+                    .and_then(|d| d.ty.clone())
+            }
+            _ => None,
+        }
+    }
+}
+
+/// 作用域链解析（建树过程中的复制推导用——树在建到一半，直接在 Vec 上走，
+/// 语义与 `ScopeTree::resolve_local` 一致：链上最近者胜、声明点可见）。
+fn resolve_in_chain<'s>(
+    scopes: &'s [Scope],
+    cur: u32,
+    byte: u32,
+    name: Sym,
+) -> Option<&'s LocalDecl> {
+    let mut i = cur;
+    loop {
+        let s = &scopes[i as usize];
+        let mut hit: Option<&LocalDecl> = None;
+        for d in &s.decls {
+            if d.name == name && d.name_span.start <= byte {
+                hit = Some(d);
+            }
+        }
+        if let Some(d) = hit {
+            return Some(d);
+        }
+        i = s.parent?;
     }
 }
 
@@ -580,7 +780,90 @@ enum E { A, B = 5 }
             }
             _ => panic!("B 应是 EnumValue"),
         }
-        // scope_tree 本任务恒为空树
-        assert!(s.scope_tree.locals_visible(0).is_empty());
+    }
+
+    /// scope_tree 建树 + auto 预推导（index-architecture §3.3.1 四类可解）。
+    /// 字节偏移用 find 定位（不硬编码，防源码微调脆断）。
+    #[test]
+    fn scope_tree_built_with_inference() {
+        const SRC: &str = "\
+void F(float DT)
+{
+    int A = 1;
+    {
+        int A = 2;
+        auto B = Cast<FVector2>(A);
+    }
+    auto C = A;
+    auto D = 1.5;
+    auto S = n\"Foo\";
+    for (auto E : Items) { Use(E); }
+    for (int I : Items) { Use(I); }
+}
+";
+        let tree = as_syntax::parse(SRC, None);
+        let s = extract_summary(&tree, SRC, FileKind::Script, None, &IndexConfig::default());
+        let after = |pat: &str| (SRC.find(pat).unwrap() + pat.len()) as u32;
+
+        // 形参：显式类型原样（裸 float 不归一化——归一化是 L3 消费期的事）
+        let dt = s.scope_tree.resolve_local(after("int A = 1;"), intern_sym("DT")).unwrap();
+        assert!(matches!(dt.kind, LocalKind::Param));
+        match dt.ty.as_ref() {
+            Some(SynType::Primitive(p, _)) => assert_eq!(sym_str(*p), "float"),
+            other => panic!("DT 应是 Primitive(float)，实际 {other:?}"),
+        }
+
+        // 遮蔽：内层块的 A（声明 2）
+        let a = s.scope_tree.resolve_local(after("auto B ="), intern_sym("A")).unwrap();
+        assert_eq!(a.name_span, TextRange::new(
+            SRC.find("int A = 2").unwrap() as u32 + 4,
+            SRC.find("int A = 2").unwrap() as u32 + 5,
+        ));
+
+        // Cast 推导：type 字段直接是 T
+        let b = s.scope_tree.resolve_local(after("auto B ="), intern_sym("B")).unwrap();
+        match b.ty.as_ref() {
+            Some(SynType::Named(n, _)) => assert_eq!(sym_str(*n), "FVector2"),
+            other => panic!("B 应是 Named(FVector2)，实际 {other:?}"),
+        }
+
+        // 复制推导：C 复制外层 A 的显式 int
+        let c = s.scope_tree.resolve_local(after("auto D ="), intern_sym("C")).unwrap();
+        match c.ty.as_ref() {
+            Some(SynType::Primitive(p, _)) => assert_eq!(sym_str(*p), "int"),
+            other => panic!("C 应是 Primitive(int)，实际 {other:?}"),
+        }
+
+        // 字面量：float 按 cfg 归一（默认 float64——字面量无源码类型名，
+        // 直接给规范名，与显式声明保留裸名不同）
+        let d = s.scope_tree.resolve_local(after("auto S ="), intern_sym("D")).unwrap();
+        match d.ty.as_ref() {
+            Some(SynType::Primitive(p, _)) => assert_eq!(sym_str(*p), "float64"),
+            other => panic!("D 应是 Primitive(float64)，实际 {other:?}"),
+        }
+
+        // n"..." → FName
+        let ns = s.scope_tree.resolve_local(after("for (auto E"), intern_sym("S")).unwrap();
+        match ns.ty.as_ref() {
+            Some(SynType::Named(n, _)) => assert_eq!(sym_str(*n), "FName"),
+            other => panic!("S 应是 Named(FName)，实际 {other:?}"),
+        }
+
+        // range-for：auto 迭代变量跨文件（元素类型）→ None（宁缺毋假）；
+        // 显式类型迭代变量 → 原样
+        let e = s.scope_tree.resolve_local(after("for (auto E"), intern_sym("E")).unwrap();
+        assert!(matches!(e.kind, LocalKind::IterVar));
+        assert!(e.ty.is_none(), "Items 元素类型未知 ⇒ None");
+        let i = s.scope_tree.resolve_local(after("for (int I"), intern_sym("I")).unwrap();
+        match i.ty.as_ref() {
+            Some(SynType::Primitive(p, _)) => assert_eq!(sym_str(*p), "int"),
+            other => panic!("I 应是 Primitive(int)，实际 {other:?}"),
+        }
+
+        // 构造调用不做（与函数调用无法语法区分）——auto G = H(...) 推不出
+        // （间接由 E 的 None 断言覆盖同类语义；此处不另设用例）
+
+        // 局部不进 decls（与 as_script_forms 用例同一不变量，此处复验）
+        assert!(s.by_name.get(&intern_sym("A")).is_none(), "函数体局部不进 decls");
     }
 }

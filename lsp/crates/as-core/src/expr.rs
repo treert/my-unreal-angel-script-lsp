@@ -602,7 +602,8 @@ pub(crate) fn is_auto_type(ty: &SynType) -> bool {
 /// 数字字面量的基类型名（引擎语义：无后缀整数 → int；`1.5f` → float32；
 /// 其余浮点 → 裸 float，宽度按 IndexConfig 归一化——与 D25 同规则）。
 /// 进制前缀（0x/0b/0o/0d）优先判定，避免 `0x1E` 里的 E 被当科学计数法。
-fn number_base_name(text: &str, float_is_f64: bool) -> &'static str {
+/// `pub(crate)`：summary.rs 局部预推导复用（Phase A，D37）。
+pub(crate) fn number_base_name(text: &str, float_is_f64: bool) -> &'static str {
     if text.ends_with('f') || text.ends_with('F') {
         return "float32";
     }
