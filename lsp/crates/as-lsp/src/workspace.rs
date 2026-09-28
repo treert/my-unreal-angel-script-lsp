@@ -15,12 +15,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Mutex, RwLock};
 
 use as_core::id::{FileId, Sym};
 use as_core::intern::{file_id_of_path, file_path, intern_file};
-use as_core::references::{resolve_file_uses, UseResolution};
-use as_core::{filename_to_module_name, FileInput, FileKind, IndexConfig, WorkspaceIndex};
+use as_core::workspace::Workspace;
+use as_core::{filename_to_module_name, FileInput, FileKind, IndexConfig};
 
 use as_core::as_log;
 
@@ -45,19 +45,19 @@ impl Default for WorkspaceConfig {
     }
 }
 
-/// 工作区状态：Loading/Ready 状态机 + 发布后的索引（§6.1）+ UseSite 解析缓存。
+/// 工作区状态：Loading/Ready 状态机 + 发布后的索引（§6.1）。
+/// Phase B（D37）：`Workspace`（FileEntry + Aggregation + DeclRef）取代
+/// 旧 `WorkspaceIndex`；references 走查询期（find_references），UseSite
+/// 解析缓存（use_cache）随 D5 翻案整体删除。
 pub struct WorkspaceState {
     /// None = Loading；Some = Ready。后台线程建好后整体替换（快照语义）
-    index: RwLock<Option<WorkspaceIndex>>,
+    index: RwLock<Option<Workspace>>,
     /// 已入索引的 overlay 版本
     indexed_versions: Mutex<HashMap<FileId, i32>>,
     /// Loading 期间的 didOpen/didChange（发布后重放，§6.1）
     dirty: Mutex<HashSet<FileId>>,
     /// didClose 后待回落磁盘的文件（§5.1）
     stale: Mutex<HashSet<FileId>>,
-    /// UseSite 解析缓存（D5：Phase 3 惰性 + 按文件缓存；编辑失效粒度 =
-    /// 文件，联动失效见 [`WorkspaceState::reindex`] 的声明面指纹判定）
-    use_cache: Mutex<HashMap<FileId, Arc<Vec<UseResolution>>>>,
     /// 重建互斥（`.d.as` 防抖触发 vs 配置变更触发的全量重建不并发——
     /// `watch::run_rebuild` 自旋占用）
     pub building: AtomicBool,
@@ -78,7 +78,6 @@ impl WorkspaceState {
             indexed_versions: Mutex::new(HashMap::new()),
             dirty: Mutex::new(HashSet::new()),
             stale: Mutex::new(HashSet::new()),
-            use_cache: Mutex::new(HashMap::new()),
             building: AtomicBool::new(false),
             ready_tx: Mutex::new(None),
             diag_tx: Mutex::new(None),
@@ -113,7 +112,7 @@ impl WorkspaceState {
     }
 
     /// Ready 时的只读访问（锁内完成，不跨 await）。
-    pub fn with<R>(&self, f: impl FnOnce(&WorkspaceIndex) -> R) -> Option<R> {
+    pub fn with<R>(&self, f: impl FnOnce(&Workspace) -> R) -> Option<R> {
         let g = self.index.read().unwrap();
         g.as_ref().map(f)
     }
@@ -127,17 +126,16 @@ impl WorkspaceState {
     }
 
     /// 发布快照 + 重放 pending_dirty（§6.1：发布瞬间原子完成）。
-    /// 全量换根 ⇒ UseSite 解析缓存整表失效。
+    /// Phase B：全量换根即整体替换（references 查询期路径无缓存可失效）。
     ///
     /// **indexed_versions 必须清空而非预填 overlay 版本**（M5b 修 M3 潜伏
     /// bug）：新索引来自磁盘文本，与 overlay 版本无对应关系——预填会让
     /// 重放的 `ensure_file_fresh` 判定「版本相等」而短路，didOpen 文本 ≠
     /// 磁盘内容时（probe / 真实编辑）重放成空操作，hover 恒 null。清空后
     /// dirty 集合的每个 overlay 文件都会真正 reindex。
-    pub fn publish_and_replay(&self, idx: WorkspaceIndex, docs: &Mutex<DocStore>) {
+    pub fn publish_and_replay(&self, idx: Workspace, docs: &Mutex<DocStore>) {
         *self.index.write().unwrap() = Some(idx);
         self.indexed_versions.lock().unwrap().clear();
-        self.use_cache.lock().unwrap().clear();
         let dirty: Vec<FileId> = self.dirty.lock().unwrap().drain().collect();
         as_log!("index published: {} pending dirty replay(s)", dirty.len());
         for file in dirty {
@@ -148,17 +146,6 @@ impl WorkspaceState {
         if let Some(tx) = self.diag_tx.lock().unwrap().as_ref() {
             let _ = tx.send(());
         }
-    }
-
-    /// 单文件的 UseSite 解析缓存（命中返回克隆的 Arc；未命中解析并填入）。
-    /// 调用约定：必须在**持有索引读锁的闭包内**同步调用（`with`），不跨 await。
-    pub fn cached_uses(&self, idx: &WorkspaceIndex, file: FileId) -> Arc<Vec<UseResolution>> {
-        if let Some(hit) = self.use_cache.lock().unwrap().get(&file) {
-            return Arc::clone(hit);
-        }
-        let resolved = Arc::new(resolve_file_uses(idx, file));
-        self.use_cache.lock().unwrap().insert(file, Arc::clone(&resolved));
-        resolved
     }
 
     /// 单文件保鲜（语义请求前）：
@@ -191,9 +178,9 @@ impl WorkspaceState {
     }
 
     fn reindex(&self, file: FileId, kind: FileKind, text: String) {
-        // 声明面指纹（D29）：函数体/局部改动 ⇒ 只失效该文件的解析缓存；
-        // 对外可见声明增删改（含重载增删）⇒ 跨文件可见性变化，整表失效
-        // （先正确后优化——精确「依赖该声明的文件集」失效 M5+ 按需）
+        // 声明面判定（D29 的继任：Workspace::reindex_file 的新旧 summary
+        // (name,kind,parent) 集 diff）。Phase B 下 references 是查询期路径，
+        // 无跨文件解析缓存需联动失效——返回值留给 Phase E 的增量消费方。
         let surface_changed = {
             let mut idx = self.index.write().unwrap();
             match idx.as_mut() {
@@ -201,17 +188,13 @@ impl WorkspaceState {
                 None => false,
             }
         };
-        let mut cache = self.use_cache.lock().unwrap();
         if surface_changed {
-            as_log!("reindex: decl surface changed -> use-site cache invalidated entirely");
-            cache.clear();
-        } else {
-            cache.remove(&file);
+            as_log!("reindex: decl surface changed (query-time references need no invalidation)");
         }
     }
 
     /// watched-files 新增 / 改名（规划 §5.3）：单文件入索引（FileId 由调用方
-    /// intern——同路径复活自动复用，D18）。结构性变更 ⇒ 整表失效解析缓存。
+    /// intern——同路径复活自动复用，D18）。
     pub fn add_file(&self, file: FileId, kind: FileKind, module: Option<Sym>, text: String) {
         let bytes = text.len();
         {
@@ -221,7 +204,6 @@ impl WorkspaceState {
             }
         }
         as_log!("add_file: indexed {bytes} bytes (kind={:?})", kind);
-        self.use_cache.lock().unwrap().clear();
     }
 
     /// watched-files 删除（规划 §5.3）：摘除全部查询表条目 + 墓碑（D18）。
@@ -233,7 +215,6 @@ impl WorkspaceState {
             }
         }
         as_log!("remove_file: tombstoned");
-        self.use_cache.lock().unwrap().clear();
     }
 }
 
@@ -296,12 +277,12 @@ fn intern_sym_for_module(name: &str) -> Sym {
     as_core::intern::intern_sym(name)
 }
 
-/// 构建全工作区索引（后台线程调用）。
+/// 构建全工作区索引（后台线程调用；Phase B：Workspace 新管线）。
 pub fn build_index(
     cfg: &WorkspaceConfig,
     folders: &[String],
     overlays: &[(FileId, i32, String)],
-) -> WorkspaceIndex {
+) -> Workspace {
     // 分阶段耗时（fileLog）：目录 walk / 逐文件读盘 / 索引构建
     let t0 = std::time::Instant::now();
     let roots = collect_roots(cfg, folders);
@@ -354,8 +335,8 @@ pub fn build_index(
     );
 
     let t_build = std::time::Instant::now();
-    let idx = WorkspaceIndex::build(IndexConfig { float_is_float64: cfg.float_is_float64 }, inputs);
-    as_log!("rebuild: phase1+2 index built in {:?}", t_build.elapsed());
+    let idx = Workspace::build(IndexConfig { float_is_float64: cfg.float_is_float64 }, inputs);
+    as_log!("rebuild: workspace built in {:?}", t_build.elapsed());
     idx
 }
 

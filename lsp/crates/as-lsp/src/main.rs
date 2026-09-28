@@ -20,7 +20,6 @@ mod workspace;
 use as_core::as_log;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use tower_lsp_server::jsonrpc::Result as RpcResult;
@@ -189,9 +188,11 @@ impl Backend {
         });
     }
 
-    /// 光标处的引用查询目标（M4）：重载组**原样保留**——消歧失败由消费方按
-    /// 「报全部重载」处理（架构设计 §4.6）；class 合成 namespace 归一到类
-    /// （`AActor::` 限定段计入类引用）。None = 光标处不可解析。
+    /// 光标处的引用查询目标（M4 / Phase B）：重载组**原样保留**——消歧失败
+    /// 由消费方按「报全部重载」处理（架构设计 §4.6）；合成成员按
+    /// `(origin, name)` 身份独立计数（B4）；`AActor::` 限定段经 B3 直接
+    /// 产出类 DeclRef（天然归一，原 origin_fallback 删除）。
+    /// None = 光标处不可解析。
     fn resolve_query_targets(&self, file: FileId, byte: u32) -> Option<Vec<as_core::RefTarget>> {
         self.ws
             .with(|idx| {
@@ -200,9 +201,11 @@ impl Backend {
                     .targets
                     .iter()
                     .filter_map(|t| match t {
-                        Target::Def(id) => Some(as_core::RefTarget::Def(
-                            as_core::references::origin_fallback(idx, *id),
-                        )),
+                        Target::Def(r) => Some(as_core::RefTarget::Def(*r)),
+                        Target::Synthetic(m) => Some(as_core::RefTarget::Synthetic {
+                            origin: m.origin,
+                            name: m.name,
+                        }),
                         Target::Local(l) => {
                             Some(as_core::RefTarget::Local { file, span: l.name_span })
                         }
@@ -214,9 +217,9 @@ impl Backend {
             .flatten()
     }
 
-    /// references / rename 共用：引用倒排给候选文件集 → 分批解析 UseSite
-    /// （按文件缓存）→ 匹配。批间释放索引读锁、上报 $/progress（规划 §9 M4
-    /// 长任务；客户端不支持时静默跳过——进度是咨询性增强）。
+    /// references / rename 共用（Phase B：查询期路径——字符串扫 + 逐点解析
+    /// 验证，锁内同步一次完成；无 UseSite 缓存，D5 翻案）。上报 $/progress
+    /// 的分批模式随之退役（整体已是单次并行查询）。
     /// `strict`：rename 只取「唯一指向目标」的站点（歧义站点可能属于其它
     /// 重载，改写会误伤——宁缺毋假）。
     async fn collect_use_matches(
@@ -225,55 +228,17 @@ impl Backend {
         strict: bool,
         title: &str,
     ) -> Vec<(FileId, TextRange)> {
-        let files: Vec<FileId> = self
+        let t0 = std::time::Instant::now();
+        let out = self
             .ws
-            .with(|idx| as_core::references::candidate_files(idx, targets))
+            .with(|idx| as_core::references::find_references(idx, targets, strict))
             .unwrap_or_default();
-        if files.is_empty() {
-            return Vec::new();
-        }
-        let token = ls::NumberOrString::Number(PROGRESS_SEQ.fetch_add(1, Ordering::Relaxed) as i32);
-        let ongoing = match self.client.create_work_done_progress(token.clone()).await {
-            Ok(()) => Some(
-                self.client
-                    .progress(token, title)
-                    .with_percentage(0)
-                    .begin()
-                    .await,
-            ),
-            Err(_) => None, // 客户端不支持 workDoneProgress：跳过进度
-        };
-        const BATCH: usize = 32;
-        let total = files.len();
-        let mut out = Vec::new();
-        for (i, chunk) in files.chunks(BATCH).enumerate() {
-            let hits: Vec<(FileId, TextRange)> = self
-                .ws
-                .with(|idx| {
-                    let mut out = Vec::new();
-                    for &f in chunk {
-                        let resolved = self.ws.cached_uses(idx, f);
-                        let matched = if strict {
-                            as_core::references::match_uses_strict(targets, &resolved)
-                        } else {
-                            as_core::references::match_uses(targets, &resolved)
-                        };
-                        for s in matched {
-                            out.push((f, s));
-                        }
-                    }
-                    out
-                })
-                .unwrap_or_default();
-            out.extend(hits);
-            if let Some(p) = &ongoing {
-                let done = ((i + 1) * BATCH).min(total);
-                p.report((done as u64 * 100 / total as u64) as u32).await;
-            }
-        }
-        if let Some(p) = ongoing {
-            p.finish().await;
-        }
+        as_log!(
+            "references (query-time): {} target(s) -> {} site(s) in {:?} [{title}]",
+            targets.len(),
+            out.len(),
+            t0.elapsed()
+        );
         out
     }
 }
@@ -834,8 +799,14 @@ impl LanguageServer for Backend {
                     let mut out: Vec<ls::Location> = Vec::new();
                     for t in &r.targets {
                         match t {
-                            Target::Def(id) => {
-                                if let Some(loc) = target_location(idx, *id) {
+                            Target::Def(r) => {
+                                if let Some(loc) = target_location(idx, *r) {
+                                    out.push(loc);
+                                }
+                            }
+                            // 合成成员跳到源头声明（D10 origin；Execute → 委托声明）
+                            Target::Synthetic(m) => {
+                                if let Some(loc) = target_location(idx, m.origin) {
                                     out.push(loc);
                                 }
                             }
@@ -887,9 +858,13 @@ impl LanguageServer for Backend {
                     targets
                         .iter()
                         .filter_map(|t| match t {
-                            as_core::RefTarget::Def(id) => {
-                                let d = idx.def(*id);
-                                Some((d.file, d.name_span))
+                            as_core::RefTarget::Def(r) => {
+                                let d = idx.decl(r);
+                                Some((r.file, d.name_span))
+                            }
+                            as_core::RefTarget::Synthetic { origin, .. } => {
+                                let d = idx.decl(origin);
+                                Some((origin.file, d.name_span))
                             }
                             as_core::RefTarget::Local { file, span } => Some((*file, *span)),
                         })
@@ -933,24 +908,24 @@ impl LanguageServer for Backend {
             .ws
             .with(|idx| {
                 let (tf, span, placeholder) = match &targets[0] {
-                    as_core::RefTarget::Def(id) => {
-                        let d = idx.def(*id);
-                        // 合成成员（Execute / StaticClass 等，origin 名 ≠ 自名）：
-                        // 无独立源码声明，不可 rename（改名语义落到源头声明上，
-                        // 用户应在那儿发起）。合成 namespace 已归一到类（同名）。
-                        if let Some(o) = d.origin {
-                            if idx.def(o).name != d.name {
-                                return None;
-                            }
+                    as_core::RefTarget::Def(r) => {
+                        let d = idx.decl(r);
+                        // 内建 primitive（builtin 伪文件的 SYNTHETIC 声明）：
+                        // 无源码锚点，不可 rename
+                        if d.flags.contains(as_core::DefFlags::SYNTHETIC) {
+                            return None;
                         }
-                        if idx.files.get(&d.file).is_none() {
-                            return None; // 内建 primitive：无源码声明
-                        }
-                        (d.file, d.name_span, as_core::intern::sym_str(d.name).to_string())
+                        (r.file, d.name_span, as_core::intern::sym_str(d.name).to_string())
+                    }
+                    as_core::RefTarget::Synthetic { .. } => {
+                        // 合成成员（Execute / StaticClass 等）无独立源码声明，
+                        // 不可 rename（改名语义落到源头声明上，用户应在那儿
+                        // 发起——D10 语义的 Phase B 形态）
+                        return None;
                     }
                     as_core::RefTarget::Local { file: lf, span } => {
-                        let snap = idx.files.get(lf)?;
-                        let name = snap
+                        let entry = idx.files.get(lf)?;
+                        let name = entry
                             .source
                             .get(span.start as usize..span.end as usize)?
                             .to_string();
@@ -993,19 +968,14 @@ impl LanguageServer for Backend {
             .ws
             .with(|idx| {
                 match &targets[0] {
-                    as_core::RefTarget::Def(id) => {
-                        let d = idx.def(*id);
-                        // 合成成员（origin 名 ≠ 自名）无独立源码声明，不可 rename；
-                        // 内建 primitive 同理
-                        if let Some(o) = d.origin {
-                            if idx.def(o).name != d.name {
-                                return None;
-                            }
-                        }
-                        if idx.files.get(&d.file).is_none() {
+                    as_core::RefTarget::Def(r) => {
+                        let d = idx.decl(r);
+                        // 内建 primitive（SYNTHETIC）不可 rename；合成成员同理
+                        if d.flags.contains(as_core::DefFlags::SYNTHETIC) {
                             return None;
                         }
                     }
+                    as_core::RefTarget::Synthetic { .. } => return None,
                     as_core::RefTarget::Local { .. } => {}
                 }
                 Some(targets[0].clone())
@@ -1020,9 +990,13 @@ impl LanguageServer for Backend {
         let decl = self
             .ws
             .with(|idx| match &target {
-                as_core::RefTarget::Def(id) => {
-                    let d = idx.def(*id);
-                    Some((d.file, d.name_span))
+                as_core::RefTarget::Def(r) => {
+                    let d = idx.decl(r);
+                    Some((r.file, d.name_span))
+                }
+                as_core::RefTarget::Synthetic { origin, .. } => {
+                    let d = idx.decl(origin);
+                    Some((origin.file, d.name_span))
                 }
                 as_core::RefTarget::Local { file: lf, span } => Some((*lf, *span)),
             })
@@ -1067,9 +1041,9 @@ impl LanguageServer for Backend {
             .with(|idx| {
                 as_core::search::query_symbols(idx, &params.query)
                     .into_iter()
-                    .filter_map(|id| {
-                        let d = idx.def(id);
-                        let location = target_location(idx, id)?;
+                    .filter_map(|r| {
+                        let d = idx.decl(&r);
+                        let location = target_location(idx, r)?;
                         Some(ls::SymbolInformation {
                             name: as_core::intern::sym_str(d.name).to_string(),
                             kind: def_kind_to_symbol_kind(d.kind),
@@ -1077,9 +1051,12 @@ impl LanguageServer for Backend {
                             #[allow(deprecated)]
                             deprecated: None,
                             location,
-                            container_name: d
-                                .parent
-                                .map(|p| as_core::intern::sym_str(idx.def(p).name).to_string()),
+                            container_name: d.parent.map(|p| {
+                                as_core::intern::sym_str(
+                                    idx.files[&r.file].summary.decls[p as usize].name,
+                                )
+                                .to_string()
+                            }),
                         })
                     })
                     .collect()
@@ -1089,22 +1066,16 @@ impl LanguageServer for Backend {
     }
 }
 
-/// Def 落点 → LSP Location（origin 回落 D10：合成符号跳转源头声明；
-/// `.d.as` 声明是合法落点）。局部/形参的落点在请求文件内，
-/// 由 goto_definition 用请求文档的行首表换算。
-fn target_location(idx: &as_core::WorkspaceIndex, id: as_core::DefId) -> Option<ls::Location> {
-    let mut d = idx.def(id);
-    if let Some(origin) = d.origin {
-        let o = idx.def(origin);
-        if o.origin.is_none() {
-            d = o;
-        }
-    }
-    let path = as_core::intern::file_path(d.file)?;
+/// DeclRef 落点 → LSP Location（`.d.as` 声明是合法落点；合成成员的 origin
+/// 回落由调用方处理——goto_definition 的 Target::Synthetic 分支）。
+/// 局部/形参的落点在请求文件内，由 goto_definition 用请求文档的行首表换算。
+fn target_location(idx: &as_core::workspace::Workspace, r: as_core::aggregation::DeclRef) -> Option<ls::Location> {
+    let d = idx.decl(&r);
+    let path = as_core::intern::file_path(r.file)?;
     let uri = ls::Uri::from_file_path(path)?;
-    let snap = idx.files.get(&d.file)?;
-    let (sl, sc) = snap.lines.line_col_utf16(&snap.source, d.name_span.start);
-    let (el, ec) = snap.lines.line_col_utf16(&snap.source, d.name_span.end);
+    let entry = idx.files.get(&r.file)?;
+    let (sl, sc) = entry.lines.line_col_utf16(&entry.source, d.name_span.start);
+    let (el, ec) = entry.lines.line_col_utf16(&entry.source, d.name_span.end);
     Some(ls::Location {
         uri,
         range: Range::new(Position::new(sl, sc), Position::new(el, ec)),
@@ -1113,7 +1084,7 @@ fn target_location(idx: &as_core::WorkspaceIndex, id: as_core::DefId) -> Option<
 
 /// (FileId, TextRange) → LSP Location（引用/重命名站点；UTF-16 换算只在本层，§3.2.1）。
 fn file_range_location(
-    idx: &as_core::WorkspaceIndex,
+    idx: &as_core::workspace::Workspace,
     file: FileId,
     range: TextRange,
 ) -> Option<ls::Location> {
@@ -1168,9 +1139,6 @@ fn under_root(path: &str, root: &std::path::Path) -> bool {
         hit
     }
 }
-
-/// $/progress token 发号器（server 侧自增即可，客户端只按 token 关联流）。
-static PROGRESS_SEQ: AtomicU32 = AtomicU32::new(1);
 
 /// 保留字（grammar token 集的实用子集：类型/语句/声明/访问/宏关键字）。
 const KEYWORDS: &[&str] = &[

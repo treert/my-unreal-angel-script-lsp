@@ -27,10 +27,9 @@ use crate::workspace::{kind_of_path, WorkspaceState};
 /// 一个文档的诊断 → LSP 协议形态（调用方须持有 docs 锁；`ws.with` 在锁内
 /// 完成——docs → index 读的既有锁序）。
 pub fn doc_ls_diags(doc: &Doc, is_script: bool, ws: &WorkspaceState) -> Vec<ls::Diagnostic> {
-    let decl_missing = is_script
-        && ws
-            .with(|idx| idx.files.values().all(|s| s.kind != FileKind::Decl))
-            .unwrap_or(false);
+    // AS0902 口径：索引中无真实 .d.as（builtin 伪文件不算——Phase B 的
+    // has_decl_files 已排除）
+    let decl_missing = is_script && ws.with(|idx| !idx.has_decl_files()).unwrap_or(false);
     script_diags(&doc.tree, &doc.text, decl_missing)
         .into_iter()
         .map(|d| {
@@ -118,7 +117,7 @@ mod tests {
         let src = "UFUNCTION(Blueprint\nvoid F() {}\n".to_string();
         let file = store.open("unique://lspdiag/a.as", 1, src);
         // 空索引发布 → Ready（dirty 空，重放为空操作）
-        let idx = as_core::WorkspaceIndex::build(as_core::IndexConfig::default(), vec![]);
+        let idx = as_core::workspace::Workspace::build(as_core::IndexConfig::default(), vec![]);
         ws.publish_and_replay(idx, &Mutex::new(DocStore::new()));
         let doc = store.get(file).unwrap();
         let diags = doc_ls_diags(doc, true, &ws);
@@ -142,7 +141,7 @@ mod tests {
             source: "struct FVector { float X; }\n".to_string(),
             module: None,
         }];
-        let idx = as_core::WorkspaceIndex::build(as_core::IndexConfig::default(), inputs);
+        let idx = as_core::workspace::Workspace::build(as_core::IndexConfig::default(), inputs);
         ws.publish_and_replay(idx, &Mutex::new(DocStore::new()));
         let doc = store.get(file).unwrap();
         assert!(doc_ls_diags(doc, true, &ws).is_empty());
