@@ -13,12 +13,14 @@
 | [`原版AngelScript与UE-fork对比.md`](原版AngelScript与UE-fork对比.md) | **差异是什么**：fork 对原版 AS 改了什么 | §1 token 表增删（`@`/`null`/`is` 移除，`struct`/`n""`/f-string 新增）；§3 GC 被摘除的证据链；§5 paper features（parser 放行但永远不可用的构造，lambda/import 的终审）；§6 错误文本 → 诊断码的映射 |
 | [`设计取舍与使用限制.md`](设计取舍与使用限制.md) | **差异为什么**：两条第一性原则推导全部限制 | 原则一「每个值必须回答生命周期归谁管」、原则二「每个构造必须能被反射描述」；§2 七项取舍因果链（GC/句柄/lambda/interface/容器/API 表面过滤/字段反射策略）；§3 脚本作者速查表「想要 X 用 Y」 |
 | [`struct类型专题.md`](struct类型专题.md) | 值/引用二分的完整展开 | §4 class/struct 语义全量对照；§5 UE 映射（UClass vs UScriptStruct）；§6 继承四道锁与 UE 展平机制；§7 `FASStructOps` 行为由脚本方法驱动；§9 对本 LSP 的实现要求 |
+| [`基础类型专题.md`](基础类型专题.md) | **类型系统的地基**：基础类型 vs 绑定类型 | §1 token 表全量清单（含别名）；§2 浮点宽度反转的完整注入链（`float`=64 位、`float32` 特例、`double` 弃用）；§3 `int`/`int32` 词法别名；§4 没有 `string`——字符串三件套全是绑定类型、`n""`/`f""` 预处理伪语法；§5 字面量→类型速查表；§6 内置常量 |
 
 ## 推荐阅读顺序
 
 1. `设计取舍与使用限制.md` §0-§1——先建立「引擎同构语言」的世界观和两条第一性原则；
 2. `原版AngelScript与UE-fork对比.md`——按 token → 机制 → paper features 的顺序看具体差异；
-3. `struct类型专题.md`——值/引用二分是类型系统（`AS01xx`/`AS02xx` 诊断多数码的语义背景）。
+3. `基础类型专题.md`——类型系统的地基：哪些类型是 VM 内建、浮点宽度反转、字符串为什么是 `FString`；
+4. `struct类型专题.md`——值/引用二分是类型系统（`AS01xx`/`AS02xx` 诊断多数码的语义背景）。
 
 ## 证据来源约定
 
