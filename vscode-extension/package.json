@@ -2,7 +2,7 @@
   "name": "my-angel-script-lsp",
   "displayName": "my-as-lsp (Unreal Angelscript)",
   "description": "Unreal Angelscript language support backed by tree-sitter + Rust LSP (my-as-lsp)",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "onemore",
   "repository": {
     "type": "git",
@@ -14,9 +14,6 @@
   },
   "categories": [
     "Programming Languages"
-  ],
-  "activationEvents": [
-    "onLanguage:angelscript-asl"
   ],
   "main": "./dist/extension.js",
   "contributes": {

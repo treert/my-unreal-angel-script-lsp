@@ -14,9 +14,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import {
+  Executable,
   LanguageClient,
   LanguageClientOptions,
-  ServerOptions,
   State,
 } from 'vscode-languageclient/node';
 
@@ -61,7 +61,7 @@ function renderReadyStatus(params: IndexStatusParams): void {
 
 function resolveServerOptions(
   context: vscode.ExtensionContext
-): ServerOptions {
+): Executable {
   const config = vscode.workspace.getConfiguration('myAngelScriptLsp');
   const serverPath = config.get<string>('serverPath') || '';
 
@@ -153,7 +153,7 @@ export function activate(context: vscode.ExtensionContext) {
   statusBarItem.command = {
     command: 'workbench.action.openSettings',
     title: 'Open my-as-lsp Settings',
-    arguments: ['@ext:my-as-lsp.my-angel-script-lsp'],
+    arguments: ['@ext:onemore.my-angel-script-lsp'],
   };
   statusBarItem.show();
   context.subscriptions.push(statusBarItem);
@@ -166,8 +166,7 @@ export function activate(context: vscode.ExtensionContext) {
   logConfigSnapshot();
 
   const serverOptions = resolveServerOptions(context);
-  const args = 'args' in serverOptions ? (serverOptions.args ?? []).join(' ') : '';
-  log(`server command: ${serverOptions.command} ${args}`.trimEnd());
+  log(`server command: ${serverOptions.command} ${(serverOptions.args ?? []).join(' ')}`.trimEnd());
 
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{ scheme: 'file', language: 'angelscript-asl' }],

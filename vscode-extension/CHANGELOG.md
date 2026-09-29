@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-29
+
+### Changed
+
+- Publisher changed to `onemore`. The status bar item's settings link now uses
+  the new extension ID (`@ext:onemore.my-angel-script-lsp`) so it keeps opening
+  this extension's settings page.
+- `tsconfig.json`: deprecated `moduleResolution: node10` replaced with
+  `Bundler` (bundling is done by esbuild; TS only type-checks).
+
+### Fixed
+
+- TypeScript compile error in `extension.ts`: `resolveServerOptions` now
+  returns the precise `Executable` type instead of the `ServerOptions` union,
+  which failed to narrow at the `.command` access.
+
+### Removed
+
+- Redundant `onLanguage:angelscript-asl` activation event (auto-generated from
+  `contributes.languages` since VS Code 1.74).
+
 ## [0.1.2] - 2026-09-28
 
 ### Added
